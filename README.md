@@ -194,7 +194,7 @@ Searches the App Store. Default limit is 5.
 
 #### `purchase`
 ```
-ipatool purchase -b BUNDLE_ID [--keychain-passphrase PASSPHRASE]
+ipatool purchase (-b BUNDLE_ID | -i APP_ID) [--keychain-passphrase PASSPHRASE]
 ```
 Acquires a free license for an app. Must be run once before downloading any app not already in your library.
 
@@ -248,6 +248,10 @@ ipatool search "minecraft" -l 5
 # 4a. Acquire the license separately, then download
 ipatool purchase -b com.mojang.minecraft-edu
 ipatool download -b com.mojang.minecraft-edu -o ~/Downloads
+
+# 4b. Or by numeric app ID
+ipatool purchase -i 1440285423
+ipatool download -i 1440285423 -o ~/Downloads
 
 # 4b. Or acquire license and download in one step
 ipatool download -b com.mojang.minecraft-edu --purchase -o ~/Downloads

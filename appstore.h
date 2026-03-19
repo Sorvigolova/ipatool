@@ -135,6 +135,29 @@ public:
         return sr.results[0];
     }
 
+    // ── Lookup by numeric app ID ──────────────────────────────────────────────
+
+    App lookup_by_id(const Account& acc, int64_t appID) {
+        std::string cc  = country_code_from_storefront(acc.storeFront);
+        std::map<std::string, std::string> p = {
+            {"entity",  "software,iPadSoftware"},
+            {"limit",   "1"},
+            {"media",   "software"},
+            {"id",      std::to_string(appID)},
+            {"country", cc},
+        };
+        std::string url = std::string("https://") + ITUNES_API_DOMAIN
+                        + ITUNES_API_PATH_LOOKUP + "?" + build_query(p);
+
+        HttpResponse res = m_http.get(url);
+        if (res.statusCode != 200)
+            throw IpaError("lookup request failed: " + std::to_string(res.statusCode));
+
+        auto sr = parse_search_json(res.body);
+        if (sr.results.empty()) throw IpaError("app not found");
+        return sr.results[0];
+    }
+
     // ── Purchase (free apps) ──────────────────────────────────────────────────
 
     void purchase(const Account& acc, const App& app) {

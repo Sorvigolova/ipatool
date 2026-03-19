@@ -685,10 +685,11 @@ static void cmd_search(const Args& args) {
 
 static void cmd_purchase(const Args& args) {
     std::string bundleID   = get(args, "bundle-id",           "b");
+    std::string appIDStr   = get(args, "app-id",              "i");
     std::string passphrase = get(args, "keychain-passphrase", "");
 
-    if (bundleID.empty()) {
-        std::cerr << "Usage: ipatool purchase -b BUNDLE_ID\n";
+    if (bundleID.empty() && appIDStr.empty()) {
+        std::cerr << "Usage: ipatool purchase (-b BUNDLE_ID | -i APP_ID)\n";
         exit(1);
     }
 
@@ -699,8 +700,16 @@ static void cmd_purchase(const Args& args) {
     }
 
     AppStore store(COOKIE_FILE);
+
+    // Resolve App — lookup by bundle ID or numeric app ID
+    auto resolve_app = [&]() -> App {
+        if (!bundleID.empty())
+            return store.lookup(acc, bundleID);
+        return store.lookup_by_id(acc, std::stoll(appIDStr));
+    };
+
     try {
-        App app = store.lookup(acc, bundleID);
+        App app = resolve_app();
         std::cout << "Purchasing: " << app.name << " (" << app.bundleID << ")\n";
         store.purchase(acc, app);
         json purchaseOut;
@@ -715,7 +724,7 @@ static void cmd_purchase(const Args& args) {
             exit(1);
         }
         try {
-            App app = store.lookup(acc, bundleID);
+            App app = resolve_app();
             store.purchase(acc, app);
             json purchaseOut;
             purchaseOut["success"] = true;
@@ -1146,13 +1155,14 @@ Examples:
   ipatool auth login -e user@example.com -p mypassword --auth-code 123456
   ipatool search "angry birds" -l 5 --keychain-passphrase mysecret
   ipatool purchase -b com.example.app
+  ipatool purchase -i 1234567890
   ipatool download -b com.example.app -o ./MyApp.ipa
   ipatool download -i 1234567890 -o ./MyApp.ipa
 
 Flags per command:
   auth login:           -e/--email  -p/--password  -a/--auth-code  --keychain-passphrase
   search:               <term>  -l/--limit  --keychain-passphrase
-  purchase:             -b/--bundle-id             --keychain-passphrase
+  purchase:             -b/--bundle-id | -i/--app-id   --keychain-passphrase
   download:             -b/--bundle-id | -i/--app-id   -o/--output  --external-version-id  --purchase  --keychain-passphrase
   list-versions:        -b/--bundle-id | -i/--app-id   --keychain-passphrase
   get-version-metadata: -b/--bundle-id | -i/--app-id   --external-version-id  --keychain-passphrase
