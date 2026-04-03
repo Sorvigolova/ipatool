@@ -124,7 +124,9 @@ Verify with `ldd build/ipatool` — should show only `linux-vdso.so.1`, `libc.so
 ```sh
 brew install curl nlohmann-json minizip openssl
 
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-Dexplicit_bzero=bzero" ^
+      -DCMAKE_CXX_FLAGS="-Dexplicit_bzero=bzero" -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) ^
+      -DOPENSSL_USE_STATIC_LIBS=TRUE
 cmake --build build
 ```
 
