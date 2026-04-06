@@ -658,11 +658,11 @@ private:
         std::string jingleDocType   = dict_str(data, "jingleDocType");
         int64_t     status          = dict_int(data, "status");
 
-        if (failureType == FAILURE_TEMPORARILY_UNAVAILABLE)
-            throw IpaError("item is temporarily unavailable");
+        if (failureType == FAILURE_TEMPORARILY_UNAVAILABLE)   throw IpaError("item is temporarily unavailable");
+        if (failureType == FAILURE_ALREADY_PURCHASED)         throw IpaError("license already exists");
         if (customerMessage == CUSTOMER_MSG_SUBSCRIPTION_REQ) throw SubscriptionRequired();
         if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED)    throw PasswordTokenExpired();
-        if (customerMessage == CUSTOMER_MSG_SIGN_IN)           throw PasswordTokenExpired();
+        if (customerMessage == CUSTOMER_MSG_SIGN_IN)          throw PasswordTokenExpired();
         if (!failureType.empty() && !customerMessage.empty()) throw IpaError(customerMessage);
         if (!failureType.empty())                             throw IpaError("something went wrong");
         if (res.statusCode == 500)                            throw IpaError("license already exists");

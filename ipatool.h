@@ -194,6 +194,7 @@ static const char* FAILURE_INVALID_CREDENTIALS      = "-5000";
 static const char* FAILURE_PASSWORD_TOKEN_EXPIRED   = "2034";
 static const char* FAILURE_LICENSE_NOT_FOUND        = "9610";
 static const char* FAILURE_TEMPORARILY_UNAVAILABLE  = "2059";
+static const char* FAILURE_ALREADY_PURCHASED        = "5002";
 
 static const char* CUSTOMER_MSG_BAD_LOGIN           = "MZFinance.BadLogin.Configurator_message";
 static const char* CUSTOMER_MSG_ACCOUNT_DISABLED    = "Your account is disabled.";
