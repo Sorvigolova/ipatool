@@ -118,6 +118,19 @@ static std::string home_dir() {
     const char* home = getenv("HOME");
 #ifdef _WIN32
     if (!home) home = getenv("USERPROFILE");
+    // On Windows, the path may contain non-ASCII characters (e.g. Cyrillic).
+    // libcurl cannot handle such paths via char*.
+    // Convert to short 8.3 path format (ASCII only) using GetShortPathNameW.
+    if (home) {
+        wchar_t wlong[MAX_PATH] = {};
+        wchar_t wshort[MAX_PATH] = {};
+        MultiByteToWideChar(CP_ACP, 0, home, -1, wlong, MAX_PATH);
+        if (GetShortPathNameW(wlong, wshort, MAX_PATH) > 0) {
+            char buf[MAX_PATH] = {};
+            WideCharToMultiByte(CP_ACP, 0, wshort, -1, buf, MAX_PATH, NULL, NULL);
+            return std::string(buf);
+        }
+    }
 #endif
     return home ? home : ".";
 }
