@@ -797,7 +797,7 @@ static void cmd_list_versions(const Args& args) {
         j["success"]                    = true;
         log_output(j);
     } catch (const std::exception& e) {
-        std::cerr << "list-versions error: " << e.what() << "\n";
+        print_red_err(std::string("Error: ") + e.what() + "\n");
         exit(1);
     }
 }
