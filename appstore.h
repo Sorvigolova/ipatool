@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <fstream>
 #include <filesystem>   // C++17 — replaces getcwd / stat / S_ISDIR
 
 // ── Platform headers ──────────────────────────────────────────────────────────
@@ -786,157 +787,111 @@ private:
                                    const std::vector<uint8_t>& artworkBytes,
                                    const std::vector<Sinf>& sinfs)
     {
-        unzFile src = unzOpen(srcPath.c_str());
-        if (!src) throw IpaError("minizip: failed to open source IPA");
-
-        zipFile dst = zipOpen(dstPath.c_str(), APPEND_STATUS_CREATE);
-        if (!dst) { unzClose(src); throw IpaError("minizip: failed to create output IPA"); }
-
-        // ── Collect info we need before rewriting ────────────────────────────
-        std::string bundleName;       // e.g. "Minecraft"  (from .app/Info.plist path)
-        std::string bundleExecutable; // CFBundleExecutable from Info.plist
-        std::vector<std::string> sinfPaths; // from SC_Info/Manifest.plist
-
+        // ── Step 1: raw-copy the original IPA → destination ──────────────────
         {
-            int rc2 = unzGoToFirstFile(src);
-            while (rc2 == UNZ_OK) {
+            std::ifstream in(srcPath,  std::ios::binary);
+            std::ofstream out(dstPath, std::ios::binary | std::ios::trunc);
+            if (!in)  throw IpaError("minizip: cannot open source IPA");
+            if (!out) throw IpaError("minizip: cannot create output IPA");
+            out << in.rdbuf();
+        }
+
+        // ── Step 2: collect bundle info needed for sinf path ─────────────────
+        std::string bundleName;
+        std::string bundleExecutable;
+        std::vector<std::string> sinfPaths;
+
+        if (!sinfs.empty()) {
+            unzFile probe = unzOpen(srcPath.c_str());
+            if (!probe) throw IpaError("minizip: cannot open source for probe");
+            int rc = unzGoToFirstFile(probe);
+            while (rc == UNZ_OK) {
                 char name[1024] = {};
-                unz_file_info fi2;
-                unzGetCurrentFileInfo(src, &fi2, name, sizeof(name), nullptr, 0, nullptr, 0);
+                unz_file_info fi;
+                unzGetCurrentFileInfo(probe, &fi, name, sizeof(name),
+                                      nullptr, 0, nullptr, 0);
                 std::string n(name);
 
-                // Read bundle name from first .app/Info.plist (not in Watch/)
                 if (bundleName.empty()
                     && n.find(".app/Info.plist") != std::string::npos
                     && n.find("/Watch/") == std::string::npos)
                 {
-                    // "Payload/Foo.app/Info.plist" -> "Foo"
-                    size_t appPos = n.rfind(".app/Info.plist");
+                    size_t appPos   = n.rfind(".app/Info.plist");
                     size_t slashPos = n.rfind('/', appPos - 1);
                     bundleName = n.substr(slashPos + 1, appPos - slashPos - 1);
                 }
 
-                // Read Info.plist to get CFBundleExecutable
                 if (bundleExecutable.empty()
                     && n.find(".app/Info.plist") != std::string::npos
                     && n.find("/Watch/") == std::string::npos)
                 {
-                    unzOpenCurrentFile(src);
-                    std::vector<uint8_t> buf(fi2.uncompressed_size);
-                    unzReadCurrentFile(src, buf.data(), (unsigned)buf.size());
-                    unzCloseCurrentFile(src);
-                    // parse CFBundleExecutable from binary or XML plist
+                    unzOpenCurrentFile(probe);
+                    std::vector<uint8_t> buf(fi.uncompressed_size);
+                    unzReadCurrentFile(probe, buf.data(), (unsigned)buf.size());
+                    unzCloseCurrentFile(probe);
                     bundleExecutable = extract_plist_string(buf, "CFBundleExecutable");
                 }
 
-                // Read SC_Info/Manifest.plist to get SinfPaths
                 if (sinfPaths.empty()
                     && n.find(".app/SC_Info/Manifest.plist") != std::string::npos)
                 {
-                    unzOpenCurrentFile(src);
-                    std::vector<uint8_t> buf(fi2.uncompressed_size);
-                    unzReadCurrentFile(src, buf.data(), (unsigned)buf.size());
-                    unzCloseCurrentFile(src);
+                    unzOpenCurrentFile(probe);
+                    std::vector<uint8_t> buf(fi.uncompressed_size);
+                    unzReadCurrentFile(probe, buf.data(), (unsigned)buf.size());
+                    unzCloseCurrentFile(probe);
                     sinfPaths = extract_sinf_paths(buf);
                 }
 
-                rc2 = unzGoToNextFile(src);
+                rc = unzGoToNextFile(probe);
             }
-            unzGoToFirstFile(src); // rewind
+            unzClose(probe);
         }
 
-        // Build set of paths that sinf injection will write so we can skip them
-        std::set<std::string> sinfWritePaths;
-        if (!sinfs.empty() && !bundleName.empty()) {
-            if (!sinfPaths.empty()) {
-                for (auto& sp : sinfPaths)
-                    sinfWritePaths.insert("Payload/" + bundleName + ".app/" + sp);
-            } else if (!bundleExecutable.empty()) {
-                sinfWritePaths.insert("Payload/" + bundleName + ".app/SC_Info/"
-                                      + bundleExecutable + ".sinf");
-            }
-        }
+        // ── Step 3: open the copy in append mode and inject new files ─────────
+        zipFile dst = zipOpen(dstPath.c_str(), APPEND_STATUS_ADDINZIP);
+        if (!dst) throw IpaError("minizip: failed to open output IPA for append");
 
-        // ── Step 1: replicate existing zip, skipping sinf paths that will be replaced ──
-        int rc = unzGoToFirstFile(src);
-        while (rc == UNZ_OK) {
-            char name[1024] = {};
-            unz_file_info fi;
-            unzGetCurrentFileInfo(src, &fi, name, sizeof(name), nullptr, 0, nullptr, 0);
-            std::string n(name);
-
-            bool skip = (sinfWritePaths.count(n) > 0);
-            if (!skip) {
-                unzOpenCurrentFile(src);
-                std::vector<uint8_t> buf(fi.uncompressed_size);
-                unzReadCurrentFile(src, buf.data(), (unsigned)buf.size());
-                unzCloseCurrentFile(src);
-
-                zip_fileinfo zfi = {};
-                zfi.tmz_date.tm_year = fi.tmu_date.tm_year;
-                zfi.tmz_date.tm_mon  = fi.tmu_date.tm_mon;
-                zfi.tmz_date.tm_mday = fi.tmu_date.tm_mday;
-                zfi.tmz_date.tm_hour = fi.tmu_date.tm_hour;
-                zfi.tmz_date.tm_min  = fi.tmu_date.tm_min;
-                zfi.tmz_date.tm_sec  = fi.tmu_date.tm_sec;
-
-                zipOpenNewFileInZip(dst, name, &zfi,
-                    nullptr, 0, nullptr, 0, nullptr,
-                    Z_DEFLATED, Z_DEFAULT_COMPRESSION);
-                zipWriteInFileInZip(dst, buf.data(), (unsigned)buf.size());
-                zipCloseFileInZip(dst);
-            }
-            rc = unzGoToNextFile(src);
-        }
-
-        // ── Step 2: inject sinf(s) ────────────────────────────────────────────
-        if (!sinfs.empty() && !bundleName.empty()) {
+        // iTunes order: iTunesMetadata.plist first, sinf(s), iTunesArtwork last
+        auto append_file = [&](const char* path,
+                                const void* data, unsigned size,
+                                int method)
+        {
             zip_fileinfo zfi = {};
+            zipOpenNewFileInZip(dst, path, &zfi,
+                nullptr, 0, nullptr, 0, nullptr,
+                method, method == 0 ? 0 : Z_DEFAULT_COMPRESSION);
+            zipWriteInFileInZip(dst, data, size);
+            zipCloseFileInZip(dst);
+        };
+
+        append_file("iTunesMetadata.plist",
+                    metaBytes.data(), (unsigned)metaBytes.size(),
+                    Z_DEFLATED);
+
+        if (!sinfs.empty() && !bundleName.empty()) {
             if (!sinfPaths.empty()) {
-                // Manifest-based: zip sinfs with sinfPaths by index
                 size_t count = std::min(sinfs.size(), sinfPaths.size());
                 for (size_t i = 0; i < count; i++) {
                     std::string sp = "Payload/" + bundleName + ".app/" + sinfPaths[i];
-                    zipOpenNewFileInZip(dst, sp.c_str(), &zfi,
-                        nullptr, 0, nullptr, 0, nullptr,
-                        Z_DEFLATED, Z_DEFAULT_COMPRESSION);
-                    zipWriteInFileInZip(dst, sinfs[i].data.data(), (unsigned)sinfs[i].data.size());
-                    zipCloseFileInZip(dst);
+                    append_file(sp.c_str(),
+                                sinfs[i].data.data(), (unsigned)sinfs[i].data.size(),
+                                Z_DEFLATED);
                 }
             } else if (!bundleExecutable.empty()) {
-                // Info-based: single sinf to SC_Info/{executable}.sinf
                 std::string sp = "Payload/" + bundleName + ".app/SC_Info/"
                                + bundleExecutable + ".sinf";
-                zipOpenNewFileInZip(dst, sp.c_str(), &zfi,
-                    nullptr, 0, nullptr, 0, nullptr,
-                    Z_DEFLATED, Z_DEFAULT_COMPRESSION);
-                zipWriteInFileInZip(dst, sinfs[0].data.data(), (unsigned)sinfs[0].data.size());
-                zipCloseFileInZip(dst);
+                append_file(sp.c_str(),
+                            sinfs[0].data.data(), (unsigned)sinfs[0].data.size(),
+                            Z_DEFLATED);
             }
         }
 
-        // ── Step 3: write iTunesMetadata.plist from Apple's response metadata ──
-        {
-            zip_fileinfo zfi = {};
-            zipOpenNewFileInZip(dst, "iTunesMetadata.plist", &zfi,
-                nullptr, 0, nullptr, 0, nullptr,
-                Z_DEFLATED, Z_DEFAULT_COMPRESSION);
-            zipWriteInFileInZip(dst, metaBytes.data(), (unsigned)metaBytes.size());
-            zipCloseFileInZip(dst);
-        }
-
-        // ── Step 4: write iTunesArtwork (PNG, no extension) ──────────────────
-        if (!artworkBytes.empty()) {
-            zip_fileinfo zfi = {};
-            zipOpenNewFileInZip(dst, "iTunesArtwork", &zfi,
-                nullptr, 0, nullptr, 0, nullptr,
-                Z_DEFLATED, Z_DEFAULT_COMPRESSION);
-            zipWriteInFileInZip(dst, artworkBytes.data(), (unsigned)artworkBytes.size());
-            zipCloseFileInZip(dst);
-        }
+        if (!artworkBytes.empty())
+            append_file("iTunesArtwork",
+                        artworkBytes.data(), (unsigned)artworkBytes.size(),
+                        Z_DEFLATED);
 
         zipClose(dst, nullptr);
-        unzClose(src);
     }
 
     // Extract a string value from a binary or XML plist by key name.
