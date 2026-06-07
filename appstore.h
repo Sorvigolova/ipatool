@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>   // C++17 — replaces getcwd / stat / S_ISDIR
+#include <regex>
 
 // ── Platform headers ──────────────────────────────────────────────────────────
 
@@ -488,6 +489,7 @@ private:
         std::string url = std::string("https://") + PRIVATE_INIT_DOMAIN
                         + PRIVATE_INIT_PATH + "?guid=" + guid;
         HttpResponse res = m_http.get(url, {{"Accept", "application/xml"}});
+        std::string ep;
 
         if (m_debug) {
             fprintf(stderr, "[DEBUG] bag status: %d\n", res.statusCode);
@@ -508,24 +510,75 @@ private:
         // Try nested: d["urlBag"]["authenticateAccount"]
         auto ubIt = d.find("urlBag");
         if (ubIt != d.end() && ubIt->second.isDict()) {
-            std::string ep = dict_str(ubIt->second.dictVal, "authenticateAccount");
-            if (!ep.empty()) return ep;
+            ep = dict_str(ubIt->second.dictVal, "authenticateAccount");     
+            if (!ep.empty()) goto FOUND_URL;
         }
 
         // Try flat: d["authenticateAccount"] directly
         {
-            std::string ep = dict_str(d, "authenticateAccount");
-            if (!ep.empty()) return ep;
+            ep = dict_str(d, "authenticateAccount");
+            if (!ep.empty()) goto FOUND_URL;;
         }
 
         // Scan all top-level dict values for authenticateAccount
         for (auto& [k, v] : d) {
             if (v.isDict()) {
-                std::string ep = dict_str(v.dictVal, "authenticateAccount");
-                if (!ep.empty()) return ep;
+                ep = dict_str(v.dictVal, "authenticateAccount");
+                if (!ep.empty()) goto FOUND_URL;
             }
         }
 
+        FOUND_URL:
+        if (!ep.empty()) {
+            //Try to find URL addend by its path and add it to the tail
+            std::string addend;
+            std::string path = std::regex_replace(ep, std::regex(R"(^https?://[^/]+(/?))"), "");
+
+            //Check if path is empty
+            if (path.empty()) return ep;
+
+            // Temporary stack for linear deep XML traversal
+            std::vector<std::reference_wrapper<const PlistDict>> xml_stack;
+            xml_stack.push_back(d);
+
+            while (!xml_stack.empty()) {
+                const PlistDict& current_layer = xml_stack.back();
+                xml_stack.pop_back();
+
+                // Try to find the target path key on the current layer
+                auto it = current_layer.find(path);
+                if (it != current_layer.end()) {
+                    auto& v = it->second;
+
+                    // Check if it is a non-empty array
+                    if (v.isArray() && !v.arrayVal.empty()) {
+
+                        // Get the first element from the array
+                        auto& first_item = v.arrayVal[0];
+
+                        // Check if it is a string and extract it
+                        if (first_item.isString()) {
+                            addend = first_item.strVal;
+                            goto FOUND_ADDEND;
+                        }
+                    }
+                }
+
+                // Push all nested dictionaries onto the stack for further processing
+                for (auto& [k, v] : current_layer) {
+                    if (v.isDict()) {
+                        xml_stack.push_back(v.dictVal);
+                    }
+                }
+            }
+            FOUND_ADDEND:
+            if (!addend.empty()) {
+                if (ep.back() != '/') ep += "/";
+                ep += addend;
+            }
+
+            return ep;
+        }
         // Fallback to known-good hardcoded endpoint
         fprintf(stderr,
             "[WARN] Could not parse urlBag -- using default auth endpoint.\n"
