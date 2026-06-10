@@ -575,6 +575,7 @@ private:
             if (!addend.empty()) {
                 if (ep.back() != '/') ep += "/";
                 ep += addend;
+                ep += "/";
             }
 
             return ep;
