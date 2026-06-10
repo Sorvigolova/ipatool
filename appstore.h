@@ -583,7 +583,7 @@ private:
         fprintf(stderr,
             "[WARN] Could not parse urlBag -- using default auth endpoint.\n"
             "       Retry with --debug to inspect the raw server response.\n");
-        return "https://auth.itunes.apple.com/auth/v1/native/fast";
+        return "https://auth.itunes.apple.com/auth/v1/native/fast/";
     }
 
     // ── Login implementation ─────────────────────────────────────────────────
