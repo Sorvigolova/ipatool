@@ -782,6 +782,13 @@ static void cmd_list_versions(const Args& args) {
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
     try {
+        // Fetch bag to get redownloadProduct endpoint for 5002 fallback
+        std::string redownloadEndpoint;
+        try {
+            auto bag = store.fetch_bag();
+            redownloadEndpoint = bag.redownloadEndpoint;
+        } catch (...) { /* non-fatal: fallback disabled if bag fails */ }
+
         App app;
         if (!bundleID.empty()) {
             app = store.lookup(acc, bundleID);
@@ -789,7 +796,7 @@ static void cmd_list_versions(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.list_versions(acc, app);
+        auto out = store.list_versions(acc, app, redownloadEndpoint);
 
         json j;
         j["externalVersionIdentifiers"] = out.externalVersionIdentifiers;
@@ -823,6 +830,13 @@ static void cmd_get_version_metadata(const Args& args) {
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
     try {
+        // Fetch bag to get redownloadProduct endpoint for 5002 fallback
+        std::string redownloadEndpoint;
+        try {
+            auto bag = store.fetch_bag();
+            redownloadEndpoint = bag.redownloadEndpoint;
+        } catch (...) { /* non-fatal */ }
+
         App app;
         if (!bundleID.empty()) {
             app = store.lookup(acc, bundleID);
@@ -830,7 +844,7 @@ static void cmd_get_version_metadata(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.get_version_metadata(acc, app, versionID);
+        auto out = store.get_version_metadata(acc, app, versionID, redownloadEndpoint);
 
         json j;
         j["externalVersionID"] = versionID;
@@ -880,6 +894,13 @@ static void cmd_download(const Args& args) {
 
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
+
+    // Fetch bag for redownloadProduct (5002 fallback for licensed apps like Teams)
+    std::string redownloadEndpoint;
+    try {
+        auto bag = store.fetch_bag();
+        redownloadEndpoint = bag.redownloadEndpoint;
+    } catch (...) { /* non-fatal: proceed without fallback */ }
 
     App app;
 
@@ -1042,7 +1063,7 @@ static void cmd_download(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.download(acc, app, outputPath, versionID, progress);
+        auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
         json dlOut;
         dlOut["output"]    = out.destinationPath;
         dlOut["purchased"] = false;
@@ -1080,7 +1101,7 @@ static void cmd_download(const Args& args) {
         startTime     = std::chrono::steady_clock::now();
         prevDrawnCols = 0;
         try {
-            auto out = store.download(acc, app, outputPath, versionID, progress);
+            auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = true;
@@ -1095,7 +1116,7 @@ static void cmd_download(const Args& args) {
             startTime     = std::chrono::steady_clock::now();
             prevDrawnCols = 0;
             try {
-                auto out = store.download(acc, app, outputPath, versionID, progress);
+                auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
                 json dlOut;
                 dlOut["output"]    = out.destinationPath;
                 dlOut["purchased"] = true;
@@ -1120,7 +1141,7 @@ static void cmd_download(const Args& args) {
             lastDraw      = std::chrono::steady_clock::now() - std::chrono::milliseconds(200);
             startTime     = std::chrono::steady_clock::now();
             prevDrawnCols = 0;
-            auto out = store.download(acc, app, outputPath, versionID, progress);
+            auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = false;

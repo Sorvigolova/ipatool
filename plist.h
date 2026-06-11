@@ -322,6 +322,13 @@ static PlistArray parse_array(XmlTokenizer& tok) {
     PlistArray arr;
     while (!tok.at_end()) {
         std::string tag = tok.peek_tag();
+        if (tag.empty()) {
+            // Not positioned at a '<' — skip forward to the next tag to avoid
+            // an infinite loop (e.g. stranded mid-text after a malformed entry)
+            size_t next = tok.src.find('<', tok.pos);
+            tok.pos = (next != std::string::npos) ? next : tok.src.size();
+            continue;
+        }
         if (tag.find("</array>") != std::string::npos) { tok.read_tag(); break; }
         arr.push_back(parse_value(tok));
     }
@@ -335,28 +342,36 @@ static PlistValue parse_value(XmlTokenizer& tok) {
 
     std::string name = XmlTokenizer::tag_name(tag);
 
+    // Detect self-closing tag (e.g. <array />, <dict />) — must not recurse
+    bool selfClose = (tag.find("/>") != std::string::npos);
+
     if (name == "dict") {
         tok.read_tag();
+        if (selfClose) return PlistValue::makeDict({});   // <dict /> → empty dict
         return PlistValue::makeDict(parse_dict(tok));
     }
     if (name == "array") {
         tok.read_tag();
+        if (selfClose) return PlistValue::makeArray({});  // <array /> → empty array
         return PlistValue::makeArray(parse_array(tok));
     }
     if (name == "string") {
         tok.read_tag();
+        if (selfClose) return PlistValue::makeString("");
         std::string text = tok.read_text_until("</string>");
         tok.read_tag();
         return PlistValue::makeString(xml_unescape(text));
     }
     if (name == "integer") {
         tok.read_tag();
+        if (selfClose) return PlistValue::makeInt(0);
         std::string text = tok.read_text_until("</integer>");
         tok.read_tag();
         return PlistValue::makeInt(std::stoll(text));
     }
     if (name == "real") {
         tok.read_tag();
+        if (selfClose) return PlistValue::makeReal(0.0);
         std::string text = tok.read_text_until("</real>");
         tok.read_tag();
         return PlistValue::makeReal(std::stod(text));
@@ -371,12 +386,14 @@ static PlistValue parse_value(XmlTokenizer& tok) {
     }
     if (name == "data") {
         tok.read_tag();
+        if (selfClose) return PlistValue::makeData({});
         std::string text = tok.read_text_until("</data>");
         tok.read_tag();
         return PlistValue::makeData(base64_decode(text));
     }
     if (name == "date") {
         tok.read_tag();
+        if (selfClose) return PlistValue::makeDate("");
         std::string text = tok.read_text_until("</date>");
         tok.read_tag();
         return PlistValue::makeDate(text);
