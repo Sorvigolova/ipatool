@@ -281,7 +281,7 @@ public:
     }
 
 public:
-    void set_debug(bool v) { m_debug = v; }
+    void set_debug(bool v) { m_debug = v; m_http.set_debug(v); }
 
     // ── List Versions ────────────────────────────────────────────────────────
     struct ListVersionsOutput {

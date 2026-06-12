@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
+#include <thread>
+#include <chrono>
 #include <curl/curl.h>
 
 namespace fs = std::filesystem;
@@ -72,6 +74,13 @@ struct HttpResponse {
     std::map<std::string, std::string> headers;
 };
 
+// ── Retry helpers ─────────────────────────────────────────────────────────────
+
+// Only timeout errors are retried — other failures surface immediately.
+static bool is_retryable_curl(CURLcode rc) {
+    return rc == CURLE_OPERATION_TIMEDOUT;
+}
+
 // ── HttpClient ────────────────────────────────────────────────────────────────
 
 class HttpClient {
@@ -88,6 +97,8 @@ public:
     HttpClient(const HttpClient&)            = delete;
     HttpClient& operator=(const HttpClient&) = delete;
 
+    void set_debug(bool v) { m_debug = v; }
+
     HttpResponse post(const std::string& url,
                       const std::string& body,
                       const std::map<std::string, std::string>& reqHeaders) const
@@ -101,135 +112,191 @@ public:
         return perform("GET", url, "", reqHeaders);
     }
 
-    // Resumable file download. rangeStart==0 means start fresh.
+    // Resumable file download with automatic retry.
+    // rangeStart==0 means start fresh; >0 resumes from that byte offset.
+    // On transient failure each retry continues from where the last left off,
+    // using HTTP Range: <offset>- so no already-downloaded bytes are re-fetched.
     void download(const std::string& url,
                   const std::string& destPath,
                   int64_t            rangeStart = 0,
                   std::function<void(int64_t, int64_t)> progress = nullptr) const
     {
-        CURL* curl = curl_easy_init();
-        if (!curl) throw std::runtime_error("curl_easy_init failed");
+        int64_t  currentStart = rangeStart;
+        CURLcode rc           = CURLE_OK;
+        int64_t  knownTotal   = 0;  // carry total across retries for progress continuity
 
-        // Use "ab" (append binary) when resuming, "wb" otherwise.
-        // On Windows fopen works fine for binary files.
-        const char* openMode = (rangeStart > 0) ? "ab" : "wb";
-        FILE* fp = fopen(destPath.c_str(), openMode);
-        if (!fp) {
+        for (int attempt = 0; ; ++attempt) {
+            // ── Back-off before retry ────────────────────────────────────────
+            if (attempt > 0) {
+                if (!is_retryable_curl(rc) || attempt > DL_MAX_RETRIES) break;
+
+                int delay = DL_BACKOFF_S[attempt - 1];
+                if (m_debug)
+                    fprintf(stderr,
+                        "\n[WARN] Download interrupted (%s), resuming from byte %lld "
+                        "in %ds... (attempt %d/%d)\n",
+                        curl_easy_strerror(rc),
+                        static_cast<long long>(currentStart),
+                        delay, attempt, DL_MAX_RETRIES);
+                std::this_thread::sleep_for(std::chrono::seconds(delay));
+            }
+
+            // ── Open file ────────────────────────────────────────────────────
+            // Append when resuming so previously written bytes are preserved.
+            const char* openMode = (currentStart > 0) ? "ab" : "wb";
+            FILE* fp = fopen(destPath.c_str(), openMode);
+            if (!fp) throw std::runtime_error("failed to open file: " + destPath);
+
+            CURL* curl = curl_easy_init();
+            if (!curl) { fclose(fp); throw std::runtime_error("curl_easy_init failed"); }
+
+            DownloadState ds;
+            ds.fp         = fp;
+            ds.progress   = progress;
+            ds.rangeStart = currentStart;
+            ds.received   = 0;
+            ds.total      = knownTotal;  // preserve total so progress bar is smooth on retry
+
+            std::map<std::string, std::string> respHeaders;
+
+            curl_easy_setopt(curl, CURLOPT_URL,             url.c_str());
+            curl_easy_setopt(curl, CURLOPT_USERAGENT,       USER_AGENT);
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,  1L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  15L);
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 512L);  // abort if < 512 B/s
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  30L);   // for more than 30 s
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,   file_write_cb);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA,       &ds);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,xferinfo_cb);
+            curl_easy_setopt(curl, CURLOPT_XFERINFODATA,    &ds);
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS,      0L);
+            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION,  header_cb);
+            curl_easy_setopt(curl, CURLOPT_HEADERDATA,      &respHeaders);
+            if (!m_cookieFile.empty()) {
+                curl_easy_setopt(curl, CURLOPT_COOKIEFILE, m_cookieFile.c_str());
+                curl_easy_setopt(curl, CURLOPT_COOKIEJAR,  m_cookieFile.c_str());
+            } else {
+                curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
+            }
+
+            if (currentStart > 0) {
+                std::string range = std::to_string(currentStart) + "-";
+                curl_easy_setopt(curl, CURLOPT_RANGE, range.c_str());
+            }
+
+            // ── Perform ──────────────────────────────────────────────────────
+            rc = curl_easy_perform(curl);
+
+            knownTotal     = ds.total;       // save for next attempt
+            currentStart  += ds.received;    // advance offset by bytes actually written
+
+            fclose(fp);
             curl_easy_cleanup(curl);
-            throw std::runtime_error("failed to open file: " + destPath);
+
+            if (rc == CURLE_OK) return;      // success — done
         }
 
-        DownloadState ds;
-        ds.fp         = fp;
-        ds.progress   = progress;
-        ds.rangeStart = rangeStart;
-
-        std::map<std::string, std::string> respHeaders;
-
-        curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
-        curl_easy_setopt(curl, CURLOPT_USERAGENT,      USER_AGENT);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);   // 15s to connect
-        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L); // abort if < 1 KB/s
-        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  30L);  // for more than 30s
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,      file_write_cb);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA,          &ds);
-        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,   xferinfo_cb);
-        curl_easy_setopt(curl, CURLOPT_XFERINFODATA,       &ds);
-        curl_easy_setopt(curl, CURLOPT_NOPROGRESS,         0L);
-        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA,     &respHeaders);
-        if (!m_cookieFile.empty()) {
-            curl_easy_setopt(curl, CURLOPT_COOKIEFILE, m_cookieFile.c_str());
-            curl_easy_setopt(curl, CURLOPT_COOKIEJAR,  m_cookieFile.c_str());
-        } else {
-            curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
-        }
-
-        if (rangeStart > 0) {
-            std::string range = std::to_string(rangeStart) + "-";
-            curl_easy_setopt(curl, CURLOPT_RANGE, range.c_str());
-        }
-
-        CURLcode rc = curl_easy_perform(curl);
-        fclose(fp);
-        curl_easy_cleanup(curl);
-
-        if (rc != CURLE_OK)
-            throw std::runtime_error(
-                curl_easy_strerror(rc));
+        throw std::runtime_error(
+            std::string("Download failed after retries: ") + curl_easy_strerror(rc));
     }
 
 private:
     static constexpr const char* USER_AGENT =
         "Configurator/2.15 (Macintosh; OS X 11.0.0; 16G29) AppleWebKit/2603.3.8";
 
-    std::string m_cookieFile;
+    // ── Retry config: API calls ───────────────────────────────────────────────
+    static constexpr int API_MAX_RETRIES  = 5;
+    static constexpr int API_BACKOFF_S[]  = { 1, 2, 4, 8, 15 };  // total: 30 s
 
+    // ── Retry config: file downloads ──────────────────────────────────────────
+    static constexpr int DL_MAX_RETRIES   = 5;
+    static constexpr int DL_BACKOFF_S[]   = { 3, 6, 12, 24, 30 };  // total: 75 s
+
+    std::string m_cookieFile;
+    bool        m_debug = false;
+
+    // Shared GET/POST implementation with automatic retry on transient errors.
     HttpResponse perform(const std::string& method,
                          const std::string& url,
                          const std::string& body,
                          const std::map<std::string, std::string>& reqHeaders) const
     {
-        CURL* curl = curl_easy_init();
-        if (!curl) throw std::runtime_error("curl_easy_init failed");
+        CURLcode rc      = CURLE_OK;
+        int      attempt = 0;
 
-        HttpResponse resp;
-        std::string  respBody;
+        for (;;) {
+            // ── Back-off before retry ────────────────────────────────────────
+            if (attempt > 0) {
+                int delay = API_BACKOFF_S[attempt - 1];
+                if (m_debug)
+                    fprintf(stderr,
+                        "[WARN] HTTP %s failed (%s), retrying in %ds... (%d/%d)\n",
+                        method.c_str(), curl_easy_strerror(rc),
+                        delay, attempt, API_MAX_RETRIES);
+                std::this_thread::sleep_for(std::chrono::seconds(delay));
+            }
 
-        curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
-        curl_easy_setopt(curl, CURLOPT_USERAGENT,      USER_AGENT);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);  // 15s to establish connection
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT,        30L);  // 30s total for API calls
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  body_write_cb);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &respBody);
-        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA,     &resp.headers);
-        // Don't follow redirects automatically — we handle them manually
-        // (mirrors the Go http.ErrUseLastResponse logic)
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
-        // Cookie engine: load from file and save back after each request
-        if (!m_cookieFile.empty()) {
-            curl_easy_setopt(curl, CURLOPT_COOKIEFILE, m_cookieFile.c_str());
-            curl_easy_setopt(curl, CURLOPT_COOKIEJAR,  m_cookieFile.c_str());
-        } else {
-            curl_easy_setopt(curl, CURLOPT_COOKIEFILE, ""); // enable in-memory cookie engine
-        }
+            // ── Setup curl ───────────────────────────────────────────────────
+            CURL* curl = curl_easy_init();
+            if (!curl) throw std::runtime_error("curl_easy_init failed");
 
-        // Build header list
-        struct curl_slist* hdrs = nullptr;
-        for (auto& [k, v] : reqHeaders) {
-            std::string h = k + ": " + v;
-            hdrs = curl_slist_append(hdrs, h.c_str());
-        }
-        if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+            HttpResponse resp;
+            std::string  respBody;
 
-        if (method == "POST") {
-            curl_easy_setopt(curl, CURLOPT_POST,          1L);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.c_str());
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
-                             static_cast<long>(body.size()));
-        } else {
-            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-        }
+            curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
+            curl_easy_setopt(curl, CURLOPT_USERAGENT,      USER_AGENT);
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT,        30L);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  body_write_cb);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &respBody);
+            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
+            curl_easy_setopt(curl, CURLOPT_HEADERDATA,     &resp.headers);
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+            if (!m_cookieFile.empty()) {
+                curl_easy_setopt(curl, CURLOPT_COOKIEFILE, m_cookieFile.c_str());
+                curl_easy_setopt(curl, CURLOPT_COOKIEJAR,  m_cookieFile.c_str());
+            } else {
+                curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
+            }
 
-        CURLcode rc = curl_easy_perform(curl);
-        if (hdrs) curl_slist_free_all(hdrs);
+            struct curl_slist* hdrs = nullptr;
+            for (auto& [k, v] : reqHeaders) {
+                std::string h = k + ": " + v;
+                hdrs = curl_slist_append(hdrs, h.c_str());
+            }
+            if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
 
-        if (rc != CURLE_OK) {
+            if (method == "POST") {
+                curl_easy_setopt(curl, CURLOPT_POST,          1L);
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.c_str());
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
+                                 static_cast<long>(body.size()));
+            } else {
+                curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+            }
+
+            // ── Perform ──────────────────────────────────────────────────────
+            rc = curl_easy_perform(curl);
+            if (hdrs) curl_slist_free_all(hdrs);
+
+            if (rc == CURLE_OK) {
+                long code = 0;
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+                curl_easy_cleanup(curl);
+                resp.statusCode = static_cast<int>(code);
+                resp.body       = std::move(respBody);
+                return resp;
+            }
+
             curl_easy_cleanup(curl);
-            throw std::runtime_error(
-                std::string("HTTP request failed: ") + curl_easy_strerror(rc));
+            ++attempt;
+
+            if (!is_retryable_curl(rc) || attempt > API_MAX_RETRIES) break;
         }
 
-        long code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-        resp.statusCode = static_cast<int>(code);
-        resp.body       = std::move(respBody);
-
-        curl_easy_cleanup(curl);
-        return resp;
+        throw std::runtime_error(
+            std::string("HTTP request failed: ") + curl_easy_strerror(rc));
     }
 };
