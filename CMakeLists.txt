@@ -294,9 +294,19 @@ else()
     target_compile_options(ipatool PRIVATE -Wall -Wextra -Wno-unused-parameter)
     if(APPLE)
         # IOKit needed for hwid.h (IOPlatformSerialNumber, IOPlatformUUID)
+        # The rest are transitive dependencies of a statically-linked libcurl:
+        #   SystemConfiguration — SCDynamicStoreCopyProxies (system proxy detection)
+        #   CoreServices        — pulled in alongside SystemConfiguration on macOS
+        #   z                   — zlib, used by curl's gzip/deflate Content-Encoding support
+        # All of these are system libraries/frameworks present on every Mac —
+        # not Homebrew dependencies, so static-linking them isn't possible or
+        # necessary; linking against them dynamically doesn't affect portability.
         target_link_libraries(ipatool PRIVATE
             "-framework IOKit"
             "-framework CoreFoundation"
+            "-framework SystemConfiguration"
+            "-framework CoreServices"
+            z
         )
     endif()
 endif()
