@@ -1,16 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
 
-# ── macOS deployment target ────────────────────────────────────────────────────
-# Catalina (10.15) is the floor we actually need: std::filesystem (used
-# throughout the project) only got full, working libc++ support on macOS
-# starting with 10.15 — older targets either fail to compile or throw at
-# runtime on filesystem calls. Set as a CACHE default (not a plain set())
-# so `-DCMAKE_OSX_DEPLOYMENT_TARGET=...` on the command line still overrides
-# it; must happen before project() or it has no effect.
-if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version")
-endif()
-
 # ── Static linking option (must be before project() for MSVC CRT selection) ───
 option(STATIC_BUILD "Build a static binary (Linux, macOS, and Windows)" OFF)
 
