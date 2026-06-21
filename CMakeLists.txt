@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ── Static linking option (must be before project() for MSVC CRT selection) ───
-option(STATIC_BUILD "Build a static binary (Linux and Windows)" OFF)
+option(STATIC_BUILD "Build a static binary (Linux, macOS, and Windows)" OFF)
 
 if(STATIC_BUILD AND WIN32)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "")
@@ -18,12 +18,43 @@ project(ipatool VERSION 1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
+if(STATIC_BUILD AND NOT WIN32)
     message(STATUS "Static build enabled — will build curl from source")
     set(BUILD_SHARED_LIBS OFF)
 
     include(ExternalProject)
     find_package(OpenSSL REQUIRED)
+
+    # On macOS, curl's configure needs an explicit --with-openssl=<path> —
+    # plain --with-openssl doesn't reliably find Homebrew's keg-only
+    # openssl@3 (it's not on the default search path on purpose, to avoid
+    # clashing with the system's old/absent OpenSSL headers).
+    # On Linux, bare --with-openssl auto-detects the system -dev package fine.
+    set(_curl_openssl_flag --with-openssl)
+    if(APPLE)
+        if(DEFINED OPENSSL_ROOT_DIR AND EXISTS "${OPENSSL_ROOT_DIR}")
+            set(_openssl_prefix "${OPENSSL_ROOT_DIR}")
+        else()
+            find_program(BREW_EXECUTABLE brew)
+            if(BREW_EXECUTABLE)
+                execute_process(
+                    COMMAND ${BREW_EXECUTABLE} --prefix openssl@3
+                    OUTPUT_VARIABLE _openssl_prefix
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET
+                )
+            endif()
+        endif()
+        if(_openssl_prefix AND EXISTS "${_openssl_prefix}")
+            message(STATUS "Static curl build will use OpenSSL at: ${_openssl_prefix}")
+            set(_curl_openssl_flag --with-openssl=${_openssl_prefix})
+        else()
+            message(WARNING
+                "Could not locate Homebrew's openssl@3 for the static curl build. "
+                "Pass -DOPENSSL_ROOT_DIR=<path> explicitly, or run "
+                "'brew install openssl@3' first.")
+        endif()
+    endif()
 
     # Build a minimal curl (HTTPS only, no SSH/LDAP/RTMP/HTTP2/brotli/zstd)
     ExternalProject_Add(curl_static
@@ -33,7 +64,7 @@ if(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
                 --prefix=<INSTALL_DIR>
                 --disable-shared
                 --enable-static
-                --with-openssl
+                ${_curl_openssl_flag}
                 --disable-ldap
                 --disable-ldaps
                 --disable-rtsp
@@ -74,7 +105,9 @@ if(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
     )
     add_dependencies(curl_static_lib curl_static)
 
-    add_link_options(-static-libgcc -static-libstdc++)
+    if(NOT APPLE)
+        add_link_options(-static-libgcc -static-libstdc++)
+    endif()
 endif()
 
 # ── Hint: if you didn't pass -DCMAKE_TOOLCHAIN_FILE, try to auto-detect vcpkg ─
@@ -231,8 +264,61 @@ if(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
     list(APPEND STATIC_LINK_LIBS ${ZLIB_STATIC})
 endif()
 
+if(STATIC_BUILD AND APPLE)
+    # Force static versions of OpenSSL/minizip via their Homebrew prefixes.
+    # zlib is left dynamic — it's a system library on every Mac (/usr/lib/libz.1.dylib),
+    # not a Homebrew dependency, so there's no portability reason to statically link it,
+    # and Homebrew doesn't ship a zlib formula by default (it'd require a separate install).
+    if(NOT _openssl_prefix)
+        message(FATAL_ERROR
+            "Static macOS build needs openssl@3 — pass -DOPENSSL_ROOT_DIR=<path> "
+            "or run 'brew install openssl@3'.")
+    endif()
+    find_library(OPENSSL_SSL_STATIC    NAMES libssl.a    PATHS "${_openssl_prefix}/lib" REQUIRED NO_DEFAULT_PATH)
+    find_library(OPENSSL_CRYPTO_STATIC NAMES libcrypto.a PATHS "${_openssl_prefix}/lib" REQUIRED NO_DEFAULT_PATH)
+
+    find_program(BREW_EXECUTABLE brew)
+    if(BREW_EXECUTABLE)
+        execute_process(
+            COMMAND ${BREW_EXECUTABLE} --prefix minizip
+            OUTPUT_VARIABLE _minizip_prefix
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+    endif()
+    if(_minizip_prefix AND EXISTS "${_minizip_prefix}/lib/libminizip.a")
+        set(MINIZIP_STATIC "${_minizip_prefix}/lib/libminizip.a")
+        target_include_directories(ipatool PRIVATE "${_minizip_prefix}/include")
+    endif()
+
+    message(STATUS "Static OpenSSL SSL:    ${OPENSSL_SSL_STATIC}")
+    message(STATUS "Static OpenSSL Crypto: ${OPENSSL_CRYPTO_STATIC}")
+    message(STATUS "Static minizip:        ${MINIZIP_STATIC}")
+
+    set(STATIC_LINK_LIBS
+        curl_static_lib
+        nlohmann_json::nlohmann_json
+        ${OPENSSL_SSL_STATIC}
+        ${OPENSSL_CRYPTO_STATIC}
+        z
+        "-framework IOKit"
+        "-framework CoreFoundation"
+        "-framework SystemConfiguration"
+        "-framework CoreServices"
+    )
+    if(MINIZIP_STATIC)
+        list(APPEND STATIC_LINK_LIBS ${MINIZIP_STATIC})
+        set(minizip_FOUND FALSE)  # don't also link the dynamic minizip::minizip target below
+    endif()
+endif()
+
 if(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
     # Linux static: use full .a paths built above
+    target_link_libraries(ipatool PRIVATE ${STATIC_LINK_LIBS})
+    add_dependencies(ipatool curl_static)
+    target_include_directories(ipatool PRIVATE "${STATIC_CURL_INCLUDE}")
+elseif(STATIC_BUILD AND APPLE)
+    # macOS static: same idea as Linux — full .a paths, our own minimal curl
     target_link_libraries(ipatool PRIVATE ${STATIC_LINK_LIBS})
     add_dependencies(ipatool curl_static)
     target_include_directories(ipatool PRIVATE "${STATIC_CURL_INCLUDE}")
