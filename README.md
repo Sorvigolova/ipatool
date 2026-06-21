@@ -24,7 +24,7 @@ ipatool-cpp protects your Apple ID credentials using machine-bound encryption �
 **In-memory protection:**
 - Sensitive fields (`passwordToken`, `password`) are AES-256-GCM encrypted in RAM at all times using `SecureString`
 - The in-memory key is **never stored** — it is derived fresh on every encrypt/decrypt call: `SHA256(get_machine_id() + "nice_key_is_nice" + passphrase)`
-- After each use the key is immediately wiped with `SecureZeroMemory`/`explicit_bzero`
+- After each use the key is immediately wiped via `secure_zero()` — a cross-platform wrapper (`SecureZeroMemory` on Windows, `memset_s` on macOS, `explicit_bzero` on Linux)
 - Plaintext exists only for microseconds during HTTP requests, then wiped
 - Only `g_passphrase` (the user-provided passphrase, which the user already knows) is kept in memory
 
@@ -124,8 +124,8 @@ Verify with `ldd build/ipatool` — should show only `linux-vdso.so.1`, `libc.so
 ```sh
 brew install curl nlohmann-json minizip openssl
 
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="-Dexplicit_bzero=bzero" ^
-      -DCMAKE_CXX_FLAGS="-Dexplicit_bzero=bzero" -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) ^
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+      -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
       -DOPENSSL_USE_STATIC_LIBS=TRUE
 cmake --build build
 ```

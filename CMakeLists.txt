@@ -181,7 +181,26 @@ find_package(OpenSSL REQUIRED)
 
 # ── Target ────────────────────────────────────────────────────────────────────
 
-add_executable(ipatool main.cpp)
+add_executable(ipatool
+    main.cpp
+    protect.cpp
+    hwid.cpp
+    appstore.cpp
+    http_client.cpp
+    plist.cpp
+    sha2.cpp
+    aes.cpp
+    # Headers below compile to nothing — included only so MSVC's Solution
+    # Explorer shows them under "Header Files" for easier navigation.
+    appstore.h
+    ipatool.h
+    protect.h
+    http_client.h
+    hwid.h
+    plist.h
+    sha2.h
+    aes.h
+)
 
 target_include_directories(ipatool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

@@ -21,10 +21,8 @@
 
 #include "appstore.h"
 #include "hwid.h"
-
-// Wire up machine ID function pointer for in-memory encryption (ipatool.h)
-// Must be done here since hwid.h is not visible from ipatool.h
-namespace { const bool _mid_init = (g_machine_id_fn = &get_machine_id, true); }
+#include "protect.h"   // secure_zero() — used directly for account file encryption
+#include "aes.h"        // aes::gcm_encrypt/decrypt — used directly for account file encryption
 
 #include <iostream>
 #include <fstream>
@@ -41,6 +39,18 @@ namespace { const bool _mid_init = (g_machine_id_fn = &get_machine_id, true); }
 #ifndef _WIN32
 #  include <sys/ioctl.h>
 #  include <unistd.h>
+#else
+// windows.h was previously pulled in transitively via the old ipatool.h;
+// that header is now logic-free and no longer includes it, so main.cpp
+// needs its own explicit include for HANDLE, MAX_PATH, console APIs,
+// MultiByteToWideChar, etc. used throughout this file.
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
 #endif
 
 // OpenSSL for AES-256-GCM encryption of the account file
@@ -175,27 +185,16 @@ static bool derive_file_key(const std::string& machine_id,
 static std::vector<unsigned char> aes_gcm_encrypt(const std::string& plaintext,
                                                     const std::string& machine_id,
                                                     const std::string& passphrase) {
-    unsigned char salt[SALT_LEN], iv[IV_LEN], key[KEY_LEN], tag[TAG_LEN];
+    unsigned char salt[SALT_LEN], key[KEY_LEN];
     RAND_bytes(salt, SALT_LEN);
-    RAND_bytes(iv,   IV_LEN);
+    Bytes iv(IV_LEN);
+    RAND_bytes(iv.data(), IV_LEN);
     if (!derive_file_key(machine_id, passphrase, salt, SALT_LEN, key))
         throw std::runtime_error("key derivation failed");
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, nullptr);
-    EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv);
-
-    std::vector<unsigned char> ct(plaintext.size() + 16);
-    int len = 0, total = 0;
-    EVP_EncryptUpdate(ctx, ct.data(), &len,
-                      (const unsigned char*)plaintext.data(), (int)plaintext.size());
-    total = len;
-    EVP_EncryptFinal_ex(ctx, ct.data() + total, &len);
-    total += len;
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag);
-    EVP_CIPHER_CTX_free(ctx);
-    ct.resize(total);
+    Bytes key_bytes(key, key + KEY_LEN);
+    Bytes pt(plaintext.begin(), plaintext.end());
+    aes::GcmOutput result = aes::gcm_encrypt(key_bytes, iv, pt);
 
     // Pack: version(1) | salt_len(4) | salt | iv | tag | ciphertext
     std::vector<unsigned char> out;
@@ -203,16 +202,11 @@ static std::vector<unsigned char> aes_gcm_encrypt(const std::string& plaintext,
     uint32_t sl = SALT_LEN;
     out.insert(out.end(), (unsigned char*)&sl, (unsigned char*)&sl + 4);
     out.insert(out.end(), salt, salt + SALT_LEN);
-    out.insert(out.end(), iv,   iv   + IV_LEN);
-    out.insert(out.end(), tag,  tag  + TAG_LEN);
-    out.insert(out.end(), ct.begin(), ct.end());
+    out.insert(out.end(), iv.begin(), iv.end());
+    out.insert(out.end(), result.tag.begin(), result.tag.end());
+    out.insert(out.end(), result.ciphertext.begin(), result.ciphertext.end());
 
-    // Wipe key material from stack
-#ifdef _WIN32
-    SecureZeroMemory(key, KEY_LEN);
-#else
-    explicit_bzero(key, KEY_LEN);
-#endif
+    secure_zero(key, KEY_LEN);
     return out;
 }
 
@@ -241,38 +235,24 @@ static std::string aes_gcm_decrypt(const std::vector<unsigned char>& blob,
         throw std::runtime_error("account file is corrupted");
 
     const unsigned char* salt = p; p += sl;
-    const unsigned char* iv   = p; p += IV_LEN;
-    unsigned char tag[TAG_LEN];
-    memcpy(tag, p, TAG_LEN); p += TAG_LEN;
+    Bytes iv(p, p + IV_LEN); p += IV_LEN;
+    Bytes tag(p, p + TAG_LEN); p += TAG_LEN;
     size_t ct_len = blob.size() - (size_t)(p - blob.data());
+    Bytes ct(p, p + ct_len);
 
     unsigned char key[KEY_LEN];
     if (!derive_file_key(machine_id, passphrase, salt, (int)sl, key))
         throw std::runtime_error("key derivation failed");
 
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, nullptr);
-    EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, iv);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN, tag);
+    Bytes key_bytes(key, key + KEY_LEN);
+    secure_zero(key, KEY_LEN);
 
-    std::vector<unsigned char> plain(ct_len + 16);
-    int len = 0, total = 0;
-    EVP_DecryptUpdate(ctx, plain.data(), &len, p, (int)ct_len);
-    total = len;
-    int ret = EVP_DecryptFinal_ex(ctx, plain.data() + total, &len);
-    EVP_CIPHER_CTX_free(ctx);
-
-#ifdef _WIN32
-    SecureZeroMemory(key, KEY_LEN);
-#else
-    explicit_bzero(key, KEY_LEN);
-#endif
-
-    if (ret <= 0)
+    try {
+        Bytes plain = aes::gcm_decrypt(key_bytes, iv, ct, tag);
+        return std::string(plain.begin(), plain.end());
+    } catch (const std::exception&) {
         throw std::runtime_error("decryption failed — wrong device or passphrase");
-    total += len;
-    return std::string((char*)plain.data(), total);
+    }
 }
 
 
@@ -1216,6 +1196,10 @@ int main(int argc, char** argv) {
         std::cerr << "Error: invalid format \''" << g_format << "\'' — use \'text\' or \'json\'\n";
         return 1;
     }
+
+    // Wire up machine ID function pointer for in-memory encryption (protect.h).
+    // Must happen before any SecureString::set()/get() call, anywhere.
+    g_machine_id_fn = &get_machine_id;
 
     // Store passphrase for in-memory encryption — machine_id derived fresh each call
     std::string passphrase = get(args, "keychain-passphrase", "");

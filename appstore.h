@@ -3,83 +3,48 @@
 // AppStore — C++ port of ipatool/pkg/appstore
 // Cross-platform: Windows (MSVC / VS2022), Linux, macOS
 //
+// Declarations only — see appstore.cpp for implementations.
+// Includes the storefront ID -> country code table and iTunes Search/Lookup
+// JSON parsing, merged in here since they're App Store specific data, not
+// general-purpose.
+
 #include "ipatool.h"
 #include "http_client.h"
 #include "plist.h"
-#include "json_helpers.h"
-#include "storefront.h"
 
 #include <string>
 #include <vector>
 #include <map>
-#include <set>
-#include <functional>
-#include <sstream>
-#include <stdexcept>
-#include <cstring>
-#include <algorithm>
-#include <cctype>
-#include <cstdio>
-#include <fstream>
-#include <filesystem>   // C++17 — replaces getcwd / stat / S_ISDIR
-#include <regex>
+#include <nlohmann/json.hpp>
 
-// ── Platform headers ──────────────────────────────────────────────────────────
+using json = nlohmann::json;
 
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
-#  include <iphlpapi.h>
-#  pragma comment(lib, "iphlpapi.lib")
-#  pragma comment(lib, "ws2_32.lib")
-#else
-#  include <sys/socket.h>
-#  include <sys/ioctl.h>
-#  include <net/if.h>
-#  include <ifaddrs.h>
-#  ifdef __linux__
-#    include <netpacket/packet.h>
-#  elif defined(__APPLE__)
-#    include <net/if_dl.h>
-#  endif
-#endif
+// ── Data types ───────────────────────────────────────────────────────────────
 
-// ── minizip for cross-platform ZIP writing ────────────────────────────────────
+// App and Sinf live in ipatool.h (shared with the rest of the project).
 
-#ifdef HAVE_MINIZIP
-#  include <minizip/zip.h>
-#  include <minizip/unzip.h>
-#endif
+// ── JSON parsing (iTunes Search/Lookup API responses) ─────────────────────────
 
-namespace fs = std::filesystem;
+App app_from_json(const json& j);
 
-// ── URL encode helper ─────────────────────────────────────────────────────────
+struct SearchResult {
+    int              count = 0;
+    std::vector<App> results;
+};
 
-static std::string url_encode(const std::string& s) {
-    std::ostringstream out;
-    for (unsigned char c : s) {
-        if (std::isalnum(c) || c=='-' || c=='_' || c=='.' || c=='~') {
-            out << c;
-        } else {
-            out << '%' << std::uppercase << std::hex << (int)c;
-        }
-    }
-    return out.str();
-}
+SearchResult parse_search_json(const std::string& body);
 
-static std::string build_query(const std::map<std::string, std::string>& params) {
-    std::string q;
-    for (auto& [k, v] : params) {
-        if (!q.empty()) q += '&';
-        q += url_encode(k) + '=' + url_encode(v);
-    }
-    return q;
-}
+// ── Storefront -> country code ──────────────────────────────────────────────
+// account.storeFront looks like "143441-1,32" — the numeric ID before the
+// dash maps to a 2-letter ISO country code (e.g. "143441" -> "US"), needed
+// for iTunes Search API calls (search, lookup, lookup_by_id).
+// Throws std::runtime_error if sf doesn't match any known storefront ID.
+std::string country_code_from_storefront(const std::string& sf);
+
+// ── URL / query helpers ──────────────────────────────────────────────────────
+
+std::string url_encode(const std::string& s);
+std::string build_query(const std::map<std::string, std::string>& params);
 
 // ── AppStore class ────────────────────────────────────────────────────────────
 
@@ -99,23 +64,14 @@ public:
     // Fetch bag.xml and return both auth and redownload endpoints.
     // Call this before download / list-versions / get-version-metadata to
     // obtain the redownloadEndpoint needed for the 5002 fallback.
-    BagOutput fetch_bag() {
-        return fetch_bag_impl(get_guid());
-    }
+    BagOutput fetch_bag();
 
     // ── Login ────────────────────────────────────────────────────────────────
 
     Account login(const std::string& email,
                   const std::string& password,
                   const std::string& authCode = "",
-                  const std::string& endpoint = "")
-    {
-        std::string guid = get_guid();
-        std::string loginEndpoint = endpoint.empty()
-                                  ? fetch_bag_auth_endpoint(guid)
-                                  : endpoint;
-        return do_login(email, password, authCode, guid, loginEndpoint);
-    }
+                  const std::string& endpoint = "");
 
     // ── Search ───────────────────────────────────────────────────────────────
 
@@ -124,72 +80,19 @@ public:
         std::vector<App> results;
     };
 
-    SearchOutput search(const Account& acc, const std::string& term, int limit = 5) {
-        std::string cc  = country_code_from_storefront(acc.storeFront);
-        std::string url = search_url(term, cc, limit);
-
-        HttpResponse res = m_http.get(url);
-        if (res.statusCode != 200)
-            throw IpaError("search request failed: " + std::to_string(res.statusCode));
-
-        auto sr = parse_search_json(res.body);
-        return {sr.count, sr.results};
-    }
+    SearchOutput search(const Account& acc, const std::string& term, int limit = 5);
 
     // ── Lookup by bundle ID ───────────────────────────────────────────────────
 
-    App lookup(const Account& acc, const std::string& bundleID) {
-        std::string cc  = country_code_from_storefront(acc.storeFront);
-        std::string url = lookup_url(bundleID, cc);
-
-        HttpResponse res = m_http.get(url);
-        if (res.statusCode != 200)
-            throw IpaError("lookup request failed: " + std::to_string(res.statusCode));
-
-        auto sr = parse_search_json(res.body);
-        if (sr.results.empty()) throw IpaError("app not found");
-        return sr.results[0];
-    }
+    App lookup(const Account& acc, const std::string& bundleID);
 
     // ── Lookup by numeric app ID ──────────────────────────────────────────────
 
-    App lookup_by_id(const Account& acc, int64_t appID) {
-        std::string cc  = country_code_from_storefront(acc.storeFront);
-        std::map<std::string, std::string> p = {
-            {"entity",  "software,iPadSoftware"},
-            {"limit",   "1"},
-            {"media",   "software"},
-            {"id",      std::to_string(appID)},
-            {"country", cc},
-        };
-        std::string url = std::string("https://") + ITUNES_API_DOMAIN
-                        + ITUNES_API_PATH_LOOKUP + "?" + build_query(p);
-
-        HttpResponse res = m_http.get(url);
-        if (res.statusCode != 200)
-            throw IpaError("lookup request failed: " + std::to_string(res.statusCode));
-
-        auto sr = parse_search_json(res.body);
-        if (sr.results.empty()) throw IpaError("app not found");
-        return sr.results[0];
-    }
+    App lookup_by_id(const Account& acc, int64_t appID);
 
     // ── Purchase (free apps) ──────────────────────────────────────────────────
 
-    void purchase(const Account& acc, const App& app) {
-        if (app.price > 0.0) throw PaidAppNotSupported();
-
-        std::string guid = get_guid();
-        try {
-            do_purchase(acc, app, guid, PRICING_APPSTORE);
-        } catch (const IpaError& e) {
-            if (std::string(e.what()).find("temporarily unavailable") != std::string::npos) {
-                do_purchase(acc, app, guid, PRICING_ARCADE);
-            } else {
-                throw;
-            }
-        }
-    }
+    void purchase(const Account& acc, const App& app);
 
     // ── Download ──────────────────────────────────────────────────────────────
 
@@ -203,82 +106,7 @@ public:
                             const std::string& outputPath = "",
                             const std::string& externalVersionID = "",
                             ProgressCb progress = nullptr,
-                            const std::string& redownloadEndpoint = "")
-    {
-        std::string guid = get_guid();
-
-        if (m_debug) {
-            std::string pod_pfx;
-            if (!acc.pod.empty()) pod_pfx = "p" + acc.pod + "-";
-            std::string dbgUrl = "https://" + pod_pfx + std::string(PRIVATE_AS_DOMAIN)
-                               + PRIVATE_AS_PATH_DOWNLOAD + "?guid=" + guid;
-            fprintf(stderr, "[DEBUG] download URL: %s\n", dbgUrl.c_str());
-            fprintf(stderr, "[DEBUG] dsid: %s\n", acc.directoryServicesID.c_str());
-            fprintf(stderr, "[DEBUG] storefront: '%s'\n", acc.storeFront.c_str());
-            fprintf(stderr, "[DEBUG] passwordToken length: %zu\n", acc.passwordToken.get().size());
-            fprintf(stderr, "[DEBUG] pod: '%s'\n", acc.pod.c_str());
-        }
-
-        PlistDict data = send_download_product(acc, app, guid, externalVersionID, redownloadEndpoint);
-
-        std::string failureType     = dict_str(data, "failureType");
-        std::string customerMessage = dict_str(data, "customerMessage");
-
-        if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED) throw PasswordTokenExpired();
-        if (customerMessage == CUSTOMER_MSG_SIGN_IN)        throw PasswordTokenExpired();
-        if (failureType == FAILURE_LICENSE_NOT_FOUND)      throw LicenseRequired();
-        if (!failureType.empty() && !customerMessage.empty())
-            throw IpaError("received error: " + customerMessage);
-        if (!failureType.empty())
-            throw IpaError("received error: " + failureType);
-
-        auto songList = dict_arr(data, "songList");
-        if (songList.empty()) {
-            if (!customerMessage.empty()) throw IpaError(customerMessage);
-            throw IpaError("invalid response: empty songList");
-        }
-
-        auto& itemVal = songList[0];
-        if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
-
-        const PlistDict& item       = itemVal.dictVal;
-        std::string      downloadURL = dict_str(item, "URL");
-        std::string      version     = "unknown";
-
-        auto metaIt  = item.find("metadata");
-        PlistDict metadata;
-        if (metaIt != item.end() && metaIt->second.isDict()) {
-            metadata = metaIt->second.dictVal;
-            auto vIt = metadata.find("bundleShortVersionString");
-            if (vIt != metadata.end() && vIt->second.isString())
-                version = vIt->second.str();
-        }
-
-        std::vector<Sinf> sinfs;
-        auto sinfsIt = item.find("sinfs");
-        if (sinfsIt != item.end() && sinfsIt->second.isArray()) {
-            for (auto& sv : sinfsIt->second.arrayVal) {
-                if (!sv.isDict()) continue;
-                Sinf s;
-                s.id = dict_int(sv.dictVal, "id");
-                auto dit = sv.dictVal.find("sinf");
-                if (dit != sv.dictVal.end() && dit->second.isData())
-                    s.data = dit->second.dataVal;
-                sinfs.push_back(std::move(s));
-            }
-        }
-
-        std::string dest    = resolve_destination(app, version, outputPath);
-        std::string tmpDest = dest + ".tmp";
-
-        int64_t rangeStart = file_size(tmpDest);
-        m_http.download(downloadURL, tmpDest, rangeStart, progress);
-
-        apply_patches(item, acc, tmpDest, dest, sinfs);
-        fs::remove(tmpDest);
-
-        return {dest, sinfs};
-    }
+                            const std::string& redownloadEndpoint = "");
 
 public:
     void set_debug(bool v) { m_debug = v; m_http.set_debug(v); }
@@ -290,53 +118,7 @@ public:
     };
 
     ListVersionsOutput list_versions(const Account& acc, const App& app,
-                                     const std::string& redownloadEndpoint = "") {
-        std::string guid = get_guid();
-
-        PlistDict data = send_download_product(acc, app, guid, "", redownloadEndpoint);
-
-        std::string failureType     = dict_str(data, "failureType");
-        std::string customerMessage = dict_str(data, "customerMessage");
-        if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED) throw PasswordTokenExpired();
-        if (customerMessage == CUSTOMER_MSG_SIGN_IN)        throw PasswordTokenExpired();
-        if (failureType == FAILURE_LICENSE_NOT_FOUND)      throw LicenseRequired();
-        if (!failureType.empty() && !customerMessage.empty())
-            throw IpaError("received error: " + customerMessage);
-        if (!failureType.empty())
-            throw IpaError("received error: " + failureType);
-
-        auto songList = dict_arr(data, "songList");
-        if (songList.empty()) {
-            if (!customerMessage.empty()) throw IpaError(customerMessage);
-            throw IpaError("invalid response: empty songList");
-        }
-        auto& itemVal = songList[0];
-        if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
-        const PlistDict& item = itemVal.dictVal;
-
-        auto metaIt = item.find("metadata");
-        if (metaIt == item.end() || !metaIt->second.isDict())
-            throw IpaError("failed to get version identifiers from item metadata");
-        const PlistDict& metadata = metaIt->second.dictVal;
-
-        // softwareVersionExternalIdentifiers — array of version IDs
-        ListVersionsOutput out;
-        auto idsIt = metadata.find("softwareVersionExternalIdentifiers");
-        if (idsIt == metadata.end() || !idsIt->second.isArray())
-            throw IpaError("failed to get version identifiers from item metadata");
-        for (auto& v : idsIt->second.arrayVal)
-            out.externalVersionIdentifiers.push_back(v.isInt()
-                ? std::to_string(v.intVal) : v.str());
-
-        // softwareVersionExternalIdentifier — latest version
-        auto latIt = metadata.find("softwareVersionExternalIdentifier");
-        if (latIt == metadata.end())
-            throw IpaError("failed to get latest version from item metadata");
-        out.latestExternalVersionID = latIt->second.isInt()
-            ? std::to_string(latIt->second.intVal) : latIt->second.str();
-
-        return out;
-    }
+                                     const std::string& redownloadEndpoint = "");
 
     // ── Get Version Metadata ─────────────────────────────────────────────────
     struct GetVersionMetadataOutput {
@@ -347,485 +129,47 @@ public:
     GetVersionMetadataOutput get_version_metadata(const Account& acc,
                                                    const App& app,
                                                    const std::string& versionID,
-                                                   const std::string& redownloadEndpoint = "") {
-        std::string guid = get_guid();
-
-        PlistDict data = send_download_product(acc, app, guid, versionID, redownloadEndpoint);
-
-        std::string failureType     = dict_str(data, "failureType");
-        std::string customerMessage = dict_str(data, "customerMessage");
-        if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED) throw PasswordTokenExpired();
-        if (customerMessage == CUSTOMER_MSG_SIGN_IN)        throw PasswordTokenExpired();
-        if (failureType == FAILURE_LICENSE_NOT_FOUND)      throw LicenseRequired();
-        if (!failureType.empty() && !customerMessage.empty())
-            throw IpaError("received error: " + customerMessage);
-        if (!failureType.empty())
-            throw IpaError("received error: " + failureType);
-
-        auto songList = dict_arr(data, "songList");
-        if (songList.empty()) {
-            if (!customerMessage.empty()) throw IpaError(customerMessage);
-            throw IpaError("invalid response: empty songList");
-        }
-        auto& itemVal = songList[0];
-        if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
-        const PlistDict& item = itemVal.dictVal;
-
-        auto metaIt = item.find("metadata");
-        if (metaIt == item.end() || !metaIt->second.isDict())
-            throw IpaError("failed to get metadata from item");
-        const PlistDict& metadata = metaIt->second.dictVal;
-
-        GetVersionMetadataOutput out;
-        auto dvIt = metadata.find("bundleShortVersionString");
-        if (dvIt != metadata.end()) out.displayVersion = dvIt->second.str();
-        auto rdIt = metadata.find("releaseDate");
-        if (rdIt != metadata.end()) out.releaseDate = rdIt->second.str();
-
-        return out;
-    }
-
+                                                   const std::string& redownloadEndpoint = "");
 
 private:
     HttpClient m_http;
     bool       m_debug = false;
 
-    // ── MAC address / GUID ───────────────────────────────────────────────────
+    static std::string get_guid();
 
-    static std::string get_guid() {
-#ifdef _WIN32
-        // Windows: enumerate adapters via iphlpapi
-        ULONG bufLen = sizeof(IP_ADAPTER_INFO);
-        std::vector<BYTE> buf(bufLen);
-        if (GetAdaptersInfo(reinterpret_cast<PIP_ADAPTER_INFO>(buf.data()), &bufLen)
-                == ERROR_BUFFER_OVERFLOW) {
-            buf.resize(bufLen);
-        }
-        PIP_ADAPTER_INFO adapter =
-            reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
-        if (GetAdaptersInfo(adapter, &bufLen) == NO_ERROR) {
-            while (adapter) {
-                // Skip loopback (address = 00:00:00:00:00:00) and software adapters
-                bool allZero = true;
-                for (UINT i = 0; i < adapter->AddressLength; i++)
-                    if (adapter->Address[i]) { allZero = false; break; }
-                if (!allZero && adapter->AddressLength == 6) {
-                    char buf2[32];
-                    snprintf(buf2, sizeof(buf2),
-                        "%02X%02X%02X%02X%02X%02X",
-                        adapter->Address[0], adapter->Address[1],
-                        adapter->Address[2], adapter->Address[3],
-                        adapter->Address[4], adapter->Address[5]);
-                    return std::string(buf2);
-                }
-                adapter = adapter->Next;
-            }
-        }
-#elif defined(__APPLE__) || defined(__linux__)
-        // POSIX: walk interface addresses
-        struct ifaddrs* ifap = nullptr;
-        if (getifaddrs(&ifap) == 0) {
-            for (struct ifaddrs* ifa = ifap; ifa; ifa = ifa->ifa_next) {
-                if (!ifa->ifa_addr) continue;
-#  ifdef __APPLE__
-                if (ifa->ifa_addr->sa_family != AF_LINK) continue;
-                auto* sdl = reinterpret_cast<struct sockaddr_dl*>(ifa->ifa_addr);
-                if (sdl->sdl_alen != 6) continue;
-                unsigned char* mac = reinterpret_cast<unsigned char*>(
-                    LLADDR(sdl));
-#  else // Linux
-                if (ifa->ifa_addr->sa_family != AF_PACKET) continue;
-                auto* sll = reinterpret_cast<struct sockaddr_ll*>(ifa->ifa_addr);
-                if (sll->sll_halen != 6) continue;
-                unsigned char* mac = sll->sll_addr;
-#  endif
-                // Skip loopback
-                bool allZero = (mac[0]|mac[1]|mac[2]|mac[3]|mac[4]|mac[5]) == 0;
-                if (allZero) continue;
-                char buf2[32];
-                snprintf(buf2, sizeof(buf2),
-                    "%02X%02X%02X%02X%02X%02X",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-                freeifaddrs(ifap);
-                return std::string(buf2);
-            }
-            freeifaddrs(ifap);
-        }
-#endif
-        return "AABBCCDDEEFF"; // fallback
-    }
-
-    // ── sendDownloadProduct ─── shared volumeStore→redownload helper ─────────
+    // ── sendDownloadProduct — shared volumeStore->redownload helper ─────────
     //
     // Sends to volumeStore first (uses externalVersionId version key).
     // On failureType "5002" (licensed app), falls back to bag-resolved
     // redownloadProduct (uses appExtVrsId key):
-    //   • redownload serves the app                    → use redownload response
-    //   • redownload: empty songList + "No Longer Available"
-    //                                                  → transient 5002 → retry volumeStore
+    //   - redownload serves the app                    -> use redownload response
+    //   - redownload: empty songList + "No Longer Available"
+    //                                                  -> transient 5002 -> retry volumeStore
     // Returns the top-level response PlistDict for the caller to inspect.
     PlistDict send_download_product(const Account& acc, const App& app,
                                      const std::string& guid,
                                      const std::string& externalVersionID,
-                                     const std::string& redownloadEndpoint)
-    {
-        std::string pod_prefix;
-        if (!acc.pod.empty()) pod_prefix = "p" + acc.pod + "-";
-        std::string vsUrl = "https://" + pod_prefix + std::string(PRIVATE_AS_DOMAIN)
-                          + PRIVATE_AS_PATH_DOWNLOAD + "?guid=" + guid;
-
-        std::map<std::string, std::string> hdrs = {
-            {"Content-Type", "application/x-apple-plist"},
-            {"iCloud-DSID",  acc.directoryServicesID},
-            {"X-Dsid",       acc.directoryServicesID},
-        };
-
-        // volumeStore payload: version pin key = externalVersionId
-        auto make_vs_payload = [&]() {
-            PlistDict p;
-            p["creditDisplay"] = PlistValue::makeString("");
-            p["guid"]          = PlistValue::makeString(guid);
-            p["salableAdamId"] = PlistValue::makeInt(app.id);
-            if (!externalVersionID.empty())
-                p["externalVersionId"] = PlistValue::makeString(externalVersionID);
-            return p;
-        };
-
-        // redownload payload: version pin key = appExtVrsId (different key, same value)
-        auto make_rd_payload = [&]() {
-            PlistDict p;
-            p["creditDisplay"] = PlistValue::makeString("");
-            p["guid"]          = PlistValue::makeString(guid);
-            p["salableAdamId"] = PlistValue::makeInt(app.id);
-            if (!externalVersionID.empty())
-                p["appExtVrsId"] = PlistValue::makeString(externalVersionID);
-            return p;
-        };
-
-        // 1. Try volumeStore (primary — every app that works today keeps using this)
-        HttpResponse vsRes = m_http.post(vsUrl, encode_plist_xml(make_vs_payload()), hdrs);
-        if (m_debug) {
-            fprintf(stderr, "[DEBUG] volumeStore status: %d\n", vsRes.statusCode);
-            fprintf(stderr, "[DEBUG] volumeStore body (first 500):\n%.500s\n", vsRes.body.c_str());
-        }
-        PlistDict data        = decode_plist(vsRes.body);
-        std::string failureType = dict_str(data, "failureType");
-
-        // 2. On 5002 (licensed app — e.g. Teams) fall back to redownloadProduct
-        if (failureType == FAILURE_ALREADY_PURCHASED && !redownloadEndpoint.empty()) {
-            std::string rdUrl = redownloadEndpoint + "?guid=" + guid;
-            HttpResponse rdRes = m_http.post(rdUrl, encode_plist_xml(make_rd_payload()), hdrs);
-            if (m_debug) {
-                fprintf(stderr, "[DEBUG] redownload fallback status: %d\n", rdRes.statusCode);
-                fprintf(stderr, "[DEBUG] redownload fallback body (first 500):\n%.500s\n", rdRes.body.c_str());
-            }
-            PlistDict rdData         = decode_plist(rdRes.body);
-            auto      rdSongList     = dict_arr(rdData, "songList");
-            std::string rdCustomerMsg = dict_str(rdData, "customerMessage");
-
-            // If redownload can't serve the app (empty songList — for any reason:
-            //   "No Longer Available"               → transient 5002, app not in library
-            //   "Redownload Unavailable with This Apple Account" → no license yet
-            //   any other refusal
-            // ) → retry volumeStore.
-            // The retry surfaces the real Apple error (e.g. 9610 → LicenseRequired
-            // so --purchase can kick in, or a clean success if the 5002 was transient).
-            if (rdSongList.empty()) {
-                if (m_debug)
-                    fprintf(stderr,
-                        "[DEBUG] redownload empty (msg: '%s') — retrying volumeStore\n",
-                        rdCustomerMsg.c_str());
-                HttpResponse retryRes = m_http.post(vsUrl, encode_plist_xml(make_vs_payload()), hdrs);
-                if (m_debug) {
-                    fprintf(stderr, "[DEBUG] volumeStore retry status: %d\n", retryRes.statusCode);
-                    fprintf(stderr, "[DEBUG] volumeStore retry body (first 500):\n%.500s\n", retryRes.body.c_str());
-                }
-                PlistDict retryData = decode_plist(retryRes.body);
-
-                // If volumeStore still returns 5002 after the retry, the failure is
-                // not transient — the account has no license for this app.
-                // Throw LicenseRequired so the --purchase flag can acquire it.
-                if (dict_str(retryData, "failureType") == FAILURE_ALREADY_PURCHASED) {
-                    if (m_debug)
-                        fprintf(stderr,
-                            "[DEBUG] volumeStore retry still 5002 — no license, "
-                            "throwing LicenseRequired\n");
-                    throw LicenseRequired();
-                }
-
-                return retryData;
-            }
-
-            // Redownload has a result (non-empty songList) → use it
-            return rdData;
-        }
-
-        return data;
-    }
+                                     const std::string& redownloadEndpoint);
 
     // ── Bag (fetch auth + redownload endpoints) ──────────────────────────────
+    BagOutput fetch_bag_impl(const std::string& guid);
 
-    BagOutput fetch_bag_impl(const std::string& guid) {
-        std::string url = std::string("https://") + PRIVATE_INIT_DOMAIN
-                        + PRIVATE_INIT_PATH + "?guid=" + guid;
-        HttpResponse res = m_http.get(url, {{"Accept", "application/xml"}});
-
-        if (m_debug) {
-            fprintf(stderr, "[DEBUG] bag status: %d\n", res.statusCode);
-            fprintf(stderr, "[DEBUG] bag body:\n%s\n", res.body.c_str());
-        }
-
-        if (res.statusCode != 200)
-            throw IpaError("bag request failed: " + std::to_string(res.statusCode));
-
-        PlistDict d = decode_plist(res.body);
-
-        if (m_debug) {
-            fprintf(stderr, "[DEBUG] parsed plist top-level keys:");
-            for (auto& [k, v] : d) fprintf(stderr, " '%s'", k.c_str());
-            fprintf(stderr, "\n");
-        }
-
-        BagOutput out;
-
-        // Extract redownloadProduct (simple flat lookup under urlBag)
-        auto ubIt = d.find("urlBag");
-        if (ubIt != d.end() && ubIt->second.isDict()) {
-            out.redownloadEndpoint = dict_str(ubIt->second.dictVal, "redownloadProduct");
-        }
-
-        // Extract authenticateAccount (complex: may need URL addend)
-        std::string ep;
-
-        // Try nested: d["urlBag"]["authenticateAccount"]
-        if (ubIt != d.end() && ubIt->second.isDict()) {
-            ep = dict_str(ubIt->second.dictVal, "authenticateAccount");
-            if (!ep.empty()) goto FOUND_URL;
-        }
-
-        // Try flat: d["authenticateAccount"] directly
-        {
-            ep = dict_str(d, "authenticateAccount");
-            if (!ep.empty()) goto FOUND_URL;
-        }
-
-        // Scan all top-level dict values for authenticateAccount
-        for (auto& [k, v] : d) {
-            if (v.isDict()) {
-                ep = dict_str(v.dictVal, "authenticateAccount");
-                if (!ep.empty()) goto FOUND_URL;
-            }
-        }
-
-        FOUND_URL:
-        if (!ep.empty()) {
-            //Try to find URL addend by its path and add it to the tail
-            std::string addend;
-            std::string path = std::regex_replace(ep, std::regex(R"(^https?://[^/]+(/?))"), "");
-
-            //Check if path is empty
-            if (path.empty()) { out.authEndpoint = ep; return out; }
-
-            // Temporary stack for linear deep XML traversal
-            std::vector<std::reference_wrapper<const PlistDict>> xml_stack;
-            xml_stack.push_back(d);
-
-            while (!xml_stack.empty()) {
-                const PlistDict& current_layer = xml_stack.back();
-                xml_stack.pop_back();
-
-                // Try to find the target path key on the current layer
-                auto it = current_layer.find(path);
-                if (it != current_layer.end()) {
-                    auto& v = it->second;
-
-                    // Check if it is a non-empty array
-                    if (v.isArray() && !v.arrayVal.empty()) {
-
-                        // Get the first element from the array
-                        auto& first_item = v.arrayVal[0];
-
-                        // Check if it is a string and extract it
-                        if (first_item.isString()) {
-                            addend = first_item.strVal;
-                            goto FOUND_ADDEND;
-                        }
-                    }
-                }
-
-                // Push all nested dictionaries onto the stack for further processing
-                for (auto& [k, v] : current_layer) {
-                    if (v.isDict()) {
-                        xml_stack.push_back(v.dictVal);
-                    }
-                }
-            }
-            FOUND_ADDEND:
-            if (!addend.empty()) {
-                if (ep.back() != '/') ep += "/";
-                ep += addend;
-                ep += "/";
-            }
-
-            out.authEndpoint = ep;
-            return out;
-        }
-
-        // Fallback to known-good hardcoded endpoint
-        fprintf(stderr,
-            "[WARN] Could not parse urlBag -- using default auth endpoint.\n"
-            "       Retry with --debug to inspect the raw server response.\n");
-        out.authEndpoint = "https://auth.itunes.apple.com/auth/v1/native/fast";
-        return out;
-    }
-
-    std::string fetch_bag_auth_endpoint(const std::string& guid) {
-        return fetch_bag_impl(guid).authEndpoint;
-    }
+    std::string fetch_bag_auth_endpoint(const std::string& guid);
 
     // ── Login implementation ─────────────────────────────────────────────────
-
     Account do_login(const std::string& email,
                      const std::string& password,
                      const std::string& authCode,
                      const std::string& guid,
-                     const std::string& baseEndpoint)
-    {
-        std::string  currentURL = baseEndpoint;
-        bool         retry      = true;
-        HttpResponse lastRes;
-        PlistDict    lastData;
-
-        for (int attempt = 1; retry && attempt <= 4; attempt++) {
-            PlistDict payload;
-            payload["appleId"]  = PlistValue::makeString(email);
-            payload["attempt"]  = PlistValue::makeString(std::to_string(attempt));
-            payload["guid"]     = PlistValue::makeString(guid);
-            payload["password"] = PlistValue::makeString(password + strip_spaces(authCode));
-            payload["rmp"]      = PlistValue::makeString("0");
-            payload["why"]      = PlistValue::makeString("signIn");
-
-            std::map<std::string, std::string> headers = {
-                {"Content-Type", "application/x-www-form-urlencoded"},
-            };
-
-            lastRes  = m_http.post(currentURL, encode_plist_xml(payload), headers);
-            lastData = decode_plist(lastRes.body);
-
-            std::string failureType     = dict_str(lastData, "failureType");
-            std::string customerMessage = dict_str(lastData, "customerMessage");
-
-            if (lastRes.statusCode == 302) {
-                auto locIt = lastRes.headers.find("location");
-                if (locIt == lastRes.headers.end())
-                    throw IpaError("redirect with no location header");
-                currentURL = locIt->second;
-                retry = true;
-            } else if (attempt == 1 && failureType == FAILURE_INVALID_CREDENTIALS) {
-                retry = true;
-            } else if (failureType.empty() && authCode.empty()
-                       && customerMessage == CUSTOMER_MSG_BAD_LOGIN) {
-                throw AuthCodeRequired();
-            } else if (failureType.empty()
-                       && customerMessage == CUSTOMER_MSG_ACCOUNT_DISABLED) {
-                throw IpaError("account is disabled");
-            } else if (!failureType.empty()) {
-                throw IpaError(!customerMessage.empty() ? customerMessage : "something went wrong");
-            } else if (lastRes.statusCode != 200
-                       || dict_str(lastData, "passwordToken").empty()
-                       || dict_str(lastData, "dsPersonId").empty()) {
-                throw IpaError("something went wrong (status="
-                               + std::to_string(lastRes.statusCode) + ")");
-            } else {
-                retry = false;
-            }
-        }
-
-        if (retry) throw IpaError("too many login attempts");
-
-        std::string sf, pod;
-        {
-            auto it = lastRes.headers.find(str_lower(HTTP_HEADER_STOREFRONT));
-            if (it != lastRes.headers.end()) sf = it->second;
-        }
-        {
-            auto it = lastRes.headers.find(str_lower(HTTP_HEADER_POD));
-            if (it != lastRes.headers.end()) pod = it->second;
-        }
-
-        auto addrDict = dict_dict(dict_dict(lastData, "accountInfo"), "address");
-
-        Account acc;
-        acc.firstName           = dict_str(addrDict, "firstName");
-        acc.lastName            = dict_str(addrDict, "lastName");
-        acc.name                = acc.firstName + " " + acc.lastName;
-        acc.email               = dict_str(dict_dict(lastData, "accountInfo"), "appleId");
-        acc.passwordToken.set(  dict_str(lastData, "passwordToken"));
-        acc.directoryServicesID = dict_str(lastData, "dsPersonId");
-        acc.storeFront          = sf;
-        acc.password.set(       password);
-        acc.pod                 = pod;
-        return acc;
-    }
+                     const std::string& baseEndpoint);
 
     // ── Purchase implementation ───────────────────────────────────────────────
-
     void do_purchase(const Account& acc, const App& app,
-                     const std::string& guid, const std::string& pricingParam)
-    {
-        std::string pod_prefix;
-        if (!acc.pod.empty()) pod_prefix = "p" + acc.pod + "-";
-
-        std::string url = "https://" + pod_prefix + std::string(PRIVATE_AS_DOMAIN)
-                        + PRIVATE_AS_PATH_PURCHASE;
-
-        PlistDict payload;
-        payload["appExtVrsId"]               = PlistValue::makeString("0");
-        payload["hasAskedToFulfillPreorder"] = PlistValue::makeString("true");
-        payload["buyWithoutAuthorization"]   = PlistValue::makeString("true");
-        payload["hasDoneAgeCheck"]           = PlistValue::makeString("true");
-        payload["guid"]                      = PlistValue::makeString(guid);
-        payload["needDiv"]                   = PlistValue::makeString("0");
-        payload["origPage"]                  = PlistValue::makeString("Software-" + std::to_string(app.id));
-        payload["origPageLocation"]          = PlistValue::makeString("Buy");
-        payload["price"]                     = PlistValue::makeString("0");
-        payload["pricingParameters"]         = PlistValue::makeString(pricingParam);
-        payload["productType"]               = PlistValue::makeString("C");
-        payload["salableAdamId"]             = PlistValue::makeInt(app.id);
-
-        std::map<std::string, std::string> headers = {
-            {"Content-Type",        "application/x-apple-plist"},
-            {"iCloud-DSID",         acc.directoryServicesID},
-            {"X-Dsid",              acc.directoryServicesID},
-            {"X-Apple-Store-Front", acc.storeFront},
-            {"X-Token",             acc.passwordToken.get()},
-        };
-
-        HttpResponse res  = m_http.post(url, encode_plist_xml(payload), headers);
-        PlistDict    data  = decode_plist(res.body);
-
-        std::string failureType     = dict_str(data, "failureType");
-        std::string customerMessage = dict_str(data, "customerMessage");
-        std::string jingleDocType   = dict_str(data, "jingleDocType");
-        int64_t     status          = dict_int(data, "status");
-
-        if (failureType == FAILURE_TEMPORARILY_UNAVAILABLE)   throw IpaError("item is temporarily unavailable");
-        if (failureType == FAILURE_ALREADY_PURCHASED)         throw IpaError("license already exists");
-        if (customerMessage == CUSTOMER_MSG_SUBSCRIPTION_REQ) throw SubscriptionRequired();
-        if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED)    throw PasswordTokenExpired();
-        if (customerMessage == CUSTOMER_MSG_SIGN_IN)          throw PasswordTokenExpired();
-        if (!failureType.empty() && !customerMessage.empty()) throw IpaError(customerMessage);
-        if (!failureType.empty())                             throw IpaError("something went wrong");
-        if (res.statusCode == 500)                            throw IpaError("license already exists");
-        if (jingleDocType != "purchaseSuccess" || status != 0)
-            throw IpaError("failed to purchase app");
-    }
+                     const std::string& guid, const std::string& pricingParam);
 
     // ── ZIP patching ──────────────────────────────────────────────────────────
     // Injects a patched iTunesMetadata.plist into the downloaded IPA.
     // Uses minizip when available; falls back to a pure C++ copy without patching.
-
-    // ── IPA patching — matches original applyPatches + ReplicateSinf ────────
     //
     // Step 1 (applyPatches): rewrite iTunesMetadata.plist with apple-id/userName
     // Step 2 (replicateSinf): inject sinf file(s) into Payload/App.app/SC_Info/
@@ -834,376 +178,42 @@ private:
     //
     // Both steps read from srcPath (.tmp) and write to dstPath (final .ipa),
     // matching the two-pass approach in the original Go code.
-
     void apply_patches(const PlistDict& item,
                        const Account&   acc,
                        const std::string& srcPath,
                        const std::string& dstPath,
-                       const std::vector<Sinf>& sinfs)
-    {
-#ifdef HAVE_MINIZIP
-        auto metaIt = item.find("metadata");
-        PlistDict metadata;
-        if (metaIt != item.end() && metaIt->second.isDict())
-            metadata = metaIt->second.dictVal;
-
-        // Add account identity fields
-        metadata["appleId"]  = PlistValue::makeString(acc.email);
-        metadata["userName"] = PlistValue::makeString(acc.name);
-
-        // purchaseDate — current download time (iTunes uses download time, not purchase time)
-        time_t now = std::time(nullptr);
-        std::string purchaseDateStr;
-        {
-            struct tm t;
-#ifdef _WIN32
-            gmtime_s(&t, &now);
-#else
-            gmtime_r(&now, &t);
-#endif
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                     t.tm_year+1900, t.tm_mon+1, t.tm_mday,
-                     t.tm_hour, t.tm_min, t.tm_sec);
-            purchaseDateStr = buf;
-        }
-
-        // Construct com.apple.iTunesStore.downloadInfo — mirrors what iTunes writes
-        {
-            PlistDict accountInfo;
-            accountInfo["AppleID"]          = PlistValue::makeString(acc.email);
-            accountInfo["UserName"]         = PlistValue::makeString(acc.name);
-            accountInfo["AccountStoreFront"]= PlistValue::makeString(acc.storeFront);
-            accountInfo["DSPersonID"]       = PlistValue::makeInt(
-                                                std::stoll(acc.directoryServicesID.empty() ? "0" : acc.directoryServicesID));
-            accountInfo["PurchaserID"]      = PlistValue::makeInt(
-                                                std::stoll(acc.directoryServicesID.empty() ? "0" : acc.directoryServicesID));
-            accountInfo["DownloaderID"]     = PlistValue::makeInt(0);
-            accountInfo["FamilyID"]         = PlistValue::makeInt(0);
-            accountInfo["FirstName"]        = PlistValue::makeString(acc.firstName);
-            accountInfo["LastName"]         = PlistValue::makeString(acc.lastName);
-
-            PlistDict downloadInfo;
-            downloadInfo["accountInfo"]  = PlistValue::makeDict(accountInfo);
-            downloadInfo["purchaseDate"] = PlistValue::makeString(purchaseDateStr);
-
-            metadata["com.apple.iTunesStore.downloadInfo"] = PlistValue::makeDict(downloadInfo);
-        }
-
-        // is-purchased-redownload: true (always set by iTunes for purchased apps)
-        metadata["is-purchased-redownload"] = PlistValue::makeBool(true);
-        metadata["purchaseDate"] = PlistValue::makeDate(purchaseDateStr);
-
-        // storeCohort — constructed by iTunes using current time + storefront number
-        {
-            // Extract numeric storefront ID (e.g. "143441-16,32" → "143441")
-            std::string sf = acc.storeFront;
-            size_t dash = sf.find('-');
-            if (dash != std::string::npos) sf = sf.substr(0, dash);
-            // Current time in milliseconds
-            int64_t ms = (int64_t)now * 1000LL;
-            char cohort[256];
-            snprintf(cohort, sizeof(cohort),
-                     "10|date=%lld&sf=%s&app=com.apple.iTunes&pgtp=Purchases&prpg=Purchases",
-                     (long long)ms, sf.c_str());
-            metadata["storeCohort"] = PlistValue::makeString(cohort);
-        }
-
-        std::string metaStr  = encode_plist_xml(metadata);
-        std::vector<uint8_t> metaBytes(metaStr.begin(), metaStr.end());
-
-        // Download iTunesArtwork
-        std::vector<uint8_t> artworkBytes;
-        std::string artworkURL = dict_str(item, "artworkURL");
-        if (!artworkURL.empty()) {
-            HttpResponse artRes = m_http.get(artworkURL);
-            if (artRes.statusCode == 200 && !artRes.body.empty())
-                artworkBytes.assign(artRes.body.begin(), artRes.body.end());
-        }
-
-        patch_with_minizip(srcPath, dstPath, metaBytes, artworkBytes, sinfs);
-#else
-        std::error_code ec;
-        fs::copy_file(srcPath, dstPath,
-                      fs::copy_options::overwrite_existing, ec);
-        if (ec) throw IpaError("failed to copy IPA: " + ec.message());
-#endif
-    }
+                       const std::vector<Sinf>& sinfs);
 
 #ifdef HAVE_MINIZIP
     static void patch_with_minizip(const std::string& srcPath,
                                    const std::string& dstPath,
                                    const std::vector<uint8_t>& metaBytes,
                                    const std::vector<uint8_t>& artworkBytes,
-                                   const std::vector<Sinf>& sinfs)
-    {
-        // ── Step 1: raw-copy the original IPA → destination ──────────────────
-        {
-            std::ifstream in(srcPath,  std::ios::binary);
-            std::ofstream out(dstPath, std::ios::binary | std::ios::trunc);
-            if (!in)  throw IpaError("minizip: cannot open source IPA");
-            if (!out) throw IpaError("minizip: cannot create output IPA");
-            out << in.rdbuf();
-        }
-
-        // ── Step 2: collect bundle info needed for sinf path ─────────────────
-        std::string bundleName;
-        std::string bundleExecutable;
-        std::vector<std::string> sinfPaths;
-
-        if (!sinfs.empty()) {
-            unzFile probe = unzOpen(srcPath.c_str());
-            if (!probe) throw IpaError("minizip: cannot open source for probe");
-            int rc = unzGoToFirstFile(probe);
-            while (rc == UNZ_OK) {
-                char name[1024] = {};
-                unz_file_info fi;
-                unzGetCurrentFileInfo(probe, &fi, name, sizeof(name),
-                                      nullptr, 0, nullptr, 0);
-                std::string n(name);
-
-                if (bundleName.empty()
-                    && n.find(".app/Info.plist") != std::string::npos
-                    && n.find("/Watch/") == std::string::npos)
-                {
-                    size_t appPos   = n.rfind(".app/Info.plist");
-                    size_t slashPos = n.rfind('/', appPos - 1);
-                    bundleName = n.substr(slashPos + 1, appPos - slashPos - 1);
-                }
-
-                if (bundleExecutable.empty()
-                    && n.find(".app/Info.plist") != std::string::npos
-                    && n.find("/Watch/") == std::string::npos)
-                {
-                    unzOpenCurrentFile(probe);
-                    std::vector<uint8_t> buf(fi.uncompressed_size);
-                    unzReadCurrentFile(probe, buf.data(), (unsigned)buf.size());
-                    unzCloseCurrentFile(probe);
-                    bundleExecutable = extract_plist_string(buf, "CFBundleExecutable");
-                }
-
-                if (sinfPaths.empty()
-                    && n.find(".app/SC_Info/Manifest.plist") != std::string::npos)
-                {
-                    unzOpenCurrentFile(probe);
-                    std::vector<uint8_t> buf(fi.uncompressed_size);
-                    unzReadCurrentFile(probe, buf.data(), (unsigned)buf.size());
-                    unzCloseCurrentFile(probe);
-                    sinfPaths = extract_sinf_paths(buf);
-                }
-
-                rc = unzGoToNextFile(probe);
-            }
-            unzClose(probe);
-        }
-
-        // ── Step 3: open the copy in append mode and inject new files ─────────
-        zipFile dst = zipOpen(dstPath.c_str(), APPEND_STATUS_ADDINZIP);
-        if (!dst) throw IpaError("minizip: failed to open output IPA for append");
-
-        // iTunes order: iTunesMetadata.plist first, sinf(s), iTunesArtwork last
-        auto append_file = [&](const char* path,
-                                const void* data, unsigned size,
-                                int method)
-        {
-            zip_fileinfo zfi = {};
-            zipOpenNewFileInZip(dst, path, &zfi,
-                nullptr, 0, nullptr, 0, nullptr,
-                method, method == 0 ? 0 : Z_DEFAULT_COMPRESSION);
-            zipWriteInFileInZip(dst, data, size);
-            zipCloseFileInZip(dst);
-        };
-
-        append_file("iTunesMetadata.plist",
-                    metaBytes.data(), (unsigned)metaBytes.size(),
-                    Z_DEFLATED);
-
-        if (!sinfs.empty() && !bundleName.empty()) {
-            if (!sinfPaths.empty()) {
-                size_t count = std::min(sinfs.size(), sinfPaths.size());
-                for (size_t i = 0; i < count; i++) {
-                    std::string sp = "Payload/" + bundleName + ".app/" + sinfPaths[i];
-                    append_file(sp.c_str(),
-                                sinfs[i].data.data(), (unsigned)sinfs[i].data.size(),
-                                Z_DEFLATED);
-                }
-            } else if (!bundleExecutable.empty()) {
-                std::string sp = "Payload/" + bundleName + ".app/SC_Info/"
-                               + bundleExecutable + ".sinf";
-                append_file(sp.c_str(),
-                            sinfs[0].data.data(), (unsigned)sinfs[0].data.size(),
-                            Z_DEFLATED);
-            }
-        }
-
-        if (!artworkBytes.empty())
-            append_file("iTunesArtwork",
-                        artworkBytes.data(), (unsigned)artworkBytes.size(),
-                        Z_DEFLATED);
-
-        zipClose(dst, nullptr);
-    }
+                                   const std::vector<Sinf>& sinfs);
 
     // Extract a string value from a binary or XML plist by key name.
     // Used to read CFBundleExecutable from Info.plist without a full plist parser.
     static std::string extract_plist_string(const std::vector<uint8_t>& data,
-                                             const std::string& key)
-    {
-        // Try XML first
-        std::string s(data.begin(), data.end());
-        size_t kpos = s.find("<key>" + key + "</key>");
-        if (kpos != std::string::npos) {
-            size_t vs = s.find("<string>", kpos);
-            size_t ve = s.find("</string>", vs);
-            if (vs != std::string::npos && ve != std::string::npos)
-                return s.substr(vs + 8, ve - vs - 8);
-        }
-        // Binary plist: key is preceded by its length byte, value follows similarly.
-        // Simple scan: find the key bytes and read the next string atom.
-        // Sufficient for short ASCII values like CFBundleExecutable.
-        for (size_t i = 0; i + key.size() < data.size(); i++) {
-            if (memcmp(data.data() + i, key.data(), key.size()) == 0) {
-                // Found key string; next string atom in binary plist follows
-                // after a string marker byte (0x5N where N=length, or 0x6N for UTF-16)
-                size_t j = i + key.size();
-                while (j < data.size()) {
-                    uint8_t b = data[j++];
-                    if ((b & 0xF0) == 0x50) { // ASCII string, length = b & 0x0F
-                        int len = b & 0x0F;
-                        if (j + len <= data.size())
-                            return std::string((char*)data.data() + j, len);
-                    }
-                }
-            }
-        }
-        return "";
-    }
+                                             const std::string& key);
 
     // Parse SinfPaths array from SC_Info/Manifest.plist (XML or binary plist)
-    static std::vector<std::string> extract_sinf_paths(const std::vector<uint8_t>& data)
-    {
-        std::vector<std::string> paths;
-        std::string s(data.begin(), data.end());
-        // XML plist path
-        size_t kpos = s.find("<key>SinfPaths</key>");
-        if (kpos != std::string::npos) {
-            size_t astart = s.find("<array>", kpos);
-            size_t aend   = s.find("</array>", astart);
-            if (astart != std::string::npos && aend != std::string::npos) {
-                std::string arr = s.substr(astart + 7, aend - astart - 7);
-                size_t pos = 0;
-                while (true) {
-                    size_t vs = arr.find("<string>", pos);
-                    size_t ve = arr.find("</string>", vs);
-                    if (vs == std::string::npos || ve == std::string::npos) break;
-                    paths.push_back(arr.substr(vs + 8, ve - vs - 8));
-                    pos = ve + 9;
-                }
-            }
-            return paths;
-        }
-        // Binary plist: scan for "SinfPaths" key then collect following string atoms
-        const std::string marker = "SinfPaths";
-        size_t mpos = s.find(marker);
-        if (mpos != std::string::npos) {
-            size_t j = mpos + marker.size();
-            // Skip array marker
-            while (j < data.size() && (data[j] & 0xF0) != 0x50 && (data[j] & 0xF0) != 0xA0) j++;
-            if (j < data.size() && (data[j] & 0xF0) == 0xA0) {
-                int count = data[j] & 0x0F;
-                j++;
-                for (int i = 0; i < count && j < data.size(); i++) {
-                    uint8_t b = data[j++];
-                    if ((b & 0xF0) == 0x50) {
-                        int len = b & 0x0F;
-                        if (j + len <= data.size()) {
-                            paths.push_back(std::string((char*)data.data() + j, len));
-                            j += len;
-                        }
-                    }
-                }
-            }
-        }
-        return paths;
-    }
+    static std::vector<std::string> extract_sinf_paths(const std::vector<uint8_t>& data);
 #endif
 
     // ── URL builders ─────────────────────────────────────────────────────────
-
     static std::string search_url(const std::string& term,
-                                   const std::string& cc, int limit)
-    {
-        std::map<std::string, std::string> p = {
-            {"entity",  "software,iPadSoftware"},
-            {"limit",   std::to_string(limit)},
-            {"media",   "software"},
-            {"term",    term},
-            {"country", cc},
-        };
-        return std::string("https://") + ITUNES_API_DOMAIN
-             + ITUNES_API_PATH_SEARCH + "?" + build_query(p);
-    }
-
+                                   const std::string& cc, int limit);
     static std::string lookup_url(const std::string& bundleID,
-                                   const std::string& cc)
-    {
-        std::map<std::string, std::string> p = {
-            {"entity",   "software,iPadSoftware"},
-            {"limit",    "1"},
-            {"media",    "software"},
-            {"bundleId", bundleID},
-            {"country",  cc},
-        };
-        return std::string("https://") + ITUNES_API_DOMAIN
-             + ITUNES_API_PATH_LOOKUP + "?" + build_query(p);
-    }
+                                   const std::string& cc);
 
     // ── Path helpers (C++17 std::filesystem — no POSIX needed) ───────────────
-
     static std::string resolve_destination(const App& app,
                                            const std::string& version,
-                                           const std::string& outputPath)
-    {
-        std::string fname = make_filename(app, version);
-        if (outputPath.empty()) {
-            return (fs::current_path() / fname).string();
-        }
-        fs::path p(outputPath);
-        if (fs::is_directory(p)) return (p / fname).string();
-        return outputPath;
-    }
-
-    static std::string make_filename(const App& app, const std::string& version) {
-        std::string name;
-        if (!app.bundleID.empty()) name += app.bundleID;
-        if (app.id > 0) {
-            if (!name.empty()) name += "_";
-            name += std::to_string(app.id);
-        }
-        if (!version.empty()) {
-            if (!name.empty()) name += "_";
-            name += version;
-        }
-        return name + ".ipa";
-    }
-
-    static int64_t file_size(const std::string& path) {
-        std::error_code ec;
-        auto sz = fs::file_size(path, ec);
-        return ec ? 0 : (int64_t)sz;
-    }
+                                           const std::string& outputPath);
+    static std::string make_filename(const App& app, const std::string& version);
+    static int64_t file_size(const std::string& path);
 
     // ── String helpers ────────────────────────────────────────────────────────
-
-    static std::string strip_spaces(const std::string& s) {
-        std::string out;
-        for (char c : s) if (c != ' ') out += c;
-        return out;
-    }
-
-    static std::string str_lower(const char* s) {
-        std::string out(s);
-        for (char& c : out) c = (char)tolower((unsigned char)c);
-        return out;
-    }
+    static std::string strip_spaces(const std::string& s);
+    static std::string str_lower(const char* s);
 };
