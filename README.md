@@ -132,6 +132,24 @@ cmake --build build
 
 IOKit and CoreFoundation are built into macOS — no extra dependencies needed for machine ID.
 
+### Static build on macOS
+
+```sh
+brew install openssl@3 minizip nlohmann-json
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
+      -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+cmake --build build
+```
+
+CMake downloads and builds a minimal curl from source (HTTPS only — no LDAP, SSH,
+HTTP/2, HTTP/3, Brotli, Zstd, GSSAPI) and statically links it together with
+OpenSSL and minizip. A handful of system frameworks (`IOKit`, `CoreFoundation`,
+`SystemConfiguration`, `CoreServices`) and `libz` remain dynamically linked —
+these ship with every Mac, so this doesn't affect portability. Run
+`otool -L build/ipatool` afterward to confirm: you should see only those system
+libraries, no `libcurl`/`libssl`/`libcrypto`/`libminizip` dylibs.
+
 ---
 
 ## Usage

@@ -260,6 +260,7 @@ if(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
     )
     if(MINIZIP_STATIC)
         list(APPEND STATIC_LINK_LIBS ${MINIZIP_STATIC})
+        set(minizip_FOUND FALSE)  # don't also link the dynamic minizip::minizip target below
     endif()
     list(APPEND STATIC_LINK_LIBS ${ZLIB_STATIC})
 endif()
