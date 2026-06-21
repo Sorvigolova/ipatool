@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
 
+# ── macOS deployment target ────────────────────────────────────────────────────
+# Catalina (10.15) is the floor we actually need: std::filesystem (used
+# throughout the project) only got full, working libc++ support on macOS
+# starting with 10.15 — older targets either fail to compile or throw at
+# runtime on filesystem calls. Set as a CACHE default (not a plain set())
+# so `-DCMAKE_OSX_DEPLOYMENT_TARGET=...` on the command line still overrides
+# it; must happen before project() or it has no effect.
+if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version")
+endif()
+
 # ── Static linking option (must be before project() for MSVC CRT selection) ───
 option(STATIC_BUILD "Build a static binary (Linux, macOS, and Windows)" OFF)
 
@@ -56,6 +67,20 @@ if(STATIC_BUILD AND NOT WIN32)
         endif()
     endif()
 
+    # curl's configure is a separate autotools build invoked via
+    # ExternalProject_Add — it knows nothing about CMAKE_OSX_DEPLOYMENT_TARGET,
+    # so without an explicit -mmacosx-version-min, its .o files default to
+    # whatever SDK version the BUILD machine happens to have, which can be
+    # newer than what CMAKE_OSX_DEPLOYMENT_TARGET asked for. That mismatch
+    # produces "object file was built for newer macOS version" linker warnings
+    # and can make the binary refuse to load on an older macOS test machine
+    # even though the rest of the project correctly targeted the older OS.
+    set(_curl_cflags "-fPIC")
+    if(APPLE AND DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(_curl_cflags "${_curl_cflags} -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        message(STATUS "Static curl build will target macOS ${CMAKE_OSX_DEPLOYMENT_TARGET}+")
+    endif()
+
     # Build a minimal curl (HTTPS only, no SSH/LDAP/RTMP/HTTP2/brotli/zstd)
     ExternalProject_Add(curl_static
         URL          https://curl.se/download/curl-8.7.1.tar.gz
@@ -90,7 +115,7 @@ if(STATIC_BUILD AND NOT WIN32)
                 --without-gssapi
                 --without-krb4
                 --disable-versioned-symbols
-                "CFLAGS=-fPIC"
+                "CFLAGS=${_curl_cflags}"
         BUILD_COMMAND   $(MAKE)
         INSTALL_COMMAND $(MAKE) install
         BUILD_IN_SOURCE 0
