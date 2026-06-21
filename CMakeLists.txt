@@ -59,6 +59,7 @@ if(STATIC_BUILD AND NOT WIN32)
     # Build a minimal curl (HTTPS only, no SSH/LDAP/RTMP/HTTP2/brotli/zstd)
     ExternalProject_Add(curl_static
         URL          https://curl.se/download/curl-8.7.1.tar.gz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         CONFIGURE_COMMAND
             <SOURCE_DIR>/configure
                 --prefix=<INSTALL_DIR>
