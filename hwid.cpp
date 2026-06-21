@@ -56,8 +56,17 @@ std::string get_machine_id() {
 #elif defined(__APPLE__)
 
 static std::string iokit_string(const char* key) {
+    // kIOMasterPortDefault was renamed to kIOMainPortDefault in the macOS 12 SDK;
+    // the old name still works but is deprecated and warns on every build.
+    // __MAC_12_0 is only defined once AvailabilityMacros.h has been pulled in
+    // (which IOKitLib.h above already does), so this check is safe here.
+#if defined(__MAC_12_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_12_0
+    const mach_port_t main_port = kIOMainPortDefault;
+#else
+    const mach_port_t main_port = kIOMasterPortDefault;
+#endif
     io_service_t service = IOServiceGetMatchingService(
-        kIOMasterPortDefault,
+        main_port,
         IOServiceMatching("IOPlatformExpertDevice"));
     if (!service) return "";
 

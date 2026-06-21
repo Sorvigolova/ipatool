@@ -889,7 +889,7 @@ static void cmd_download(const Args& args) {
     auto   lastDraw  = std::chrono::steady_clock::now() - std::chrono::milliseconds(200);
     auto   startTime = std::chrono::steady_clock::now();
     bool   isTTY     = use_color();
-    int    prevDrawnCols = 0; // track columns written last tick for erase-on-shrink
+    [[maybe_unused]] int prevDrawnCols = 0; // track columns written last tick for erase-on-shrink (Windows only)
 
 #ifdef _WIN32
     HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
