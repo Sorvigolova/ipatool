@@ -1,9 +1,9 @@
 #include "protect.h"
 #include "aes.h"
 #include <cstring>
-#include <string.h>  // memset_s on macOS (Darwin declares it unconditionally)
 #include <functional>
 #include <stdexcept>
+#include <string.h>  // memset_s on macOS (Darwin declares it unconditionally)
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #ifdef _WIN32
@@ -17,7 +17,7 @@
 // translation unit — having this as `static` in the header (the old way)
 // gave every .cpp file its own private copy, silently breaking decryption
 // whenever SecureString::set() and SecureString::get() were called from
-// different .cpp files.
+// different .cpp files (e.g. set in gsa.cpp, get in main.cpp).
 
 std::string (*g_machine_id_fn)() = nullptr;
 std::string g_passphrase;
@@ -111,3 +111,4 @@ std::string SecureString::get() const {
     if (blob.empty()) return "";
     return mem_decrypt(blob);
 }
+

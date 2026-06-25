@@ -62,4 +62,34 @@ Bytes gcm_decrypt(const Bytes& key, const Bytes& iv,
     return plain;
 }
 
+Bytes cbc_decrypt(const Bytes& key, const Bytes& iv, const Bytes& ciphertext) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    Bytes out(ciphertext.size() + EVP_MAX_BLOCK_LENGTH);
+    int len1 = 0, len2 = 0;
+    EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key.data(), iv.data());
+    EVP_CIPHER_CTX_set_padding(ctx, 1);
+    EVP_DecryptUpdate(ctx, out.data(), &len1, ciphertext.data(), (int)ciphertext.size());
+    int rc = EVP_DecryptFinal_ex(ctx, out.data() + len1, &len2);
+    EVP_CIPHER_CTX_free(ctx);
+    if (rc != 1)
+        throw std::runtime_error("aes::cbc_decrypt: decryption failed (wrong key or corrupted data)");
+    out.resize(len1 + len2);
+    return out;
+}
+
+Bytes cbc_encrypt(const Bytes& key, const Bytes& iv, const Bytes& plaintext) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    Bytes out(plaintext.size() + EVP_MAX_BLOCK_LENGTH);
+    int len1 = 0, len2 = 0;
+    EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key.data(), iv.data());
+    EVP_CIPHER_CTX_set_padding(ctx, 1);
+    EVP_EncryptUpdate(ctx, out.data(), &len1, plaintext.data(), (int)plaintext.size());
+    int rc = EVP_EncryptFinal_ex(ctx, out.data() + len1, &len2);
+    EVP_CIPHER_CTX_free(ctx);
+    if (rc != 1)
+        throw std::runtime_error("aes::cbc_encrypt: encryption failed");
+    out.resize(len1 + len2);
+    return out;
+}
+
 } // namespace aes

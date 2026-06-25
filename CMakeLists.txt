@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
 
+# ── macOS deployment target ────────────────────────────────────────────────────
+# Catalina (10.15) is the floor we actually need: std::filesystem (used
+# throughout the project) only got full, working libc++ support on macOS
+# starting with 10.15 — older targets either fail to compile or throw at
+# runtime on filesystem calls. Set as a CACHE default (not a plain set())
+# so `-DCMAKE_OSX_DEPLOYMENT_TARGET=...` on the command line still overrides
+# it; must happen before project() or it has no effect.
+if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version")
+endif()
+
 # ── Static linking option (must be before project() for MSVC CRT selection) ───
 option(STATIC_BUILD "Build a static binary (Linux, macOS, and Windows)" OFF)
 
@@ -135,9 +146,69 @@ endif()
 # ── Dependencies via vcpkg (or system) ────────────────────────────────────────
 
 # curl
+#
+# We need libcurl >= 7.77 for CURLSSLOPT_NATIVE_CA. This is not a macOS-only
+# concern — any older distro's system libcurl can hit the same problem.
+#
+# macOS-specific: the system libcurl is almost always too old, and Homebrew's
+# curl is "keg-only" (not symlinked into /usr/local or /opt/homebrew) to
+# avoid clashing with the system one — so CMake's default search silently
+# finds the old system copy first unless we point it at Homebrew explicitly.
+#
+# None of this discovery/version-check matters for a non-Windows static
+# build: that path builds its own curl from source via ExternalProject_Add
+# (see curl_static / curl_static_lib above) and links THAT, never touching
+# the CURL::libcurl target created here. Skipping it entirely avoids a
+# nonsensical failure mode where this block finds some old/missing system
+# curl (e.g. the CommandLineTools SDK's ancient 7.64.1 stub) and aborts the
+# whole configure with FATAL_ERROR, even though the static build doesn't
+# need or use that curl at all.
+if(NOT (STATIC_BUILD AND NOT WIN32))
+if(APPLE)
+    find_program(BREW_EXECUTABLE brew)
+    if(BREW_EXECUTABLE)
+        execute_process(
+            COMMAND ${BREW_EXECUTABLE} --prefix curl
+            OUTPUT_VARIABLE BREW_CURL_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(BREW_CURL_PREFIX AND EXISTS "${BREW_CURL_PREFIX}")
+            message(STATUS "Using Homebrew curl: ${BREW_CURL_PREFIX}")
+            set(CURL_ROOT "${BREW_CURL_PREFIX}")
+            list(PREPEND CMAKE_PREFIX_PATH "${BREW_CURL_PREFIX}")
+        else()
+            message(WARNING
+                "Homebrew curl not found via 'brew --prefix curl' — "
+                "falling back to system libcurl, which may be too old. "
+                "Run: brew install curl")
+        endif()
+    endif()
+endif()
+
 find_package(CURL CONFIG QUIET)          # vcpkg installs a CONFIG-mode package
 if(NOT CURL_FOUND)
-    find_package(CURL REQUIRED)          # system fallback (MODULE mode)
+    find_package(CURL REQUIRED)          # system fallback (MODULE mode), honors CURL_ROOT above
+endif()
+
+# Hard requirement, not platform-specific: CURLSSLOPT_NATIVE_CA needs >= 7.77.
+# Fails the configure step with a clear message instead of a cryptic compile
+# error deep in http_client.h.
+if(CURL_VERSION_STRING AND CURL_VERSION_STRING VERSION_LESS "7.77")
+    if(APPLE)
+        set(_curl_hint "Install a newer one with 'brew install curl' and "
+                       "re-run cmake with a clean build directory.")
+    elseif(UNIX)
+        set(_curl_hint "Install a newer libcurl-dev package for your distro "
+                       "(e.g. 'sudo apt install libcurl4-openssl-dev' on "
+                       "recent Ubuntu/Debian), or build curl from source.")
+    else()
+        set(_curl_hint "Install a newer libcurl via vcpkg or your package manager.")
+    endif()
+    message(FATAL_ERROR
+        "Found libcurl ${CURL_VERSION_STRING}, but this project requires "
+        ">= 7.77 for CURLSSLOPT_NATIVE_CA. ${_curl_hint}")
+endif()
 endif()
 
 # nlohmann/json
@@ -166,13 +237,19 @@ endif()
 
 # minizip (for cross-platform ZIP writing, used by IPA patching)
 # Try CONFIG mode first (vcpkg), then pkg-config (Linux system), then manual find
-find_package(minizip CONFIG QUIET)
-if(NOT minizip_FOUND)
-    find_package(unofficial-minizip CONFIG QUIET)
-    if(unofficial-minizip_FOUND)
-        add_library(minizip::minizip ALIAS unofficial::minizip::minizip)
-        set(minizip_FOUND TRUE)
-    endif()
+#
+# vcpkg's minizip port now installs under the "unofficial-minizip" CONFIG
+# name; the old "minizip" CONFIG name is kept only as a deprecated shim that
+# prints its own message(WARNING ...) the moment it's touched — even with
+# QUIET, since that warning lives inside minizipConfig.cmake itself, not in
+# CMake's own "package not found" machinery that QUIET actually suppresses.
+# So we try the real (non-deprecated) name first to stay quiet on vcpkg.
+find_package(unofficial-minizip CONFIG QUIET)
+if(unofficial-minizip_FOUND)
+    add_library(minizip::minizip ALIAS unofficial::minizip::minizip)
+    set(minizip_FOUND TRUE)
+else()
+    find_package(minizip CONFIG QUIET)  # legacy name, non-vcpkg installs
 endif()
 if(NOT minizip_FOUND)
     find_package(PkgConfig QUIET)
@@ -238,6 +315,10 @@ add_executable(ipatool
     plist.cpp
     sha2.cpp
     aes.cpp
+    gsa.cpp
+    anisette.cpp
+    bignum.cpp
+    srp.cpp
     # Headers below compile to nothing — included only so MSVC's Solution
     # Explorer shows them under "Header Files" for easier navigation.
     appstore.h
@@ -248,6 +329,10 @@ add_executable(ipatool
     plist.h
     sha2.h
     aes.h
+    gsa.h
+    anisette.h
+    bignum.h
+    srp.h
 )
 
 target_include_directories(ipatool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -358,7 +443,8 @@ endif()
 if(WIN32)
     # iphlpapi  = GetAdaptersInfo (MAC address)
     # ws2_32    = Winsock (used by curl internally too)
-    target_link_libraries(ipatool PRIVATE iphlpapi ws2_32 crypt32 wldap32 normaliz)
+    # winhttp   = WinHttpGetIEProxyConfigForCurrentUser (system proxy detection)
+    target_link_libraries(ipatool PRIVATE iphlpapi ws2_32 crypt32 wldap32 normaliz winhttp)
 
     # Suppress MSVC warnings about "unsafe" CRT functions
     target_compile_definitions(ipatool PRIVATE
@@ -433,12 +519,13 @@ message(STATUS "")
 if(WIN32)
     if(STATIC_BUILD)
         message(STATUS "  Quick-start (Windows static):")
-        message(STATUS "    vcpkg install curl nlohmann-json minizip openssl --triplet x64-windows-static")
+        message(STATUS "    vcpkg install curl:x64-windows-static nlohmann-json:x64-windows-static minizip:x64-windows-static openssl:x64-windows-static")
         message(STATUS "    cmake -B build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake -DSTATIC_BUILD=ON -DVCPKG_TARGET_TRIPLET=x64-windows-static")
         message(STATUS "    cmake --build build --config Release")
+        message(STATUS "    NOTE: plain curl (Schannel backend) — Apple CA embedded via CURLOPT_CAINFO_BLOB")
     else()
         message(STATUS "  Quick-start with vcpkg:")
-        message(STATUS "    vcpkg install curl nlohmann-json minizip openssl --triplet x64-windows")
+        message(STATUS "    vcpkg install curl:x64-windows nlohmann-json:x64-windows minizip:x64-windows openssl:x64-windows")
         message(STATUS "    cmake -B build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake")
         message(STATUS "    cmake --build build --config Release")
     endif()

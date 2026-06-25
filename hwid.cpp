@@ -125,7 +125,7 @@ std::string get_machine_id() {
 
 // ── HWID derivation ───────────────────────────────────────────────────────────
 
-const char* FILE_KEY_SALT = "nice_key_is_nice";
+const char* FILE_KEY_SALT = "nice_token_is_nice";
 
 bool derive_key_from_machine(const std::string& machine_id,
                              const std::string& passphrase,

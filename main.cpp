@@ -3,11 +3,11 @@
 // Requires: libcurl, nlohmann/json, OpenSSL, minizip
 //
 // Account file encryption:
-//   Key = PBKDF2-SHA256(machine_id + "nice_key_is_nice" + passphrase, random_salt, 100000, 32)
+//   Key = PBKDF2-SHA256(machine_id + "nice_token_is_nice" + passphrase, random_salt, 100000, 32)
 //   machine_id = SHA256(ProductId + MachineGuid)   on Windows
 //              = SHA256(machine-id + product_uuid)  on Linux
 //              = SHA256(SerialNumber + PlatformUUID) on macOS
-//   File format: [0x02][salt_len(4)][salt][IV][GCM tag][ciphertext]
+//   File format: [0x03][salt_len(4)][salt][IV][GCM tag][ciphertext]
 //
 // In-memory encryption:
 //   SecureString fields encrypted with AES-256-GCM
@@ -22,7 +22,6 @@
 #include "appstore.h"
 #include "hwid.h"
 #include "protect.h"   // secure_zero() — used directly for account file encryption
-#include "aes.h"        // aes::gcm_encrypt/decrypt — used directly for account file encryption
 
 #include <iostream>
 #include <fstream>
@@ -40,10 +39,12 @@
 #  include <sys/ioctl.h>
 #  include <unistd.h>
 #else
-// windows.h was previously pulled in transitively via the old ipatool.h;
-// that header is now logic-free and no longer includes it, so main.cpp
-// needs its own explicit include for HANDLE, MAX_PATH, console APIs,
+// windows.h was previously pulled in transitively via ipatool.h; that header
+// is now logic-free (see ipatool.cpp split) and no longer includes it, so
+// main.cpp needs its own explicit include for HANDLE, MAX_PATH, console APIs,
 // MultiByteToWideChar, etc. used throughout this file.
+// CMakeLists.txt already defines these globally via target_compile_definitions,
+// but guard anyway in case this file is ever compiled outside that setup.
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
 #  endif
@@ -160,20 +161,21 @@ static void ensure_config_dir() {
 }
 
 // ── AES-256-GCM file encryption ───────────────────────────────────────────────
-// Format v2 (the only supported format):
-//   [1 byte: 0x02][4 bytes: salt_len][16 bytes: salt][12 bytes: IV][16 bytes: GCM tag][ciphertext]
+// Format v3 (the only supported format — v2 files are rejected with a
+// re-login message rather than silently failing):
+//   [1 byte: 0x03][4 bytes: salt_len][16 bytes: salt][12 bytes: IV][16 bytes: GCM tag][ciphertext]
 //
-// Key = PBKDF2-SHA256(machine_id + "nice_key_is_nice" + passphrase, random_salt, 100000, 32)
+// Key = PBKDF2-SHA256(machine_id + "nice_token_is_nice" + passphrase, random_salt, 100000, 32)
 // passphrase may be "" — machine binding alone is sufficient.
 // Plaintext and old-format files are rejected — re-login required.
 
-static const uint8_t FILE_FORMAT_V2  = 0x02;
+static const uint8_t FILE_FORMAT_V3  = 0x03;  // gsIdmsToken separate from passwordToken
 static const int     SALT_LEN        = 16;
 static const int     IV_LEN          = 12;
 static const int     TAG_LEN         = 16;
 static const int     KEY_LEN         = 32; // AES-256
 
-// Derive file encryption key: PBKDF2-SHA256(machine_id + "nice_key_is_nice" + passphrase, random_salt, 100000, 32)
+// Derive file encryption key: PBKDF2-SHA256(machine_id + "nice_token_is_nice" + passphrase, random_salt, 100000, 32)
 static bool derive_file_key(const std::string& machine_id,
                              const std::string& passphrase,
                              const unsigned char* salt, int salt_len,
@@ -181,7 +183,7 @@ static bool derive_file_key(const std::string& machine_id,
     return derive_key_from_machine(machine_id, passphrase, salt, salt_len, key_out);
 }
 
-// Encrypt plaintext → v2 binary blob
+// Encrypt plaintext → v3 binary blob
 static std::vector<unsigned char> aes_gcm_encrypt(const std::string& plaintext,
                                                     const std::string& machine_id,
                                                     const std::string& passphrase) {
@@ -198,7 +200,7 @@ static std::vector<unsigned char> aes_gcm_encrypt(const std::string& plaintext,
 
     // Pack: version(1) | salt_len(4) | salt | iv | tag | ciphertext
     std::vector<unsigned char> out;
-    out.push_back(FILE_FORMAT_V2);
+    out.push_back(FILE_FORMAT_V3);
     uint32_t sl = SALT_LEN;
     out.insert(out.end(), (unsigned char*)&sl, (unsigned char*)&sl + 4);
     out.insert(out.end(), salt, salt + SALT_LEN);
@@ -210,7 +212,7 @@ static std::vector<unsigned char> aes_gcm_encrypt(const std::string& plaintext,
     return out;
 }
 
-// Decrypt v2 binary blob → plaintext
+// Decrypt v3 binary blob → plaintext
 static std::string aes_gcm_decrypt(const std::vector<unsigned char>& blob,
                                     const std::string& machine_id,
                                     const std::string& passphrase) {
@@ -221,9 +223,9 @@ static std::string aes_gcm_decrypt(const std::vector<unsigned char>& blob,
         throw std::runtime_error(
             "account file is unencrypted — please run 'auth login' again");
 
-    if (blob[0] != FILE_FORMAT_V2)
+    if (blob[0] != FILE_FORMAT_V3)
         throw std::runtime_error(
-            "account file format is outdated — please run 'auth login' again");
+            "account file format is unsupported — please run 'auth login' again");
 
     if (blob.size() < (size_t)(1 + 4 + SALT_LEN + IV_LEN + TAG_LEN))
         throw std::runtime_error("account file is too short or corrupted");
@@ -269,15 +271,23 @@ static bool save_account(const Account& acc, const std::string& passphrase = "")
     std::string machine_id = get_machine_id();
 
     json j;
+    // Identity
     j["email"]               = std::string(acc.email);
-    j["passwordToken"]       = acc.passwordToken.get();
-    j["directoryServicesID"] = std::string(acc.directoryServicesID);
     j["name"]                = std::string(acc.name);
     j["firstName"]           = std::string(acc.firstName);
     j["lastName"]            = std::string(acc.lastName);
+    j["directoryServicesID"] = std::string(acc.directoryServicesID);
+    j["adsid"]               = std::string(acc.adsid);
+    // Store routing
     j["storeFront"]          = std::string(acc.storeFront);
-    j["password"]            = acc.password.get();
     j["pod"]                 = std::string(acc.pod);
+    // GSA session tokens
+    j["petToken"]            = std::string(acc.petToken);
+    j["hbToken"]             = std::string(acc.hbToken);
+    // Secrets
+    j["password"]            = acc.password.get();
+    j["gsIdmsToken"]         = acc.gsIdmsToken.get();
+    j["passwordToken"]       = acc.passwordToken.get();
     std::string data = j.dump(2);
 
     try {
@@ -305,7 +315,7 @@ static bool load_account(Account& acc, const std::string& passphrase = "") {
     if (raw.empty()) return false;
 
     // Reject plaintext and old formats
-    if (raw[0] == '{' || raw[0] != FILE_FORMAT_V2) {
+    if (raw[0] == '{' || raw[0] != FILE_FORMAT_V3) {
         print_red_err("Error: account file is not protected.\n"
                       "Please run 'auth login' again.\n");
         return false;
@@ -329,16 +339,19 @@ static bool load_account(Account& acc, const std::string& passphrase = "") {
         json j = json::parse(data);
 
         acc.email               = j.value("email", "");
-        acc.directoryServicesID = j.value("directoryServicesID", "");
         acc.name                = j.value("name", "");
         acc.firstName           = j.value("firstName", "");
         acc.lastName            = j.value("lastName", "");
+        acc.directoryServicesID = j.value("directoryServicesID", "");
+        acc.adsid               = j.value("adsid", "");
         acc.storeFront          = j.value("storeFront", "");
         acc.pod                 = j.value("pod", "");
-
-        // Encrypt sensitive fields with mem key derived from machine_id
-        acc.passwordToken.set(j.value("passwordToken", ""));
-        acc.password.set(     j.value("password", ""));
+        acc.petToken            = j.value("petToken", "");
+        acc.hbToken             = j.value("hbToken", "");
+        // Secrets
+        acc.password.set(      j.value("password",      ""));
+        acc.gsIdmsToken.set(   j.value("gsIdmsToken",   ""));
+        acc.passwordToken.set( j.value("passwordToken", ""));
 
         return true;
     } catch (...) {
@@ -498,17 +511,33 @@ static void print_red_err(const std::string& msg) {
 #endif
 }
 
+// Fetch anisette data — local binary on Windows, public server fallback elsewhere.
+// On macOS/Linux we don't yet have a working local anisette generator, so we
+// rely on public SideStore-style servers until that's solved.
+static AnisetteData fetch_anisette(HttpClient& http, bool debug = false)
+{
+#ifdef _WIN32
+    // OS finds anisette.exe via PATH or current directory
+    return AnisetteData::fetch_from_exe("anisette.exe");
+#else
+    return AnisetteData::fetch_from_public_servers(http, debug);
+#endif
+}
+
 // Attempt silent re-login using stored password and update saved account.
 // Returns true and updates acc on success. Returns false if password not stored.
 // Used to recover from PasswordTokenExpired without user interaction.
 static bool silent_relogin(Account& acc, const std::string& passphrase) {
     if (acc.password.empty()) return false;
+    HttpClient http(COOKIE_FILE);
     std::string authCode;
     for (int attempt = 0; attempt < 2; attempt++) {
         try {
+            // OTPs are single-use — fetch fresh anisette on every attempt
+            AnisetteData anisette = fetch_anisette(http);
             AppStore store(COOKIE_FILE);
-            auto pwd = acc.password.decrypt();
-            Account fresh = store.login(acc.email, pwd.str(), authCode);
+            Account fresh = store.login(acc.email, acc.password.get(),
+                                             anisette, authCode);
             if (!save_account(fresh, passphrase)) return false;
             acc = fresh;
             return true;
@@ -575,9 +604,7 @@ static void cmd_login(const Args& args) {
 
     // email is always required
     if (email.empty()) {
-        if (interactive) {
-            email = read_line("Enter email: ");
-        }
+        if (interactive) email = read_line("Enter email: ");
         if (email.empty()) {
             std::cerr << "Error: email is required. Use -e EMAIL\n";
             exit(1);
@@ -586,9 +613,7 @@ static void cmd_login(const Args& args) {
 
     // password: prompt with hidden input if not supplied and interactive
     if (password.empty()) {
-        if (interactive) {
-            password = read_hidden("Enter password: ");
-        }
+        if (interactive) password = read_hidden("Enter password: ");
         if (password.empty()) {
             std::cerr << "Error: password is required when not running interactively. Use -p PASSWORD\n";
             exit(1);
@@ -598,30 +623,49 @@ static void cmd_login(const Args& args) {
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
 
-    // Retry loop: if 2FA required, prompt for code and retry (mirrors original)
+    // Fetch anisette data (local binary on Windows, public servers elsewhere)
+    HttpClient anisetteHttp(COOKIE_FILE);
+    AnisetteData anisette;
+    try {
+        anisette = fetch_anisette(anisetteHttp, get(args, "debug") == "true");
+    } catch (const std::exception& e) {
+        print_red_err(std::string("Error: ") + e.what() + "\n");
+        exit(1);
+    }
+
+    // GSA login (SRP-6a); handles 2FA on first retry
     for (int attempt = 0; attempt < 2; ++attempt) {
         try {
-            Account acc = store.login(email, password, authCode);
-            if (!save_account(acc, passphrase)) {
+            Account acc = store.login(email, password, anisette, authCode);
+            if (!save_account(acc, passphrase))
                 std::cerr << "Warning: could not save account\n";
-            }
             json loginOut;
-            loginOut["name"]    = acc.name;
-            loginOut["email"]   = acc.email;
             loginOut["success"] = true;
+            loginOut["email"]   = acc.email;
+            loginOut["name"]    = acc.name;
             log_output(loginOut);
             return;
         } catch (const AuthCodeRequired&) {
-            if (interactive && authCode.empty()) {
-                std::cerr << "Enter 2FA code: " << std::flush;
-                std::getline(std::cin, authCode);
-                // strip CR/LF
-                while (!authCode.empty() && (authCode.back() == '\r' || authCode.back() == '\n'))
-                    authCode.pop_back();
-                continue; // retry with code
+            if (attempt > 0) {
+                print_red_err("Error: 2FA code was rejected.\n");
+                exit(1);
             }
-            std::cerr << "Error: two-factor auth code required. Retry with --auth-code CODE\n";
-            exit(1);
+            if (!interactive && authCode.empty()) {
+                std::cerr << "Error: two-factor auth code required. Retry with --auth-code CODE\n";
+                exit(1);
+            }
+            std::cerr << "Enter 2FA code: " << std::flush;
+            std::getline(std::cin, authCode);
+            while (!authCode.empty() && (authCode.back() == '\r' || authCode.back() == '\n'))
+                authCode.pop_back();
+            // OTPs are single-use — must fetch fresh anisette before retry
+            try {
+                anisette = fetch_anisette(anisetteHttp);
+            } catch (const std::exception& e2) {
+                print_red_err(std::string("Error: anisette re-fetch failed: ") + e2.what() + "\n");
+                exit(1);
+            }
+            continue;
         } catch (const std::exception& e) {
             print_red_err(std::string("Login error: ") + e.what() + "\n");
             exit(1);
@@ -693,6 +737,7 @@ static void cmd_purchase(const Args& args) {
     }
 
     AppStore store(COOKIE_FILE);
+    if (get(args, "debug") == "true") store.set_debug(true);
 
     // Resolve App — lookup by bundle ID or numeric app ID
     auto resolve_app = [&]() -> App {
@@ -708,6 +753,9 @@ static void cmd_purchase(const Args& args) {
         json purchaseOut;
         purchaseOut["success"] = true;
         log_output(purchaseOut);
+    } catch (const AlreadyPurchased&) {
+        print_red_err("Error: license already exists\n");
+        exit(1);
     } catch (const PaidAppNotSupported&) {
         print_red_err("Error: purchasing paid apps is not supported.\n");
         exit(1);
@@ -722,6 +770,9 @@ static void cmd_purchase(const Args& args) {
             json purchaseOut;
             purchaseOut["success"] = true;
             log_output(purchaseOut);
+        } catch (const AlreadyPurchased&) {
+            print_red_err("Error: license already exists\n");
+            exit(1);
         } catch (const std::exception& e2) {
             print_red_err(std::string("Purchase error: ") + e2.what() + "\n");
             exit(1);
@@ -762,13 +813,6 @@ static void cmd_list_versions(const Args& args) {
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
     try {
-        // Fetch bag to get redownloadProduct endpoint for 5002 fallback
-        std::string redownloadEndpoint;
-        try {
-            auto bag = store.fetch_bag();
-            redownloadEndpoint = bag.redownloadEndpoint;
-        } catch (...) { /* non-fatal: fallback disabled if bag fails */ }
-
         App app;
         if (!bundleID.empty()) {
             app = store.lookup(acc, bundleID);
@@ -776,7 +820,7 @@ static void cmd_list_versions(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.list_versions(acc, app, redownloadEndpoint);
+        auto out = store.list_versions(acc, app);
 
         json j;
         j["externalVersionIdentifiers"] = out.externalVersionIdentifiers;
@@ -810,13 +854,6 @@ static void cmd_get_version_metadata(const Args& args) {
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
     try {
-        // Fetch bag to get redownloadProduct endpoint for 5002 fallback
-        std::string redownloadEndpoint;
-        try {
-            auto bag = store.fetch_bag();
-            redownloadEndpoint = bag.redownloadEndpoint;
-        } catch (...) { /* non-fatal */ }
-
         App app;
         if (!bundleID.empty()) {
             app = store.lookup(acc, bundleID);
@@ -824,7 +861,7 @@ static void cmd_get_version_metadata(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.get_version_metadata(acc, app, versionID, redownloadEndpoint);
+        auto out = store.get_version_metadata(acc, app, versionID);
 
         json j;
         j["externalVersionID"] = versionID;
@@ -875,12 +912,12 @@ static void cmd_download(const Args& args) {
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
 
-    // Fetch bag for redownloadProduct (5002 fallback for licensed apps like Teams)
-    std::string redownloadEndpoint;
+    // Fetch anisette for download request headers
     try {
-        auto bag = store.fetch_bag();
-        redownloadEndpoint = bag.redownloadEndpoint;
-    } catch (...) { /* non-fatal: proceed without fallback */ }
+        HttpClient anisetteHttp(COOKIE_FILE);
+        AnisetteData ani = fetch_anisette(anisetteHttp);
+        store.set_anisette(ani);
+    } catch (...) { /* non-fatal */ }
 
     App app;
 
@@ -937,7 +974,7 @@ static void cmd_download(const Args& args) {
             return buf;
         };
 
-        char pctStr[8] = "  0%";
+        char pctStr[16] = "  0%";
         if (total > 0) {
             int pct = (int)(received * 100 / total);
             if (pct > 100) pct = 100;
@@ -1043,7 +1080,7 @@ static void cmd_download(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
+        auto out = store.download(acc, app, outputPath, versionID, progress);
         json dlOut;
         dlOut["output"]    = out.destinationPath;
         dlOut["purchased"] = false;
@@ -1081,7 +1118,7 @@ static void cmd_download(const Args& args) {
         startTime     = std::chrono::steady_clock::now();
         prevDrawnCols = 0;
         try {
-            auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
+            auto out = store.download(acc, app, outputPath, versionID, progress);
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = true;
@@ -1096,7 +1133,7 @@ static void cmd_download(const Args& args) {
             startTime     = std::chrono::steady_clock::now();
             prevDrawnCols = 0;
             try {
-                auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
+                auto out = store.download(acc, app, outputPath, versionID, progress);
                 json dlOut;
                 dlOut["output"]    = out.destinationPath;
                 dlOut["purchased"] = true;
@@ -1121,7 +1158,7 @@ static void cmd_download(const Args& args) {
             lastDraw      = std::chrono::steady_clock::now() - std::chrono::milliseconds(200);
             startTime     = std::chrono::steady_clock::now();
             prevDrawnCols = 0;
-            auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
+            auto out = store.download(acc, app, outputPath, versionID, progress);
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = false;
@@ -1197,7 +1234,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Wire up machine ID function pointer for in-memory encryption (protect.h).
+    // Wire up machine ID function pointer for in-memory encryption (ipatool.h).
     // Must happen before any SecureString::set()/get() call, anywhere.
     g_machine_id_fn = &get_machine_id;
 
