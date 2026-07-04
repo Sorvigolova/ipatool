@@ -808,11 +808,16 @@ void AppStore::apply_patches(const PlistDict& item,
     std::vector<uint8_t> metaBytes(metaStr.begin(), metaStr.end());
 
     std::vector<uint8_t> artworkBytes;
-    std::string artworkURL = dict_str(item, "artworkURL");
-    if (!artworkURL.empty()) {
-        HttpResponse artRes = m_http.get(artworkURL);
-        if (artRes.statusCode == 200 && !artRes.body.empty())
-            artworkBytes.assign(artRes.body.begin(), artRes.body.end());
+    try {
+        std::string artworkURL = dict_str(item, "artworkURL");
+        if (!artworkURL.empty()) {
+            HttpResponse artRes = m_http.get(artworkURL);
+            if (artRes.statusCode == 200 && !artRes.body.empty())
+                artworkBytes.assign(artRes.body.begin(), artRes.body.end());
+        }
+    }
+    catch (const std::exception& e) {
+        fprintf(stderr, "[WARN] Artwork Download Error: %s\n", e.what());
     }
 
     patch_with_minizip(srcPath, dstPath, metaBytes, artworkBytes, sinfs);
