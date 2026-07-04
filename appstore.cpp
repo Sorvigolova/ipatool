@@ -817,7 +817,7 @@ void AppStore::apply_patches(const PlistDict& item,
         }
     }
     catch (const std::exception& e) {
-        fprintf(stderr, "[WARN] Artwork Download Error: %s\n", e.what());
+        fprintf(stderr, "[WARN] Artwork Download Failed: %s\n", e.what());
     }
 
     patch_with_minizip(srcPath, dstPath, metaBytes, artworkBytes, sinfs);
