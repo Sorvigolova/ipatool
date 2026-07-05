@@ -11,8 +11,8 @@ ipatool-cpp protects your Apple ID credentials using machine-bound encryption �
 
 **Account file encryption:**
 - Credentials are always encrypted with AES-256-GCM — plaintext storage is not supported
-- File format version `0x03` — older formats are rejected with a clear re-login message
-- Encryption key: `PBKDF2-SHA256(machine_id + "nice_token_is_nice" + passphrase, random_salt, 100000, 32)`
+- File format version `0x02` — older formats are rejected with a clear re-login message
+- Encryption key: `PBKDF2-SHA256(machine_id + "nice_key_is_nice" + passphrase, random_salt, 100000, 32)`
 - `passphrase` is `""` if `--keychain-passphrase` is not provided — machine binding alone is sufficient
 - Copying the account file to another machine produces an unreadable file
 
@@ -150,20 +150,6 @@ these ship with every Mac, so this doesn't affect portability. Run
 `otool -L build/ipatool` afterward to confirm: you should see only those system
 libraries, no `libcurl`/`libssl`/`libcrypto`/`libminizip` dylibs.
 
-**Minimum macOS version**: defaults to Catalina (10.15) — the project uses
-`std::filesystem` throughout, which only got reliable libc++ support starting
-with that release, so there's no point targeting anything older. The bundled
-curl build picks this up automatically (`-mmacosx-version-min`), so the
-resulting binary should run on 10.15+ without the "object file was built for
-a newer macOS version" linker warnings you'd get if curl's separate autotools
-build silently defaulted to whatever SDK version your Mac happens to have.
-Override it explicitly if needed: `-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0`.
-
-Verify what actually got baked in:
-```sh
-otool -l build/ipatool | grep -A3 "LC_BUILD_VERSION\|LC_VERSION_MIN_MACOSX"
-```
-
 ---
 
 ## Usage
@@ -232,8 +218,6 @@ ipatool purchase (-b BUNDLE_ID | -i APP_ID) [--keychain-passphrase PASSPHRASE]
 ```
 Acquires a free license for an app. Must be run once before downloading any app not already in your library.
 
-- If the app is already in your library, this exits with an error (`license already exists`) — that's expected, just proceed to `download`
-
 #### `download`
 ```
 ipatool download (-b BUNDLE_ID | -i APP_ID) [-o OUTPUT] [--external-version-id ID] [--purchase] [--keychain-passphrase PASSPHRASE]
@@ -249,7 +233,7 @@ Downloads an app as an `.ipa` file.
 - Download is resumable — if interrupted, re-running the same command continues from where it stopped
 - The IPA is patched to match the iTunes format:
   - `iTunesMetadata.plist` — written to zip root with full account info, purchase date, and `com.apple.iTunesStore.downloadInfo`
-  - `iTunesArtwork` — app icon written to zip root
+  - `iTunesArtwork` — app icon (600×600 PNG, no extension) written to zip root
   - Sinf DRM token injected into `Payload/{App}.app/SC_Info/`
 
 #### `list-versions`
@@ -329,8 +313,8 @@ On Windows 7/8 the legacy Console API is used for colors; on Windows 10+ ANSI es
 
 | File | Contents |
 |------|----------|
-| `~/.ipatool/account` | Apple ID credentials — AES-256-GCM encrypted, machine-bound (format v3) |
-| `~/.ipatool/cookies` | Session cookies (libcurl cookie file, required for download) |
+| `~/.ipatool/account` | Apple ID credentials — AES-256-GCM encrypted, machine-bound (format v2) |
+| `~/.ipatool/cookies` | Session cookies (libcurl cookie jar, required for download) |
 
 On Windows these are in `%USERPROFILE%\.ipatool\`.
 
@@ -353,25 +337,14 @@ The account file is always encrypted. If you copy it to another machine or reins
 
 ```
 ipatool-cpp/
-├── main.cpp           ← CLI entry point, arg parsing, all commands, account file encryption
-├── ipatool.h           ← Shared types: Account, ProgressCb, IpaError hierarchy, Store constants
-├── protect.h/.cpp      ← In-memory protection: secure_zero, SecureString, passphrase state
-├── appstore.h/.cpp     ← App Store API (login, search, purchase, download), App/Sinf types,
-│                          storefront table, iTunes Search/Lookup JSON parsing
-├── gsa.h/.cpp          ← Grand Slam Authentication (SRP-6a login, 2FA)
-├── anisette.h/.cpp     ← Anisette data: local binary (Windows) / public servers (macOS, Linux)
-├── hwid.h/.cpp         ← Machine ID derivation (Windows registry, Linux /etc, macOS IOKit)
-├── http_client.h/.cpp  ← libcurl wrapper (GET, POST, resumable download, cookie file)
-├── plist.h/.cpp        ← Apple plist XML+binary encoder/decoder (no external deps)
-├── bignum.h/.cpp       ← BIGNUM free-function wrappers
-├── sha2.h/.cpp         ← SHA-256 + HMAC-SHA256 + PBKDF2
-├── aes.h/.cpp          ← AES-GCM + AES-CBC, all modes in one place
-├── srp.h/.cpp          ← SRP-6a math for GSA (Apple's "s2k" x derivation)
-├── CMakeLists.txt      ← Cross-platform CMake build (vcpkg + static support)
+├── main.cpp           ← CLI entry point, arg parsing, all commands, file encryption
+├── ipatool.h          ← Shared types (Account, App, Sinf), SecureString, in-memory encryption
+├── hwid.h             ← Machine ID derivation (Windows registry, Linux /etc, macOS IOKit)
+├── http_client.h      ← libcurl wrapper (GET, POST, resumable download, cookie jar)
+├── plist.h            ← Apple plist XML+binary encoder/decoder (no external deps)
+├── json_helpers.h     ← nlohmann/json helpers for iTunes search/lookup API
+├── appstore.h         ← All App Store API logic (login, search, purchase, download)
+├── storefront.h       ← Country code ↔ storefront ID map (130 entries)
+├── CMakeLists.txt     ← Cross-platform CMake build (vcpkg + static support)
 └── README.md
 ```
-
-`Account` lives in `ipatool.h` (not `appstore.h`) because `gsa.h`/`gsa.cpp` needs it too —
-it's the result of the GSA login flow, not an App Store-specific concept. `App` and `Sinf`,
-on the other hand, only ever appear in search/lookup/download results, so they live in
-`appstore.h` alongside the code that produces and consumes them.

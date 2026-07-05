@@ -4,11 +4,13 @@
 // Cross-platform: Windows (MSVC / VS2022), Linux, macOS
 //
 // Declarations only — see appstore.cpp for implementations.
+// Includes the storefront ID -> country code table and iTunes Search/Lookup
+// JSON parsing, merged in here since they're App Store specific data, not
+// general-purpose.
 
 #include "ipatool.h"
 #include "http_client.h"
 #include "plist.h"
-#include "gsa.h"
 
 #include <string>
 #include <vector>
@@ -17,27 +19,9 @@
 
 using json = nlohmann::json;
 
-// ── Storefront → country code ───────────────────────────────────────────────
-// account.storeFront looks like "143441-1,32" — the numeric ID before the
-// dash maps to a 2-letter ISO country code (e.g. "143441" → "US"), needed
-// for iTunes Search API calls (search, lookup, lookup_by_id).
-// Throws std::runtime_error if sf doesn't match any known storefront ID.
-std::string country_code_from_storefront(const std::string& sf);
-
 // ── Data types ───────────────────────────────────────────────────────────────
 
-struct App {
-    int64_t     id        = 0;
-    std::string bundleID;
-    std::string name;
-    std::string version;
-    double      price     = 0.0;
-};
-
-struct Sinf {
-    int64_t              id   = 0;
-    std::vector<uint8_t> data;
-};
+// App and Sinf live in ipatool.h (shared with the rest of the project).
 
 // ── JSON parsing (iTunes Search/Lookup API responses) ─────────────────────────
 
@@ -49,6 +33,13 @@ struct SearchResult {
 };
 
 SearchResult parse_search_json(const std::string& body);
+
+// ── Storefront -> country code ──────────────────────────────────────────────
+// account.storeFront looks like "143441-1,32" — the numeric ID before the
+// dash maps to a 2-letter ISO country code (e.g. "143441" -> "US"), needed
+// for iTunes Search API calls (search, lookup, lookup_by_id).
+// Throws std::runtime_error if sf doesn't match any known storefront ID.
+std::string country_code_from_storefront(const std::string& sf);
 
 // ── URL / query helpers ──────────────────────────────────────────────────────
 
@@ -63,17 +54,24 @@ public:
     explicit AppStore(const std::string& cookieFile = "")
         : m_http(cookieFile) {}
 
+    // ── Bag ──────────────────────────────────────────────────────────────────
+
+    struct BagOutput {
+        std::string authEndpoint;
+        std::string redownloadEndpoint;  // https://downloaddispatch.itunes.apple.com/r/redownload
+    };
+
+    // Fetch bag.xml and return both auth and redownload endpoints.
+    // Call this before download / list-versions / get-version-metadata to
+    // obtain the redownloadEndpoint needed for the 5002 fallback.
+    BagOutput fetch_bag();
+
     // ── Login ────────────────────────────────────────────────────────────────
 
-    // ── Login (GSA path — replaces broken iTunes fast-auth endpoint) ────────
-    //
-    // anisette : from AnisetteData::fetch_from_exe("anisette.exe")
-    // authCode : empty on first call; fill if AuthCodeRequired is thrown
-    //
-    Account login(const std::string&  email,
-                  const std::string&  password,
-                  const AnisetteData& anisette,
-                  const std::string&  authCode = "");
+    Account login(const std::string& email,
+                  const std::string& password,
+                  const std::string& authCode = "",
+                  const std::string& endpoint = "");
 
     // ── Search ───────────────────────────────────────────────────────────────
 
@@ -107,22 +105,20 @@ public:
                             const App& app,
                             const std::string& outputPath = "",
                             const std::string& externalVersionID = "",
-                            ProgressCb progress = nullptr);
+                            ProgressCb progress = nullptr,
+                            const std::string& redownloadEndpoint = "");
 
 public:
-    void set_debug(bool v) { m_debug = v; }
-    void set_anisette(const AnisetteData& a) { m_anisette = a; }
+    void set_debug(bool v) { m_debug = v; m_http.set_debug(v); }
 
     // ── List Versions ────────────────────────────────────────────────────────
-    PlistDict fetch_download_info(const Account& acc, const std::string& guid,
-                                  int64_t adamId, const std::string& versionId = "");
-
     struct ListVersionsOutput {
         std::vector<std::string> externalVersionIdentifiers;
         std::string              latestExternalVersionID;
     };
 
-    ListVersionsOutput list_versions(const Account& acc, const App& app);
+    ListVersionsOutput list_versions(const Account& acc, const App& app,
+                                     const std::string& redownloadEndpoint = "");
 
     // ── Get Version Metadata ─────────────────────────────────────────────────
     struct GetVersionMetadataOutput {
@@ -132,37 +128,44 @@ public:
 
     GetVersionMetadataOutput get_version_metadata(const Account& acc,
                                                    const App& app,
-                                                   const std::string& versionID);
+                                                   const std::string& versionID,
+                                                   const std::string& redownloadEndpoint = "");
 
 private:
-    HttpClient   m_http;
-    bool         m_debug    = false;
-    AnisetteData m_anisette; // cached from login, used for store requests
+    HttpClient m_http;
+    bool       m_debug = false;
 
     static std::string get_guid();
-    static std::string get_guid_from_mac();
 
-    // ── iTunes Store authentication (GSA path) ───────────────────────────────
+    // ── sendDownloadProduct — shared volumeStore->redownload helper ─────────
     //
-    // Exchanges com.apple.gs.itunes.auth token for iTunes Store session cookies.
-    // Curl automatically stores Set-Cookie (amia-{dsid}, mz_at0-{dsid}, etc.)
-    // into COOKIE_FILE so subsequent buyProduct / download requests send them.
-    //
-    // Mirrors gsa.js storeAuthenticate():
-    //   POST https://buy.itunes.apple.com/.../authenticate
-    //   Body:  appleId, attempt:"1", createSession:"true", guid,
-    //          password:PET, rmp:"0", why:"signIn"
-    //   Header: X-Apple-Identity-Token = base64(adsid:GsIdmsToken)
-    //   Response sets mz_at0-{dsid} / itspod / hsaccnt cookies into COOKIE_FILE,
-    //   and returns passwordToken used as X-Token in buy/download requests.
-    void do_itunes_auth(Account& acc,
-                        const AnisetteData& anisette,
-                        const std::string& guid);
+    // Sends to volumeStore first (uses externalVersionId version key).
+    // On failureType "5002" (licensed app), falls back to bag-resolved
+    // redownloadProduct (uses appExtVrsId key):
+    //   - redownload serves the app                    -> use redownload response
+    //   - redownload: empty songList + "No Longer Available"
+    //                                                  -> transient 5002 -> retry volumeStore
+    // Returns the top-level response PlistDict for the caller to inspect.
+    PlistDict send_download_product(const Account& acc, const App& app,
+                                     const std::string& guid,
+                                     const std::string& externalVersionID,
+                                     const std::string& redownloadEndpoint);
+
+    // ── Bag (fetch auth + redownload endpoints) ──────────────────────────────
+    BagOutput fetch_bag_impl(const std::string& guid);
+
+    std::string fetch_bag_auth_endpoint(const std::string& guid);
+
+    // ── Login implementation ─────────────────────────────────────────────────
+    Account do_login(const std::string& email,
+                     const std::string& password,
+                     const std::string& authCode,
+                     const std::string& guid,
+                     const std::string& baseEndpoint);
 
     // ── Purchase implementation ───────────────────────────────────────────────
     void do_purchase(const Account& acc, const App& app,
-                     const std::string& guid, const std::string& pricingParam,
-                     std::map<std::string,std::string> headers = {});
+                     const std::string& guid, const std::string& pricingParam);
 
     // ── ZIP patching ──────────────────────────────────────────────────────────
     // Injects a patched iTunesMetadata.plist into the downloaded IPA.
@@ -209,4 +212,8 @@ private:
                                            const std::string& outputPath);
     static std::string make_filename(const App& app, const std::string& version);
     static int64_t file_size(const std::string& path);
+
+    // ── String helpers ────────────────────────────────────────────────────────
+    static std::string strip_spaces(const std::string& s);
+    static std::string str_lower(const char* s);
 };
