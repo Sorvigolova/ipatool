@@ -63,8 +63,8 @@ public:
     //                public anisette servers: X-MMe-Client-Info <MacBookPro13,2>...)
 #if defined(_WIN32) || defined(_WIN64)
     static constexpr const char* ITUNES_UA =
-        "iTunes/12.11.3 (Windows; Microsoft Windows 10 x64 Professional Edition "
-        "(Build 19041); x64) AppleWebKit/7611.3.10.1.16";
+        "iTunes/12.13.10 (Windows; Microsoft Windows 10 x64 Professional Edition "
+        "(Build 19045); x64) AppleWebKit/7613.3.9.0.2";
 #else
     static constexpr const char* ITUNES_UA =
         "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0";

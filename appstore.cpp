@@ -577,30 +577,125 @@ void AppStore::do_itunes_auth(Account& acc,
         {"X-Apple-Identity-Token",  id_tok},
     };
 
-    // URL: hardcoded constant, no ?guid, no pod prefix (first call)
-    static const char* AUTH_URL =
-        "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate";
+    // URL selection and retry strategy:
+    //
+    //  Apple may return any of the following on authenticate:
+    //    200 → success, parse passwordToken
+    //    302 → redirect to the correct pod, repeat POST there
+    //    204 → accepted but no body (rate-limit / load balancer), retry
+    //    404 → this pod does not serve the account, try another pod
+    //
+    //  Attempt order:
+    //    1. account pod (if known) — fastest path
+    //    2. p25 — standard routing pod (no authCode)
+    //    3. p6  — additional fallback
+    //
+    //  After a successful response the pod is updated from response headers.
 
-    HttpResponse res = m_http.post(AUTH_URL, encode_plist_xml(payload), hdrs);
+    auto make_auth_url = [](const std::string& pod) {
+        return "https://p" + pod +
+               "-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
+               "?Pod=" + pod + "&PRH=" + pod;
+    };
 
-    // Apple may redirect (302) to pod-specific URL e.g. p51-buy.itunes.apple.com
-    // gsa.js uses curl -L --post302 to follow with POST — we do it manually
-    if (res.statusCode == 301 || res.statusCode == 302 || res.statusCode == 307) {
-        auto locIt = res.headers.find("location");
-        if (locIt != res.headers.end() && !locIt->second.empty()) {
+    // Pod list for attempts (no duplicates)
+    std::vector<std::string> pods;
+    if (!acc.pod.empty())           pods.push_back(acc.pod);
+    if (acc.pod != "25")            pods.push_back("25");
+    if (acc.pod != "6" && pods.size() < 3) pods.push_back("6");
+
+    HttpResponse res;
+    bool         got_response = false;
+    std::string  last_err;
+
+    for (const auto& pod : pods) {
+        std::string url = make_auth_url(pod);
+        if (m_debug)
+            fprintf(stderr, "[iTunes auth] trying pod %s → %s\n", pod.c_str(), url.c_str());
+
+        // One attempt + retry on 204
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (attempt > 0) {
+#ifdef _WIN32
+                Sleep(1000);
+#else
+                usleep(1000000);
+#endif
+            }
+            res = m_http.post(url, encode_plist_xml(payload), hdrs);
+
             if (m_debug)
-                fprintf(stderr, "[iTunes auth] redirect → %s\n", locIt->second.c_str());
-            res = m_http.post(locIt->second, encode_plist_xml(payload), hdrs);
+                fprintf(stderr, "[iTunes auth] pod=%s attempt=%d status=%d\n",
+                        pod.c_str(), attempt, res.statusCode);
+
+            // 302/301/307 — follow redirect (POST → POST)
+            if (res.statusCode == 301 || res.statusCode == 302 || res.statusCode == 307) {
+                auto locIt = res.headers.find("location");
+                if (locIt != res.headers.end() && !locIt->second.empty()) {
+                    // Location header present — follow it
+                    if (m_debug)
+                        fprintf(stderr, "[iTunes auth] redirect → %s\n",
+                                locIt->second.c_str());
+                    res = m_http.post(locIt->second, encode_plist_xml(payload), hdrs);
+                    if (res.statusCode == 200 || res.statusCode == 201) {
+                        got_response = true;
+                    } else {
+                        // Redirect followed but server returned non-success (204 etc.)
+                        // Try next pod
+                        if (m_debug)
+                            fprintf(stderr, "[iTunes auth] redirect gave %d"
+                                    " — trying next pod\n", res.statusCode);
+                        last_err = "HTTP " + std::to_string(res.statusCode)
+                                 + " after redirect (pod " + pod + ")";
+                    }
+                } else {
+                    // 301/302 without Location — CDN rejected the request for this pod,
+                    // try the next pod
+                    if (m_debug)
+                        fprintf(stderr, "[iTunes auth] %d without Location"
+                                " — skipping pod %s\n", res.statusCode, pod.c_str());
+                    last_err = "HTTP " + std::to_string(res.statusCode)
+                             + " no Location (pod " + pod + ")";
+                }
+                break;
+            }
+
+            // 200/201 — success
+            if (res.statusCode == 200 || res.statusCode == 201) {
+                got_response = true;
+                break;
+            }
+
+            // 204 — empty body, retry on the same pod
+            if (res.statusCode == 204) {
+                last_err = "HTTP 204 (pod " + pod + ")";
+                continue;
+            }
+
+            // 404 — this pod is not ours, try the next one
+            if (res.statusCode == 404) {
+                last_err = "HTTP 404 (pod " + pod + ")";
+                break;
+            }
+
+            // Other errors — move immediately to next pod
+            last_err = "HTTP " + std::to_string(res.statusCode) + " (pod " + pod + ")";
+            break;
         }
+
+        if (got_response) break;
     }
 
+    if (!got_response)
+        throw IpaError("iTunes auth: all attempts exhausted — " + last_err);
+
     if (m_debug) {
-        fprintf(stderr, "[iTunes auth] status=%d\n", res.statusCode);
-        fprintf(stderr, "[iTunes auth] response headers:\n");
+        fprintf(stderr, "[iTunes auth] final status=%d\n", res.statusCode);
         for (auto& [k, v] : res.headers)
             fprintf(stderr, "  %s: %s\n", k.c_str(), v.c_str());
         fprintf(stderr, "[iTunes auth] body:\n%s\n", res.body.c_str());
     }
+
     if (res.statusCode != 200 && res.statusCode != 201)
         throw IpaError("iTunes auth: HTTP " + std::to_string(res.statusCode));
 

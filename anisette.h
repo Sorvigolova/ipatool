@@ -36,6 +36,7 @@ struct AnisetteData {
     std::string routingInfo;    // X-Apple-I-MD-RINFO  (e.g. "17106176")
 
     // Locale / time — populated from server output
+    std::string userAgent;   // GSA UA — depends on anisette source
     std::string locale     = "en_US";
     std::string timezone   = "PST";
     std::string clientTime;     // X-Apple-I-Client-Time (auto-filled if empty)
@@ -73,7 +74,7 @@ struct AnisetteData {
     // Not implemented. If the OTP algorithm ever gets reverse-engineered,
     // it goes here — same return type, so every caller (GsaClient::login,
     // do_purchase, etc.) keeps working unmodified.
-    // static AnisetteData generate_locally();
+    static AnisetteData generate_locally();
 
 private:
     static std::string trim(const std::string& s);

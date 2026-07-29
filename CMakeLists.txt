@@ -335,6 +335,7 @@ add_executable(ipatool
     srp.h
 )
 
+
 target_include_directories(ipatool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
@@ -444,7 +445,7 @@ if(WIN32)
     # iphlpapi  = GetAdaptersInfo (MAC address)
     # ws2_32    = Winsock (used by curl internally too)
     # winhttp   = WinHttpGetIEProxyConfigForCurrentUser (system proxy detection)
-    target_link_libraries(ipatool PRIVATE iphlpapi ws2_32 crypt32 wldap32 normaliz winhttp)
+    target_link_libraries(ipatool PRIVATE iphlpapi ws2_32 crypt32 wldap32 normaliz winhttp Shell32 Shlwapi Ole32 Advapi32)
 
     # Suppress MSVC warnings about "unsafe" CRT functions
     target_compile_definitions(ipatool PRIVATE

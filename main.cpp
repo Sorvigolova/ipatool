@@ -511,14 +511,37 @@ static void print_red_err(const std::string& msg) {
 #endif
 }
 
-// Fetch anisette data — local binary on Windows, public server fallback elsewhere.
-// On macOS/Linux we don't yet have a working local anisette generator, so we
-// rely on public SideStore-style servers until that's solved.
+// Fetch anisette data.
+//
+// Priority order on Windows:
+//   1. generate_locally()   — native MS Store iCloud (Win10/11, no extra binary)
+//   2. fetch_from_exe()     — anisette.exe from PATH (Win7 + iTunes fallback)
+//
+// On macOS/Linux:
+//   fetch_from_public_servers() — SideStore-style public servers
 static AnisetteData fetch_anisette(HttpClient& http, bool debug = false)
 {
 #ifdef _WIN32
-    // OS finds anisette.exe via PATH or current directory
-    return AnisetteData::fetch_from_exe("anisette.exe");
+    // 1. Native MS Store iCloud — no external binaries required
+    try {
+        return AnisetteData::generate_locally();
+    } catch (const std::exception& e) {
+        if (debug)
+            fprintf(stderr, "[anisette] native: %s\n", e.what());
+    }
+
+    // 2. Fallback — anisette.exe (Win7 + iTunes)
+    try {
+        return AnisetteData::fetch_from_exe("anisette.exe");
+    } catch (const std::exception& e) {
+        if (debug)
+            fprintf(stderr, "[anisette] anisette.exe: %s\n", e.what());
+    }
+
+    throw IpaError(
+        "anisette: no working source found.\n"
+        "  Option A: install iCloud from Microsoft Store and sign in\n"
+        "  Option B: put anisette.exe in PATH or same directory as ipatool");
 #else
     return AnisetteData::fetch_from_public_servers(http, debug);
 #endif

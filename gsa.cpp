@@ -486,7 +486,7 @@ GsaClient::build_headers(const AnisetteData& a) const
     std::map<std::string, std::string> h = {
         {"Content-Type",  "text/x-xml-plist"},
         {"Accept",        "*/*"},
-        {"User-Agent",    ITUNES_UA},
+        {"User-Agent",    a.userAgent.empty() ? ITUNES_UA : a.userAgent},
         {"Accept-Language","en-US,en;q=0.9"},
         // Machine ID stays in headers (required by new protocol)
         {"X-Apple-I-MD-M", a.machineID},
