@@ -957,7 +957,16 @@ static void cmd_download(const Args& args) {
 #endif
 
     ProgressCb progress = [&](int64_t received, int64_t total) {
-        if (!isTTY) return;
+        if (!isTTY) {
+            // Machine-readable progress for GUI / piped output
+            if (total > 0) {
+                int pct = (int)(received * 100 / total);
+                if (pct > 100) pct = 100;
+                fprintf(stderr, "PROGRESS:%d\n", pct);
+                fflush(stderr);
+            }
+            return;
+        }
         auto now     = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDraw).count();
         bool done    = (total > 0 && received >= total);

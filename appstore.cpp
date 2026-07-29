@@ -669,11 +669,13 @@ void AppStore::do_purchase(const Account& acc, const App& app,
 
     PlistDict payload;
     payload["appExtVrsId"]               = PlistValue::makeString("0");
+    payload["hasAskedToFulfillPreorder"] = PlistValue::makeString("true");
     payload["buyWithoutAuthorization"]   = PlistValue::makeString("true");
+    payload["hasDoneAgeCheck"]           = PlistValue::makeString("true");
     payload["guid"]                      = PlistValue::makeString(guid);
     payload["needDiv"]                   = PlistValue::makeString("0");
-    payload["ownerDsid"]                 = PlistValue::makeString(acc.directoryServicesID);
-    payload["pg"]                        = PlistValue::makeString("default");
+    payload["origPage"]                  = PlistValue::makeString("Software-" + std::to_string(app.id));
+    payload["origPageLocation"]          = PlistValue::makeString("Buy");
     payload["price"]                     = PlistValue::makeString("0");
     payload["pricingParameters"]         = PlistValue::makeString(pricingParam);
     payload["productType"]               = PlistValue::makeString("C");
@@ -683,6 +685,7 @@ void AppStore::do_purchase(const Account& acc, const App& app,
     if (headers.empty()) {
         headers = {
             {"Content-Type",        "application/x-apple-plist"},
+            {"iCloud-DSID",         acc.directoryServicesID},
             {"X-Dsid",              acc.directoryServicesID},
             {"X-Apple-Store-Front", acc.storeFront},
             {"X-Token",             acc.passwordToken.get()},
@@ -807,6 +810,7 @@ void AppStore::apply_patches(const PlistDict& item,
     std::string metaStr  = encode_plist_xml(metadata);
     std::vector<uint8_t> metaBytes(metaStr.begin(), metaStr.end());
 
+    // Download iTunesArtwork
     std::vector<uint8_t> artworkBytes;
     try {
         std::string artworkURL = dict_str(item, "artworkURL");
