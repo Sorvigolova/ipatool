@@ -1,0 +1,11 @@
+#include "sap_resources.h"
+
+// SAP dylib assets embedded as binary resources.
+// Paths are relative to the .rc file location (project root).
+// Run extract_sap_assets.py first to populate sap_assets/.
+
+IDR_SAP_COREFP        RCDATA "sap_assets/CoreFP"
+IDR_SAP_COMMERCECORE  RCDATA "sap_assets/CommerceCore"
+IDR_SAP_COMMERCEKIT   RCDATA "sap_assets/CommerceKit"
+IDR_SAP_COREFP_ICXS   RCDATA "sap_assets/CoreFP.icxs"
+IDR_SAP_STOREAGENT    RCDATA "sap_assets/storeagent"
