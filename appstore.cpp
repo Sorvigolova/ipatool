@@ -570,14 +570,47 @@ AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc, const A
     auto songList = dict_arr(data, "songList");
     if (songList.empty()) {
         if (!customerMessage.empty()) throw IpaError(customerMessage);
-        // purchaseSuccess + empty songList = app not available in this storefront/region
-        // (e.g. VPN apps removed from Russian App Store by government order)
+
+        // Empty songList on list_versions — try redownload endpoint before giving up.
+        // Some apps (e.g. removed from local storefront) return songList via redownload
+        // even when volumeStore returns empty. Matches behaviour of download flow.
         std::string jingle = dict_str(data, "jingleDocType");
+        if (!redownloadEndpoint.empty()) {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] list_versions: empty songList — trying redownload endpoint\n");
+            std::string rdUrl = redownloadEndpoint + "?guid=" + guid;
+            PlistDict rdPayload;
+            rdPayload["creditDisplay"]           = PlistValue::makeString("");
+            rdPayload["guid"]                    = PlistValue::makeString(guid);
+            rdPayload["salableAdamId"]           = PlistValue::makeInt(app.id);
+            rdPayload["serialNumber"]            = PlistValue::makeString("0");
+            rdPayload["is-purchased-redownload"] = PlistValue::makeBool(true);
+            std::map<std::string, std::string> rdHdrs = {
+                {"Content-Type",        "application/x-apple-plist"},
+                {"iCloud-DSID",         acc.directoryServicesID},
+                {"X-Dsid",              acc.directoryServicesID},
+                {"X-Apple-Store-Front", acc.storeFront},
+                {"X-Token",             acc.passwordToken.get()},
+            };
+            HttpResponse rdRes = m_http.post(rdUrl, encode_plist_xml(rdPayload), rdHdrs);
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] list_versions redownload status: %d\n", rdRes.statusCode);
+            PlistDict rdData  = decode_plist(rdRes.body);
+            auto rdList = dict_arr(rdData, "songList");
+            if (!rdList.empty()) {
+                data     = std::move(rdData);
+                songList = std::move(rdList);
+                goto lv_process_songlist;
+            }
+        }
+
         if (jingle == "purchaseSuccess")
             throw IpaError("app is not available for download in your region/storefront"
                            " (license was granted but download was blocked)");
         throw IpaError("invalid response: empty songList");
     }
+    lv_process_songlist:
+    {
     auto& itemVal = songList[0];
     if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
     const PlistDict& item = itemVal.dictVal;
@@ -604,6 +637,7 @@ AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc, const A
         ? std::to_string(latIt->second.intVal) : latIt->second.str();
 
     return out;
+    } // lv_process_songlist block
 }
 
 AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account& acc,
