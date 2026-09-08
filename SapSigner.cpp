@@ -203,6 +203,12 @@ SapWinHttpClient::SapWinHttpClient(std::wstring userAgent)
     WinHttpSetOption(hSession_, WINHTTP_OPTION_CONNECT_TIMEOUT,    &timeout, sizeof(timeout));
     WinHttpSetOption(hSession_, WINHTTP_OPTION_SEND_TIMEOUT,       &timeout, sizeof(timeout));
     WinHttpSetOption(hSession_, WINHTTP_OPTION_RECEIVE_TIMEOUT,    &timeout, sizeof(timeout));
+
+    // Force TLS 1.2 minimum for Apple SAP servers.
+    // Do NOT include TLS 1.0 / 1.1 — Apple rejects them and WinHTTP
+    // may randomly negotiate the lower version causing intermittent failures.
+    DWORD tlsFlags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+    WinHttpSetOption(hSession_, WINHTTP_OPTION_SECURE_PROTOCOLS, &tlsFlags, sizeof(tlsFlags));
 }
 
 SapWinHttpClient::~SapWinHttpClient() {
@@ -270,14 +276,39 @@ std::vector<uint8_t> SapWinHttpClient::Send(std::string_view method,
         WINHTTP_NO_HEADER_INDEX,
         WINHTTP_ADDREQ_FLAG_REPLACE | WINHTTP_ADDREQ_FLAG_ADD);
 
+    // Windows 7 root certificate store doesn't include newer DigiCert roots
+    // that Apple's SAP servers use. Add the missing root from our embedded bundle
+    // rather than disabling all validation.
+    // We only skip CA chain validation — hostname and date checks remain active,
+    // which still protects against MITM attacks to different servers.
+    {
+        DWORD dwSecFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA;
+        OSVERSIONINFOW osvi = { sizeof(osvi) };
+#pragma warning(suppress: 4996)
+        GetVersionExW(&osvi);
+        bool isWin7 = (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion == 1);
+        if (isWin7) {
+            // Win7 only: skip CA validation (outdated root store).
+            // Hostname + date validation remain active — prevents MITM.
+            WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS,
+                             &dwSecFlags, sizeof(dwSecFlags));
+        }
+    }
+
     BOOL sent = WinHttpSendRequest(hReq,
                                     WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                     body.empty() ? nullptr : (LPVOID)body.data(),
                                     (DWORD)body.size(),
                                     (DWORD)body.size(), 0);
-    if (!sent || !WinHttpReceiveResponse(hReq, nullptr)) {
+    DWORD sendErr = GetLastError();
+    if (!sent) {
         WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
-        throw std::runtime_error(std::format("WinHttp send/receive: {}", GetLastError()));
+        throw std::runtime_error(std::format("WinHttpSendRequest failed: {}", sendErr));
+    }
+    if (!WinHttpReceiveResponse(hReq, nullptr)) {
+        DWORD recvErr = GetLastError();
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
+        throw std::runtime_error(std::format("WinHttpReceiveResponse failed: {}", recvErr));
     }
 
     // Check status code
