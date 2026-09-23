@@ -62,6 +62,7 @@ public:
     struct BagOutput {
         std::string authEndpoint;
         std::string redownloadEndpoint;  // https://downloaddispatch.itunes.apple.com/r/redownload
+        std::string updateEndpoint;      // https://downloaddispatch.itunes.apple.com/up/updateProduct
         // SAP config fields (v2.4.0+ — from bag.xml sign-sap-* keys)
         std::string          signSapSetup;        // sign-sap-setup URL
         std::string          signSapSetupCert;    // sign-sap-setup-cert URL
@@ -117,7 +118,7 @@ public:
                             const std::string& redownloadEndpoint = "");
 
 public:
-    void set_debug(bool v) { m_debug = v; m_http.set_debug(v); }
+    void set_debug(bool v); // also enables SapSigner HTTP dumps
 
     // ── List Versions ────────────────────────────────────────────────────────
     struct ListVersionsOutput {
@@ -142,6 +143,9 @@ public:
 private:
     HttpClient m_http;
     bool       m_debug = false;
+    // Bag "updateProduct" endpoint, remembered by fetch_bag_impl() so the
+    // redownload fallback can use it without changing public signatures.
+    std::string m_updateEndpoint;
 
     static std::string get_guid();
 
@@ -154,10 +158,55 @@ private:
     //   - redownload: empty songList + "No Longer Available"
     //                                                  -> transient 5002 -> retry volumeStore
     // Returns the top-level response PlistDict for the caller to inspect.
+    //
+    // isMac: skip the iOS catalog version lookup on the redownload fallback
+    // (the lookup would pin an iOS build for a macOS download).
     PlistDict send_download_product(const Account& acc, const App& app,
                                      const std::string& guid,
                                      const std::string& externalVersionID,
-                                     const std::string& redownloadEndpoint);
+                                     const std::string& redownloadEndpoint,
+                                     bool isMac = false);
+
+    // ── Platform version lookup (port of upstream appstore_platform_version_lookup.go)
+    //
+    // Resolves the latest iOS external version ID via the MZStorePlatform
+    // lookup (p=mdm-lockup). Tries catalogs in order: enterprisestore, then the
+    // consumer catalogs iphone and ipad (upstream e5211d6 — some storefronts
+    // have no enterprise listing even when the consumer catalogs contain the
+    // app). The account's country is kept for every lookup.
+    // Throws IpaError when no catalog lists the app or on HTTP failure.
+    std::string lookup_latest_external_version_id(const Account& acc, const App& app);
+
+    // ── Redownload + updateProduct fallback (port of upstream sendDownloadProduct)
+    //
+    // POSTs redownloadProduct with the Go request shape (headers: Content-Type,
+    // iCloud-DSID, X-Dsid; payload: creditDisplay, guid, salableAdamId,
+    // serialNumber, appExtVrsId). The version is pinned to externalVersionID or,
+    // for iOS, the latest from the platform catalogs.
+    // If redownload answers HTTP 500 with an empty body, or 200 with a
+    // "No Longer Available" message, and the version is pinned, the same request
+    // goes to the bag's updateProduct endpoint.
+    // Returns the decoded response of the last request sent.
+    PlistDict redownload_product(const Account& acc, const App& app,
+                                 const std::string& guid,
+                                 const std::string& redownloadEndpoint,
+                                 const std::string& externalVersionID,
+                                 bool isMac, const char* label);
+
+    // updateProduct request (upstream sendUpdateProduct). Returns the response
+    // as-is when it carries a failureType; throws IpaError on a customer
+    // message, a non-200 status, or a response that does not match the
+    // requested app ID / version / bundle ID.
+    PlistDict send_update_product(const Account& acc, const App& app,
+                                  const std::string& guid,
+                                  const std::string& externalVersionID);
+
+    // Version to pin on a redownload request: externalVersionID if set,
+    // otherwise the result of lookup_latest_external_version_id(). Unpinned
+    // redownloads can return the wrong platform's build (e.g. tvOS).
+    // Returns "" (unpinned, previous behaviour) if the lookup fails.
+    std::string redownload_version_id(const Account& acc, const App& app,
+                                      const std::string& externalVersionID);
 
     // Download (macOS) — decrypts .pkg using StoreAgentMachine
     DownloadOutput download_mac(const Account& acc, const App& app,

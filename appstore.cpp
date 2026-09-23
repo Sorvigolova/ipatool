@@ -1,5 +1,6 @@
 #include "appstore.h"
 #include "SapSigner.h"   // SAP signing (v2.4.0+)
+#include "device_mac.h"  // device MAC / GUID
 #include "StoreAgentMachine.h"
 #include <thread>
 #include <chrono>
@@ -205,6 +206,54 @@ std::string build_query(const std::map<std::string, std::string>& params) {
     return q;
 }
 
+// ── Debug request/response dumps (--debug) ────────────────────────────────────
+
+// Session tokens are shortened so a --debug log can be shared safely.
+static std::string debug_mask_header(const std::string& name, const std::string& value) {
+    if (name == "X-Token" && value.size() > 8)
+        return value.substr(0, 4) + "..." + value.substr(value.size() - 4)
+             + " (" + std::to_string(value.size()) + " chars)";
+    return value;
+}
+
+static void debug_dump_request(const char* label, const char* method,
+                               const std::string& url,
+                               const std::map<std::string, std::string>& headers,
+                               const std::string& body) {
+    fprintf(stderr, "[DEBUG] ── %s request ──\n", label);
+    fprintf(stderr, "[DEBUG] %s %s\n", method, url.c_str());
+    fprintf(stderr, "[DEBUG] request headers:\n");
+    for (auto& [k, v] : headers)
+        fprintf(stderr, "  %s: %s\n", k.c_str(), debug_mask_header(k, v).c_str());
+    fprintf(stderr, "[DEBUG] request body (%zu bytes):\n%s\n", body.size(), body.c_str());
+}
+
+static void debug_dump_response(const char* label, const HttpResponse& res) {
+    fprintf(stderr, "[DEBUG] ── %s response ──\n", label);
+    fprintf(stderr, "[DEBUG] status: %d\n", res.statusCode);
+    fprintf(stderr, "[DEBUG] response headers:\n");
+    for (auto& [k, v] : res.headers)
+        fprintf(stderr, "  %s: %s\n", k.c_str(), v.c_str());
+    fprintf(stderr, "[DEBUG] response body (%zu bytes):\n%s\n",
+            res.body.size(), res.body.empty() ? "<empty>" : res.body.c_str());
+}
+
+// Same failure mapping as the top of download()/list_versions().
+static void throw_on_store_failure(const PlistDict& data) {
+    std::string failureType     = dict_str(data, "failureType");
+    std::string customerMessage = dict_str(data, "customerMessage");
+    if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED ||
+        failureType == FAILURE_SIGN_IN_REQUIRED        ||
+        failureType == FAILURE_DEVICE_VERIFICATION)
+        throw PasswordTokenExpired();
+    if (customerMessage == CUSTOMER_MSG_SIGN_IN)   throw PasswordTokenExpired();
+    if (failureType == FAILURE_LICENSE_NOT_FOUND)  throw LicenseRequired();
+    if (!failureType.empty() && !customerMessage.empty())
+        throw IpaError("received error: " + customerMessage);
+    if (!failureType.empty())
+        throw IpaError("received error: " + failureType);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AppStore — Bag / Login
 // ─────────────────────────────────────────────────────────────────────────────
@@ -379,30 +428,16 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
         if ((jingle == "purchaseSuccess" || jingle.empty()) && !redownloadEndpoint.empty()) {
             if (m_debug)
                 fprintf(stderr, "[DEBUG] empty songList after purchase — trying redownload endpoint\n");
-            std::string rdUrl = redownloadEndpoint + "?guid=" + guid;
-            PlistDict rdPayload;
-            rdPayload["creditDisplay"]           = PlistValue::makeString("");
-            rdPayload["guid"]                    = PlistValue::makeString(guid);
-            rdPayload["salableAdamId"]           = PlistValue::makeInt(app.id);
-            rdPayload["serialNumber"]            = PlistValue::makeString("0");
-            rdPayload["is-purchased-redownload"] = PlistValue::makeBool(true);
-            std::map<std::string, std::string> rdHdrs = {
-                {"Content-Type",        "application/x-apple-plist"},
-                {"iCloud-DSID",         acc.directoryServicesID},
-                {"X-Dsid",              acc.directoryServicesID},
-                {"X-Apple-Store-Front", acc.storeFront},
-                {"X-Token",             acc.passwordToken.get()},
-            };
-            HttpResponse rdRes = m_http.post(rdUrl, encode_plist_xml(rdPayload), rdHdrs);
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] redownload status: %d\n", rdRes.statusCode);
-            PlistDict rdData = decode_plist(rdRes.body);
+            PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
+                                                  externalVersionID, /*isMac=*/false,
+                                                  "redownload");
             auto rdList = dict_arr(rdData, "songList");
             if (!rdList.empty()) {
                 data     = std::move(rdData);
                 songList = std::move(rdList);
                 goto process_songlist;
             }
+            throw_on_store_failure(rdData);
         }
 
         if (jingle == "purchaseSuccess")
@@ -578,30 +613,16 @@ AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc, const A
         if (!redownloadEndpoint.empty()) {
             if (m_debug)
                 fprintf(stderr, "[DEBUG] list_versions: empty songList — trying redownload endpoint\n");
-            std::string rdUrl = redownloadEndpoint + "?guid=" + guid;
-            PlistDict rdPayload;
-            rdPayload["creditDisplay"]           = PlistValue::makeString("");
-            rdPayload["guid"]                    = PlistValue::makeString(guid);
-            rdPayload["salableAdamId"]           = PlistValue::makeInt(app.id);
-            rdPayload["serialNumber"]            = PlistValue::makeString("0");
-            rdPayload["is-purchased-redownload"] = PlistValue::makeBool(true);
-            std::map<std::string, std::string> rdHdrs = {
-                {"Content-Type",        "application/x-apple-plist"},
-                {"iCloud-DSID",         acc.directoryServicesID},
-                {"X-Dsid",              acc.directoryServicesID},
-                {"X-Apple-Store-Front", acc.storeFront},
-                {"X-Token",             acc.passwordToken.get()},
-            };
-            HttpResponse rdRes = m_http.post(rdUrl, encode_plist_xml(rdPayload), rdHdrs);
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] list_versions redownload status: %d\n", rdRes.statusCode);
-            PlistDict rdData  = decode_plist(rdRes.body);
+            PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
+                                                  "", /*isMac=*/false,
+                                                  "list_versions redownload");
             auto rdList = dict_arr(rdData, "songList");
             if (!rdList.empty()) {
                 data     = std::move(rdData);
                 songList = std::move(rdList);
                 goto lv_process_songlist;
             }
+            throw_on_store_failure(rdData);
         }
 
         if (jingle == "purchaseSuccess")
@@ -694,74 +715,26 @@ AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account&
 // AppStore — private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+// GUID sent with every App Store request: hex of the physical adapter's MAC
+// (device_mac.cpp). Throws IpaError when no real address is available, so no
+// request ever goes out with a placeholder device ID.
 std::string AppStore::get_guid() {
-#ifdef _WIN32
-    // Windows: enumerate adapters via iphlpapi
-    ULONG bufLen = sizeof(IP_ADAPTER_INFO);
-    std::vector<BYTE> buf(bufLen);
-    if (GetAdaptersInfo(reinterpret_cast<PIP_ADAPTER_INFO>(buf.data()), &bufLen)
-            == ERROR_BUFFER_OVERFLOW) {
-        buf.resize(bufLen);
-    }
-    PIP_ADAPTER_INFO adapter =
-        reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
-    if (GetAdaptersInfo(adapter, &bufLen) == NO_ERROR) {
-        while (adapter) {
-            // Skip loopback (address = 00:00:00:00:00:00) and software adapters
-            bool allZero = true;
-            for (UINT i = 0; i < adapter->AddressLength; i++)
-                if (adapter->Address[i]) { allZero = false; break; }
-            if (!allZero && adapter->AddressLength == 6) {
-                char buf2[32];
-                snprintf(buf2, sizeof(buf2),
-                    "%02X%02X%02X%02X%02X%02X",
-                    adapter->Address[0], adapter->Address[1],
-                    adapter->Address[2], adapter->Address[3],
-                    adapter->Address[4], adapter->Address[5]);
-                return std::string(buf2);
-            }
-            adapter = adapter->Next;
-        }
-    }
-#elif defined(__APPLE__) || defined(__linux__)
-    // POSIX: walk interface addresses
-    struct ifaddrs* ifap = nullptr;
-    if (getifaddrs(&ifap) == 0) {
-        for (struct ifaddrs* ifa = ifap; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_addr) continue;
-#  ifdef __APPLE__
-            if (ifa->ifa_addr->sa_family != AF_LINK) continue;
-            auto* sdl = reinterpret_cast<struct sockaddr_dl*>(ifa->ifa_addr);
-            if (sdl->sdl_alen != 6) continue;
-            unsigned char* mac = reinterpret_cast<unsigned char*>(
-                LLADDR(sdl));
-#  else // Linux
-            if (ifa->ifa_addr->sa_family != AF_PACKET) continue;
-            auto* sll = reinterpret_cast<struct sockaddr_ll*>(ifa->ifa_addr);
-            if (sll->sll_halen != 6) continue;
-            unsigned char* mac = sll->sll_addr;
-#  endif
-            // Skip loopback
-            bool allZero = (mac[0]|mac[1]|mac[2]|mac[3]|mac[4]|mac[5]) == 0;
-            if (allZero) continue;
-            char buf2[32];
-            snprintf(buf2, sizeof(buf2),
-                "%02X%02X%02X%02X%02X%02X",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-            freeifaddrs(ifap);
-            return std::string(buf2);
-        }
-        freeifaddrs(ifap);
-    }
-#endif
-    return "AABBCCDDEEFF"; // fallback
+    return device_guid();
+}
+
+void AppStore::set_debug(bool v) {
+    m_debug = v;
+    m_http.set_debug(v);
+    SapSigner::SetDebug(v);
+    device_mac_set_debug(v);
 }
 
 // ── sendDownloadProduct — shared volumeStore->redownload helper ─────────
 PlistDict AppStore::send_download_product(const Account& acc, const App& app,
                                  const std::string& guid,
                                  const std::string& externalVersionID,
-                                 const std::string& redownloadEndpoint)
+                                 const std::string& redownloadEndpoint,
+                                 bool isMac)
 {
     std::string pod_prefix;
     if (!acc.pod.empty()) pod_prefix = "p" + acc.pod + "-";
@@ -788,27 +761,11 @@ PlistDict AppStore::send_download_product(const Account& acc, const App& app,
         return p;
     };
 
-    // redownload payload: version pin key = appExtVrsId (different key, same value)
-    auto make_rd_payload = [&]() {
-        PlistDict p;
-        p["creditDisplay"] = PlistValue::makeString("");
-        p["guid"]          = PlistValue::makeString(guid);
-        p["salableAdamId"] = PlistValue::makeInt(app.id);
-        p["serialNumber"]  = PlistValue::makeString("0");  // PR #500 fix (v2.4.0)
-        if (!externalVersionID.empty())
-            p["appExtVrsId"] = PlistValue::makeString(externalVersionID);
-        return p;
-    };
-
     // 1. Try volumeStore (primary — every app that works today keeps using this)
     HttpResponse vsRes = m_http.post(vsUrl, encode_plist_xml(make_vs_payload()), hdrs);
     if (m_debug) {
         fprintf(stderr, "[DEBUG] volumeStore status: %d\n", vsRes.statusCode);
         fprintf(stderr, "[DEBUG] volumeStore body:\n%s\n", vsRes.body.c_str());
-        // Save raw response to file for inspection
-        if (std::ofstream dbgf("volumestore_response.xml", std::ios::binary); dbgf)
-            dbgf.write(vsRes.body.data(), vsRes.body.size());
-        fprintf(stderr, "[DEBUG] raw response saved to volumestore_response.xml\n");
     }
     PlistDict data        = decode_plist(vsRes.body);
     std::string failureType    = dict_str(data, "failureType");
@@ -852,13 +809,9 @@ PlistDict AppStore::send_download_product(const Account& acc, const App& app,
 
     // 2b. On 5002 (licensed app — e.g. Teams) fall back to redownloadProduct
     if (failureType == FAILURE_ALREADY_PURCHASED && !redownloadEndpoint.empty()) {
-        std::string rdUrl = redownloadEndpoint + "?guid=" + guid;
-        HttpResponse rdRes = m_http.post(rdUrl, encode_plist_xml(make_rd_payload()), hdrs);
-        if (m_debug) {
-            fprintf(stderr, "[DEBUG] redownload fallback status: %d\n", rdRes.statusCode);
-            fprintf(stderr, "[DEBUG] redownload fallback body (first 500):\n%.500s\n", rdRes.body.c_str());
-        }
-        PlistDict rdData         = decode_plist(rdRes.body);
+        PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
+                                              externalVersionID, isMac,
+                                              "redownload fallback (5002)");
         auto      rdSongList     = dict_arr(rdData, "songList");
         std::string rdCustomerMsg = dict_str(rdData, "customerMessage");
 
@@ -902,6 +855,282 @@ PlistDict AppStore::send_download_product(const Account& acc, const App& app,
     return data;
 }
 
+// ── Redownload / updateProduct (port of upstream appstore_download_product.go)
+
+static constexpr const char* UPDATE_PRODUCT_URL =
+    "https://downloaddispatch.itunes.apple.com/up/updateProduct";
+
+static std::string trim_copy(const std::string& v) {
+    size_t b = v.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = v.find_last_not_of(" \t\r\n");
+    return v.substr(b, e - b + 1);
+}
+
+static std::string plist_scalar_str(const PlistDict& d, const std::string& key) {
+    auto it = d.find(key);
+    if (it == d.end()) return "";
+    return it->second.isInt() ? std::to_string(it->second.intVal) : it->second.str();
+}
+
+// Upstream isEmptyRedownloadError: HTTP 500 with an empty body.
+static bool is_empty_redownload_error(const HttpResponse& res) {
+    return res.statusCode == 500 && trim_copy(res.body).empty();
+}
+
+// Upstream isUnavailableDownloadProductResponse: 200, no failureType, no items,
+// customerMessage "No Longer Available" (optionally prefixed).
+static bool is_unavailable_response(const HttpResponse& res, const PlistDict& d) {
+    if (res.statusCode != 200 || !dict_str(d, "failureType").empty()
+        || !dict_arr(d, "songList").empty())
+        return false;
+    std::string m = trim_copy(dict_str(d, "customerMessage"));
+    std::transform(m.begin(), m.end(), m.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    static const std::string kSuffix = " no longer available";
+    return m == "no longer available"
+        || (m.size() > kSuffix.size()
+            && m.compare(m.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0);
+}
+
+// Decode a response body; an empty or non-plist body yields an empty dict.
+static PlistDict decode_plist_safe(const std::string& body) {
+    if (trim_copy(body).empty()) return {};
+    try { return decode_plist(body); } catch (...) { return {}; }
+}
+
+// Headers and payload exactly as upstream downloadProductRequest.
+static std::map<std::string, std::string> go_download_headers(const Account& acc) {
+    return {
+        {"Content-Type", "application/x-apple-plist"},
+        {"iCloud-DSID",  acc.directoryServicesID},
+        {"X-Dsid",       acc.directoryServicesID},
+    };
+}
+
+static std::string go_download_payload(const std::string& guid, const App& app,
+                                       const std::string& appExtVrsId) {
+    PlistDict p;
+    p["creditDisplay"] = PlistValue::makeString("");
+    p["guid"]          = PlistValue::makeString(guid);
+    p["salableAdamId"] = PlistValue::makeInt(app.id);
+    p["serialNumber"]  = PlistValue::makeString("0");
+    if (!appExtVrsId.empty())
+        p["appExtVrsId"] = PlistValue::makeString(appExtVrsId);
+    return encode_plist_xml(p);
+}
+
+PlistDict AppStore::redownload_product(const Account& acc, const App& app,
+                                       const std::string& guid,
+                                       const std::string& redownloadEndpoint,
+                                       const std::string& externalVersionID,
+                                       bool isMac, const char* label)
+{
+    // Unpinned redownloads can fail or return a tvOS package — pin iOS builds.
+    std::string pin = isMac ? externalVersionID
+                            : redownload_version_id(acc, app, externalVersionID);
+
+    auto        hdrs = go_download_headers(acc);
+    std::string body = go_download_payload(guid, app, pin);
+    std::string url  = redownloadEndpoint + "?guid=" + guid;
+
+    if (m_debug) debug_dump_request(label, "POST", url, hdrs, body);
+    HttpResponse res = m_http.post(url, body, hdrs);
+    if (m_debug) debug_dump_response(label, res);
+
+    PlistDict data = decode_plist_safe(res.body);
+
+    // The bag's updateProduct can serve pinned versions when redownload returns
+    // an empty HTTP 500 or a message-only availability error.
+    if ((is_empty_redownload_error(res) || is_unavailable_response(res, data))
+        && !pin.empty())
+    {
+        if (m_updateEndpoint.empty()) {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] redownload failed and bag has no updateProduct"
+                                " — no update fallback\n");
+            return data;
+        }
+        if (m_debug)
+            fprintf(stderr, "[DEBUG] redownload failed — trying updateProduct\n");
+        return send_update_product(acc, app, guid, pin);
+    }
+    return data;
+}
+
+PlistDict AppStore::send_update_product(const Account& acc, const App& app,
+                                        const std::string& guid,
+                                        const std::string& externalVersionID)
+{
+    // Upstream newDownloadEndpoint: only the exact downloaddispatch path is accepted.
+    if (m_updateEndpoint != UPDATE_PRODUCT_URL)
+        throw IpaError("invalid download endpoint in bag: " + m_updateEndpoint);
+
+    auto        hdrs = go_download_headers(acc);
+    std::string body = go_download_payload(guid, app, externalVersionID);
+    std::string url  = m_updateEndpoint + "?guid=" + guid;
+
+    if (m_debug) debug_dump_request("updateProduct", "POST", url, hdrs, body);
+    HttpResponse res = m_http.post(url, body, hdrs);
+    if (m_debug) debug_dump_response("updateProduct", res);
+
+    PlistDict data = decode_plist_safe(res.body);
+
+    // Structured failures keep their normal handling in the caller.
+    if (!dict_str(data, "failureType").empty())
+        return data;
+
+    std::string customerMessage = dict_str(data, "customerMessage");
+    if (!customerMessage.empty())
+        throw IpaError("received update error: " + customerMessage);
+
+    if (res.statusCode != 200)
+        throw IpaError("received unexpected update status code: "
+                       + std::to_string(res.statusCode));
+
+    auto items = dict_arr(data, "songList");
+    if (items.size() != 1 || !items[0].isDict())
+        throw IpaError("update response must contain exactly one item");
+
+    auto metaIt = items[0].dictVal.find("metadata");
+    if (metaIt == items[0].dictVal.end() || !metaIt->second.isDict())
+        throw IpaError("update response does not match the requested app or version");
+    const PlistDict& meta = metaIt->second.dictVal;
+
+    if (plist_scalar_str(meta, "itemId") != std::to_string(app.id) ||
+        plist_scalar_str(meta, "softwareVersionExternalIdentifier") != externalVersionID)
+        throw IpaError("update response does not match the requested app or version");
+
+    std::string bundleID = dict_str(meta, "softwareVersionBundleId");
+    if (bundleID.empty() || (!app.bundleID.empty() && bundleID != app.bundleID))
+        throw IpaError("update response does not match the requested bundle identifier");
+
+    return data;
+}
+
+// ── Platform version lookup ──────────────────────────────────────────────
+// Port of upstream pkg/appstore/appstore_platform_version_lookup.go,
+// including e5211d6 "fall back to consumer catalogs for ios version lookup".
+
+// externalId may arrive as a JSON string or number (upstream UnmarshalJSON).
+static std::string platform_external_id_to_string(const json& v) {
+    if (v.is_string())          return v.get<std::string>();
+    if (v.is_number_unsigned()) return std::to_string(v.get<uint64_t>());
+    if (v.is_number_integer())  return std::to_string(v.get<int64_t>());
+    if (v.is_null())            return "";
+    throw IpaError("invalid external version id " + v.dump());
+}
+
+// buyParams is a query string: "...&appExtVrsId=123456&..."
+static std::string external_version_id_from_buy_params(const std::string& buyParams) {
+    std::istringstream ss(buyParams);
+    std::string kv;
+    while (std::getline(ss, kv, '&')) {
+        auto eq = kv.find('=');
+        if (eq != std::string::npos && kv.compare(0, eq, "appExtVrsId") == 0)
+            return kv.substr(eq + 1);
+    }
+    return "";
+}
+
+std::string AppStore::lookup_latest_external_version_id(const Account& acc, const App& app) {
+    if (app.id == 0)
+        throw IpaError("app ID is required for platform version lookup");
+
+    std::string cc = country_code_from_storefront(acc.storeFront);
+    std::transform(cc.begin(), cc.end(), cc.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+
+    // Some storefronts have no enterprise listing even when the consumer
+    // catalogs contain the app. Keep the account's country for each lookup.
+    static const char* const kCatalogs[] = { "enterprisestore", "iphone", "ipad" };
+
+    const std::string appKey = std::to_string(app.id);
+    std::string lastErr;
+
+    for (const char* catalog : kCatalogs) {
+        std::map<std::string, std::string> p = {
+            {"version",  "2"},
+            {"id",       appKey},
+            {"p",        "mdm-lockup"},
+            {"caller",   "MDM"},
+            {"platform", catalog},
+            {"cc",       cc},
+            {"l",        "en"},
+        };
+        std::string url = "https://uclient-api.itunes.apple.com/WebObjects/"
+                          "MZStorePlatform.woa/wa/lookup?" + build_query(p);
+
+        HttpResponse res = m_http.get(url);
+        if (m_debug)
+            fprintf(stderr, "[DEBUG] platform version lookup (%s) status: %d\n",
+                    catalog, res.statusCode);
+        if (res.statusCode != 200)
+            throw IpaError("platform version lookup request failed: "
+                           + std::to_string(res.statusCode));
+
+        json j = json::parse(res.body, nullptr, /*allow_exceptions=*/false);
+        if (j.is_discarded())
+            throw IpaError("platform version lookup returned invalid JSON");
+
+        const json* item = nullptr;
+        auto rIt = j.find("results");
+        if (rIt != j.end() && rIt->is_object()) {
+            auto aIt = rIt->find(appKey);
+            if (aIt != rIt->end() && aIt->is_object()) item = &*aIt;
+        }
+        if (!item) {
+            lastErr = "platform version lookup returned no app";
+            continue;
+        }
+
+        auto oIt = item->find("offers");
+        if (oIt == item->end() || !oIt->is_array() || oIt->empty()
+            || !(*oIt)[0].is_object()) {
+            lastErr = "platform version lookup returned no offers";
+            continue;
+        }
+        const json& offer = (*oIt)[0];
+
+        std::string externalVersionID;
+        auto vIt = offer.find("version");
+        if (vIt != offer.end() && vIt->is_object()) {
+            auto eIt = vIt->find("externalId");
+            if (eIt != vIt->end())
+                externalVersionID = platform_external_id_to_string(*eIt);
+        }
+        if (externalVersionID.empty()) {
+            auto bIt = offer.find("buyParams");
+            if (bIt != offer.end() && bIt->is_string())
+                externalVersionID = external_version_id_from_buy_params(bIt->get<std::string>());
+        }
+        if (externalVersionID.empty())
+            throw IpaError("platform version lookup returned no external version id");
+
+        if (m_debug)
+            fprintf(stderr, "[DEBUG] platform version lookup (%s): externalVersionId=%s\n",
+                    catalog, externalVersionID.c_str());
+        return externalVersionID;
+    }
+
+    throw IpaError("app " + appKey + " in storefront " + cc
+                   + " (catalogs: enterprisestore, iphone, ipad): " + lastErr);
+}
+
+std::string AppStore::redownload_version_id(const Account& acc, const App& app,
+                                            const std::string& externalVersionID) {
+    if (!externalVersionID.empty()) return externalVersionID;
+    try {
+        return lookup_latest_external_version_id(acc, app);
+    } catch (const std::exception& e) {
+        // Upstream aborts here; we keep the previous unpinned redownload so
+        // apps that already worked are not broken by a lookup failure.
+        if (m_debug)
+            fprintf(stderr, "[DEBUG] %s — sending unpinned redownload\n", e.what());
+        return "";
+    }
+}
+
 // ── Bag (fetch auth + redownload endpoints) ──────────────────────────────
 
 AppStore::BagOutput AppStore::fetch_bag_impl(const std::string& guid) {
@@ -909,21 +1138,15 @@ AppStore::BagOutput AppStore::fetch_bag_impl(const std::string& guid) {
                     + PRIVATE_INIT_PATH + "?guid=" + guid;
     HttpResponse res = m_http.get(url, {{"Accept", "application/xml"}});
 
-    if (m_debug) {
-        fprintf(stderr, "[DEBUG] bag status: %d\n", res.statusCode);
-        fprintf(stderr, "[DEBUG] bag body:\n%s\n", res.body.c_str());
-    }
+    // Bag body is huge — log only status and size.
+    if (m_debug)
+        fprintf(stderr, "[DEBUG] bag status: %d (%zu bytes)\n",
+                res.statusCode, res.body.size());
 
     if (res.statusCode != 200)
         throw IpaError("bag request failed: " + std::to_string(res.statusCode));
 
     PlistDict d = decode_plist(res.body);
-
-    if (m_debug) {
-        fprintf(stderr, "[DEBUG] parsed plist top-level keys:");
-        for (auto& [k, v] : d) fprintf(stderr, " '%s'", k.c_str());
-        fprintf(stderr, "\n");
-    }
 
     BagOutput out;
 
@@ -931,6 +1154,8 @@ AppStore::BagOutput AppStore::fetch_bag_impl(const std::string& guid) {
     auto ubIt = d.find("urlBag");
     if (ubIt != d.end() && ubIt->second.isDict()) {
         out.redownloadEndpoint = dict_str(ubIt->second.dictVal, "redownloadProduct");
+        out.updateEndpoint     = dict_str(ubIt->second.dictVal, "updateProduct");
+        m_updateEndpoint       = out.updateEndpoint;
 
         // ── SAP config fields (v2.4.0+) — must be extracted here, before
         //    the early returns below for the auth endpoint. ──────────────────
@@ -1041,6 +1266,33 @@ std::string AppStore::fetch_bag_auth_endpoint(const std::string& guid) {
 
 // ── Login implementation ─────────────────────────────────────────────────
 
+// ── Debug helpers for the SAP-signed authenticate request ────────────────
+// The authenticate body carries the plain password (+ 2FA code); mask it so
+// --debug output can be shared without leaking credentials.
+static std::string mask_plist_password(const std::string& body) {
+    static const std::string kKey = "<key>password</key>";
+    std::string out = body;
+    size_t k = out.find(kKey);
+    if (k == std::string::npos) return out;
+    size_t open  = out.find("<string>", k + kKey.size());
+    size_t close = (open == std::string::npos) ? open : out.find("</string>", open);
+    if (open == std::string::npos || close == std::string::npos) return out;
+    open += 8; // strlen("<string>")
+    out.replace(open, close - open, "********");
+    return out;
+}
+
+static void debug_dump_auth_request(const std::string& url,
+                                    const std::map<std::string, std::string>& headers,
+                                    const std::string& body) {
+    debug_dump_request("SAP-signed authenticate (password masked)", "POST",
+                       url, headers, mask_plist_password(body));
+}
+
+static void debug_dump_auth_response(const HttpResponse& res) {
+    debug_dump_response("authenticate", res);
+}
+
 Account AppStore::do_login(const std::string& email,
                  const std::string& password,
                  const std::string& authCode,
@@ -1080,6 +1332,8 @@ Account AppStore::do_login(const std::string& email,
                 auto sigBytes = signer->Sign(std::span<const uint8_t>(
                     reinterpret_cast<const uint8_t*>(body.data()), body.size()));
                 headers[HTTP_HEADER_SAP_SIGNATURE] = SapBase64::Encode(sigBytes);
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] SAP signature: %zu bytes\n", sigBytes.size());
             } catch (const std::exception& e) {
                 if (m_debug)
                     fprintf(stderr, "[DEBUG] SAP sign failed: %s\n", e.what());
@@ -1090,7 +1344,9 @@ Account AppStore::do_login(const std::string& email,
         // 429 → hard stop. Matches Go sendAuthenticationRequest behaviour.
         lastRes = {};
         for (int tx = 1; tx <= 3; ++tx) {
+            if (m_debug) debug_dump_auth_request(currentURL, headers, body);
             lastRes = m_http.post(currentURL, body, headers);
+            if (m_debug) debug_dump_auth_response(lastRes);
             int sc  = lastRes.statusCode;
             if (sc == 429)
                 throw IpaError("rate limited by Apple (HTTP 429): " + lastRes.body);
@@ -1626,7 +1882,8 @@ AppStore::DownloadOutput AppStore::download_mac(const Account& acc, const App& a
         throw IpaError("failed to get hardware ID for macOS download");
 
     // 2. Download request (same as iOS but pkg extension)
-    PlistDict dlData = send_download_product(acc, app, guid, "", redownloadEndpoint);
+    PlistDict dlData = send_download_product(acc, app, guid, "", redownloadEndpoint,
+                                             /*isMac=*/true);
 
     auto songList = dict_arr(dlData, "songList");
     if (songList.empty()) throw IpaError("invalid response: empty songList");

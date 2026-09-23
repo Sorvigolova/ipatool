@@ -96,7 +96,16 @@ public:
     // Return first non-loopback adapter MAC on this machine
     static std::vector<uint8_t> LocalHardwareID();
 
+    // ── debug logging ─────────────────────────────────────────────────────────
+    // When enabled, the built-in SAP HTTP clients dump every handshake request
+    // (method, URL, all headers, body) and response (status, headers, body)
+    // to stderr. Enabled by AppStore::set_debug (--debug).
+    static void SetDebug(bool v) { debug_ = v; }
+    static bool Debug()          { return debug_; }
+
 private:
+    static inline bool debug_ = false;
+
     SapSigner() = default;
 
     std::unique_ptr<SapMachine> machine_;

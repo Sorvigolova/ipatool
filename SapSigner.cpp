@@ -1,4 +1,5 @@
 #include "SapSigner.h"
+#include "device_mac.h"
 
 #ifdef _WIN32
 // Windows networking headers — order matters:
@@ -27,6 +28,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
 #include <cctype>
 #include "compat_format.h"
 #include <sstream>
@@ -183,6 +185,56 @@ std::vector<uint8_t> SapPlist::MakeData(std::string_view key,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Debug dump helpers (enabled by SapSigner::SetDebug / --debug)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Print a request/response body. SAP bodies are XML plists, so they are
+// printed as text; anything with non-text bytes is hex-dumped instead.
+static void SapDebugBody(const char* label, const uint8_t* data, size_t n) {
+    if (!SapSigner::Debug()) return;
+    fprintf(stderr, "[DEBUG] SAP %s body (%zu bytes):\n", label, n);
+    if (n == 0) { fprintf(stderr, "  <empty>\n"); return; }
+
+    bool isText = true;
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t c = data[i];
+        if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') { isText = false; break; }
+    }
+    if (isText) {
+        fwrite(data, 1, n, stderr);
+        if (data[n - 1] != '\n') fputc('\n', stderr);
+        return;
+    }
+    for (size_t i = 0; i < n; i += 16) {
+        fprintf(stderr, "  %06zx ", i);
+        for (size_t j = i; j < i + 16 && j < n; ++j) fprintf(stderr, " %02x", data[j]);
+        fputc('\n', stderr);
+    }
+}
+
+static void SapDebugRequest(std::string_view method, std::string_view url,
+                            const std::string& headers,
+                            std::span<const uint8_t> body) {
+    if (!SapSigner::Debug()) return;
+    fprintf(stderr, "[DEBUG] SAP request: %.*s %.*s\n",
+            (int)method.size(), method.data(), (int)url.size(), url.data());
+    fprintf(stderr, "[DEBUG] SAP request headers:\n%s", headers.c_str());
+    if (!headers.empty() && headers.back() != '\n') fputc('\n', stderr);
+    SapDebugBody("request", body.data(), body.size());
+}
+
+static void SapDebugResponse(long status, const std::string& headers,
+                             const std::vector<uint8_t>& body) {
+    if (!SapSigner::Debug()) return;
+    fprintf(stderr, "[DEBUG] SAP response status: %ld\n", status);
+    if (!headers.empty()) {
+        fprintf(stderr, "[DEBUG] SAP response headers:\n%s", headers.c_str());
+        if (headers.back() != '\n') fputc('\n', stderr);
+    }
+    SapDebugBody("response", body.data(), body.size());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  SapWinHttpClient (Windows) / SapCurlHttpClient (Linux/macOS)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -311,16 +363,37 @@ std::vector<uint8_t> SapWinHttpClient::Send(std::string_view method,
         throw std::runtime_error(std::format("WinHttpReceiveResponse failed: {}", recvErr));
     }
 
+    // Raw header block (request or response) as UTF-8, for --debug
+    auto rawHeaders = [&](DWORD infoLevel) -> std::string {
+        DWORD size = 0;
+        WinHttpQueryHeaders(hReq, infoLevel, WINHTTP_HEADER_NAME_BY_INDEX,
+                            WINHTTP_NO_OUTPUT_BUFFER, &size, WINHTTP_NO_HEADER_INDEX);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size == 0) return {};
+        std::wstring w(size / sizeof(wchar_t), L'\0');
+        if (!WinHttpQueryHeaders(hReq, infoLevel, WINHTTP_HEADER_NAME_BY_INDEX,
+                                 w.data(), &size, WINHTTP_NO_HEADER_INDEX))
+            return {};
+        w.resize(size / sizeof(wchar_t));
+        int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                                    nullptr, 0, nullptr, nullptr);
+        std::string out(n, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                            out.data(), n, nullptr, nullptr);
+        return out;
+    };
+
+    // Request as actually sent — WinHTTP fills in Host, Content-Length, etc.
+    if (SapSigner::Debug())
+        SapDebugRequest(method, urlStr,
+            rawHeaders(WINHTTP_QUERY_RAW_HEADERS_CRLF | WINHTTP_QUERY_FLAG_REQUEST_HEADERS),
+            body);
+
     // Check status code
     DWORD statusCode = 0; DWORD statusSize = sizeof(statusCode);
     WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                          nullptr, &statusCode, &statusSize, nullptr);
-    if (statusCode != 200) {
-        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
-        throw std::runtime_error(std::format("Apple returned HTTP {}", statusCode));
-    }
 
-    // Read response body
+    // Read response body (also on error status, so --debug can show it)
     std::vector<uint8_t> result;
     DWORD avail = 0;
     while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
@@ -330,6 +403,14 @@ std::vector<uint8_t> SapWinHttpClient::Send(std::string_view method,
         if (!WinHttpReadData(hReq, result.data() + off, avail, &read))
             break;
         result.resize(off + read);
+    }
+
+    if (SapSigner::Debug())
+        SapDebugResponse((long)statusCode, rawHeaders(WINHTTP_QUERY_RAW_HEADERS_CRLF), result);
+
+    if (statusCode != 200) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
+        throw std::runtime_error(std::format("Apple returned HTTP {}", statusCode));
     }
 
     WinHttpCloseHandle(hReq);
@@ -345,6 +426,7 @@ namespace {
 
 struct CurlResponse {
     std::vector<uint8_t> body;
+    std::string          headers;   // raw response header lines (for --debug)
     long statusCode = 0;
 
     static size_t WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -352,7 +434,19 @@ struct CurlResponse {
         resp->body.insert(resp->body.end(), ptr, ptr + size * nmemb);
         return size * nmemb;
     }
+    static size_t HeaderCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+        auto* resp = static_cast<CurlResponse*>(userdata);
+        resp->headers.append(ptr, size * nmemb);
+        return size * nmemb;
+    }
 };
+
+// CURLOPT_DEBUGFUNCTION: collect the request header block exactly as sent
+static int CurlDebugCallback(CURL*, curl_infotype type, char* data, size_t size, void* userdata) {
+    if (type == CURLINFO_HEADER_OUT)
+        static_cast<std::string*>(userdata)->append(data, size);
+    return 0;
+}
 
 static std::vector<uint8_t> curl_request(
     const std::string& method,
@@ -385,10 +479,25 @@ static std::vector<uint8_t> curl_request(
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
     }
 
+    std::string sentHeaders;
+    if (SapSigner::Debug()) {
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, CurlResponse::HeaderCallback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp);
+        curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, CurlDebugCallback);
+        curl_easy_setopt(curl, CURLOPT_DEBUGDATA, &sentHeaders);
+        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);  // required for DEBUGFUNCTION
+    }
+
     CURLcode res = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.statusCode);
     if (hdrs) curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
+
+    if (SapSigner::Debug()) {
+        SapDebugRequest(method, url, sentHeaders, body);
+        if (res == CURLE_OK)
+            SapDebugResponse(resp.statusCode, resp.headers, resp.body);
+    }
 
     if (res != CURLE_OK)
         throw std::runtime_error(std::string("curl: ") + curl_easy_strerror(res));
@@ -433,6 +542,8 @@ static const char* kPlistCT   = "application/x-plist";
 // GET certURL → parse plist → return cert bytes
 static std::vector<uint8_t> FetchCertificate(ISapHttpClient& http,
                                                const std::string& certURL) {
+    if (SapSigner::Debug())
+        fprintf(stderr, "[DEBUG] ── SAP handshake step 1/2: fetch certificate ──\n");
     auto body = http.Get(certURL);
     return SapPlist::ExtractData(body, kCertKey);
 }
@@ -441,6 +552,8 @@ static std::vector<uint8_t> FetchCertificate(ISapHttpClient& http,
 static std::vector<uint8_t> ExchangeSetup(ISapHttpClient& http,
                                             const std::string& setupURL,
                                             std::span<const uint8_t> request) {
+    if (SapSigner::Debug())
+        fprintf(stderr, "[DEBUG] ── SAP handshake step 2/2: sign-sap-setup exchange ──\n");
     auto plist = SapPlist::MakeData(kBufferKey, request);
     auto body  = http.Post(setupURL, plist, kPlistCT);
     return SapPlist::ExtractData(body, kBufferKey);
@@ -585,76 +698,12 @@ std::vector<uint8_t> SapSigner::HardwareIDFromMAC(std::string_view mac) {
 }
 
 std::vector<uint8_t> SapSigner::LocalHardwareID() {
-#ifdef _WIN32
-    // Windows: GetAdaptersAddresses
-    ULONG bufLen = 15000;
-    std::vector<uint8_t> buf(bufLen);
-
-    DWORD ret = GetAdaptersAddresses(AF_UNSPEC,
-        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
-        nullptr,
-        reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data()),
-        &bufLen);
-
-    if (ret == ERROR_BUFFER_OVERFLOW) {
-        buf.resize(bufLen);
-        ret = GetAdaptersAddresses(AF_UNSPEC,
-            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
-            nullptr,
-            reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data()),
-            &bufLen);
+    // Same source as the request GUID (device_mac.cpp), so the StoreAgent /
+    // SAP hardware ID always matches the GUID Apple sees. Empty on failure;
+    // callers treat that as an error.
+    try {
+        return device_mac_address();
+    } catch (...) {
+        return {};
     }
-
-    if (ret != NO_ERROR) return {};
-
-    auto* adapter = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
-    while (adapter) {
-        if (adapter->IfType != IF_TYPE_SOFTWARE_LOOPBACK &&
-            adapter->IfType != IF_TYPE_TUNNEL &&
-            adapter->PhysicalAddressLength == 6 &&
-            adapter->OperStatus == IfOperStatusUp)
-        {
-            return std::vector<uint8_t>(
-                adapter->PhysicalAddress,
-                adapter->PhysicalAddress + adapter->PhysicalAddressLength);
-        }
-        adapter = adapter->Next;
-    }
-    return {};
-
-#else
-    // POSIX (Linux / macOS): getifaddrs
-    struct ifaddrs* ifap = nullptr;
-    if (getifaddrs(&ifap) != 0) return {};
-
-    std::vector<uint8_t> result;
-    for (struct ifaddrs* ifa = ifap; ifa && result.empty(); ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr) continue;
-        // Skip loopback
-        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
-        // Skip interfaces that are down
-        if (!(ifa->ifa_flags & IFF_UP)) continue;
-
-#  ifdef __linux__
-        if (ifa->ifa_addr->sa_family != AF_PACKET) continue;
-        auto* sll = reinterpret_cast<struct sockaddr_ll*>(ifa->ifa_addr);
-        if (sll->sll_halen != 6) continue;
-        bool allZero = true;
-        for (int i = 0; i < 6; ++i) if (sll->sll_addr[i]) { allZero = false; break; }
-        if (allZero) continue;
-        result.assign(sll->sll_addr, sll->sll_addr + 6);
-#  else // macOS
-        if (ifa->ifa_addr->sa_family != AF_LINK) continue;
-        auto* sdl = reinterpret_cast<struct sockaddr_dl*>(ifa->ifa_addr);
-        if (sdl->sdl_alen != 6) continue;
-        auto* mac = reinterpret_cast<unsigned char*>(LLADDR(sdl));
-        bool allZero = true;
-        for (int i = 0; i < 6; ++i) if (mac[i]) { allZero = false; break; }
-        if (allZero) continue;
-        result.assign(mac, mac + 6);
-#  endif
-    }
-    freeifaddrs(ifap);
-    return result;
-#endif
 }

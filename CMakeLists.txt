@@ -407,6 +407,7 @@ add_executable(ipatool
     main.cpp
     protect.cpp
     hwid.cpp
+    device_mac.cpp
     appstore.cpp
     http_client.cpp
     plist.cpp
@@ -421,6 +422,7 @@ add_executable(ipatool
     $<$<PLATFORM_ID:Windows>:sap_resources.rc>
     # Headers
     appstore.h
+    device_mac.h
     ipatool.h
     protect.h
     http_client.h
