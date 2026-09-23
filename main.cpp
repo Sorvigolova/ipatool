@@ -127,10 +127,13 @@ using json = nlohmann::json;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 static std::string home_dir() {
-    const char* home = getenv("HOME");
 #ifdef _WIN32
-    if (!home) home = getenv("USERPROFILE");
-    // On Windows, the path may contain non-ASCII characters (e.g. Cyrillic).
+    // USERPROFILE first: Windows sets it for every process, while HOME is set
+    // inconsistently (Git Bash, MSYS2, corporate policies), which used to put
+    // ~/.ipatool in different places depending on the launching shell.
+    const char* home = getenv("USERPROFILE");
+    if (!home) home = getenv("HOME");
+    // The path may contain non-ASCII characters (e.g. Cyrillic).
     // libcurl cannot handle such paths via char*.
     // Convert to short 8.3 path format (ASCII only) using GetShortPathNameW.
     if (home) {
@@ -143,6 +146,8 @@ static std::string home_dir() {
             return std::string(buf);
         }
     }
+#else
+    const char* home = getenv("HOME");
 #endif
     return home ? home : ".";
 }
@@ -763,7 +768,8 @@ static void cmd_list_versions(const Args& args) {
 
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
-    try {
+
+    auto run = [&]() {
         // Fetch bag to get redownloadProduct endpoint for 5002 fallback
         std::string redownloadEndpoint;
         try {
@@ -785,6 +791,19 @@ static void cmd_list_versions(const Args& args) {
         j["bundleID"]                   = app.bundleID;
         j["success"]                    = true;
         log_output(j);
+    };
+
+    try {
+        try {
+            run();
+        } catch (const PasswordTokenExpired&) {
+            // Same recovery as download/purchase: one silent re-login, one retry.
+            if (!silent_relogin(acc, passphrase)) {
+                print_red_err("Error: session expired. Please log in again.\n");
+                exit(1);
+            }
+            run();
+        }
     } catch (const std::exception& e) {
         print_red_err(std::string("Error: ") + e.what() + "\n");
         exit(1);
@@ -811,7 +830,8 @@ static void cmd_get_version_metadata(const Args& args) {
 
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
-    try {
+
+    auto run = [&]() {
         // Fetch bag to get redownloadProduct endpoint for 5002 fallback
         std::string redownloadEndpoint;
         try {
@@ -834,6 +854,19 @@ static void cmd_get_version_metadata(const Args& args) {
         j["releaseDate"]       = out.releaseDate;
         j["success"]           = true;
         log_output(j);
+    };
+
+    try {
+        try {
+            run();
+        } catch (const PasswordTokenExpired&) {
+            // Same recovery as download/purchase: one silent re-login, one retry.
+            if (!silent_relogin(acc, passphrase)) {
+                std::cerr << "get-version-metadata error: session expired. Please log in again.\n";
+                exit(1);
+            }
+            run();
+        }
     } catch (const std::exception& e) {
         std::cerr << "get-version-metadata error: " << e.what() << "\n";
         exit(1);
@@ -1220,6 +1253,11 @@ int main(int argc, char** argv) {
         std::cerr << "Error: invalid format \''" << g_format << "\'' — use \'text\' or \'json\'\n";
         return 1;
     }
+
+    // ~/.ipatool must exist before the first request: libcurl writes the cookie
+    // jar but does not create its directory, so on a first login the session
+    // cookies were silently dropped.
+    ensure_config_dir();
 
     // Wire up machine ID function pointer for in-memory encryption (protect.h).
     // Must happen before any SecureString::set()/get() call, anywhere.

@@ -685,13 +685,33 @@ AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account&
     auto songList = dict_arr(data, "songList");
     if (songList.empty()) {
         if (!customerMessage.empty()) throw IpaError(customerMessage);
-        // purchaseSuccess + empty songList = app not available in this storefront/region
-        // (e.g. VPN apps removed from Russian App Store by government order)
+
+        // Empty songList after purchaseSuccess — retry via redownload (pinned to
+        // the requested version), like download() and list_versions().
         std::string jingle = dict_str(data, "jingleDocType");
-        if (jingle == "purchaseSuccess")
-            throw IpaError("app is not available for download in your region/storefront"
-                           " (license was granted but download was blocked)");
-        throw IpaError("invalid response: empty songList");
+        if ((jingle == "purchaseSuccess" || jingle.empty()) && !redownloadEndpoint.empty()) {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] get_version_metadata: empty songList — trying redownload endpoint\n");
+            PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
+                                                  versionID, /*isMac=*/false,
+                                                  "get_version_metadata redownload");
+            auto rdList = dict_arr(rdData, "songList");
+            if (!rdList.empty()) {
+                data     = std::move(rdData);
+                songList = std::move(rdList);
+            } else {
+                throw_on_store_failure(rdData);
+            }
+        }
+
+        // Still empty = app not available in this storefront/region
+        // (e.g. VPN apps removed from Russian App Store by government order)
+        if (songList.empty()) {
+            if (jingle == "purchaseSuccess")
+                throw IpaError("app is not available for download in your region/storefront"
+                               " (license was granted but download was blocked)");
+            throw IpaError("invalid response: empty songList");
+        }
     }
     auto& itemVal = songList[0];
     if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
