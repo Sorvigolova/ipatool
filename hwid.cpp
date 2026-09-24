@@ -56,17 +56,13 @@ std::string get_machine_id() {
 #elif defined(__APPLE__)
 
 static std::string iokit_string(const char* key) {
-    // kIOMasterPortDefault was renamed to kIOMainPortDefault in the macOS 12 SDK;
-    // the old name still works but is deprecated and warns on every build.
-    // __MAC_12_0 is only defined once AvailabilityMacros.h has been pulled in
-    // (which IOKitLib.h above already does), so this check is safe here.
-#if defined(__MAC_12_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_12_0
-    const mach_port_t main_port = kIOMainPortDefault;
-#else
-    const mach_port_t main_port = kIOMasterPortDefault;
-#endif
+    // MACH_PORT_NULL selects the default main port on every macOS version.
+    // Do not use kIOMainPortDefault: it only exists on macOS 12+, and with an
+    // older deployment target (e.g. 10.15) it is weak-linked, so reading it on
+    // macOS 10.15 / 11 dereferences NULL and crashes (SIGSEGV after login).
+    // kIOMasterPortDefault works everywhere but is deprecated in newer SDKs.
     io_service_t service = IOServiceGetMatchingService(
-        main_port,
+        MACH_PORT_NULL,
         IOServiceMatching("IOPlatformExpertDevice"));
     if (!service) return "";
 
@@ -79,8 +75,9 @@ static std::string iokit_string(const char* key) {
 
     if (!cf_val) return "";
     char buf[128] = {};
-    CFStringGetCString((CFStringRef)cf_val, buf, sizeof(buf),
-                       kCFStringEncodingUTF8);
+    if (CFGetTypeID(cf_val) == CFStringGetTypeID())
+        CFStringGetCString((CFStringRef)cf_val, buf, sizeof(buf),
+                           kCFStringEncodingUTF8);
     CFRelease(cf_val);
     return std::string(buf);
 }
