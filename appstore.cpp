@@ -238,6 +238,66 @@ static void debug_dump_response(const char* label, const HttpResponse& res) {
             res.body.size(), res.body.empty() ? "<empty>" : res.body.c_str());
 }
 
+// A songList item is usable as a download source only if it carries sinf data
+// ("sinf" for iOS, "dpInfo" for macOS). Apple sometimes returns the item
+// without it — such a response is treated like an empty songList.
+static bool has_sinfs(const PlistArray& songList) {
+    if (songList.empty() || !songList[0].isDict()) return false;
+    auto it = songList[0].dictVal.find("sinfs");
+    if (it == songList[0].dictVal.end() || !it->second.isArray()) return false;
+    for (const auto& s : it->second.arrayVal) {
+        if (!s.isDict()) continue;
+        for (const char* key : {"sinf", "dpInfo"}) {
+            auto f = s.dictVal.find(key);
+            if (f != s.dictVal.end() && f->second.isData() && !f->second.dataVal.empty())
+                return true;
+        }
+    }
+    return false;
+}
+
+// Redownload refusal meaning this account holds no license for the item.
+// Compared in full (Apple always sends these in English): other refusals with
+// different wording have other causes and must not trigger a purchase.
+static constexpr const char* REDOWNLOAD_UNAVAILABLE_MESSAGE =
+    "Redownload Unavailable with This Apple Account";
+static constexpr const char* REDOWNLOAD_UNAVAILABLE_EXPLANATION =
+    "This redownload is not available for this Apple Account either because it "
+    "was bought by a different user or the item was refunded or cancelled.";
+
+// Apple writes "Apple Account" with a no-break space (U+00A0), which looks like
+// a normal space in logs. Map Unicode spaces / tabs / newlines to ' ', collapse
+// runs and trim, so the full phrases still compare exactly.
+static std::string normalize_spaces(const std::string& in) {
+    std::string out;
+    bool pendingSpace = false;
+    for (size_t i = 0; i < in.size(); ) {
+        unsigned char c = (unsigned char)in[i];
+        size_t len = 0;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')                 len = 1;
+        else if (c == 0xC2 && i + 1 < in.size() && (unsigned char)in[i+1] == 0xA0) len = 2;  // U+00A0
+        else if (c == 0xE2 && i + 2 < in.size() && (unsigned char)in[i+1] == 0x80) {
+            unsigned char c2 = (unsigned char)in[i+2];
+            if ((c2 >= 0x80 && c2 <= 0x8A) || c2 == 0xAF) len = 3;       // U+2000..200A, U+202F
+        }
+        if (len) { pendingSpace = true; i += len; continue; }
+        if (pendingSpace && !out.empty()) out += ' ';
+        pendingSpace = false;
+        out += in[i++];
+    }
+    return out;
+}
+
+static bool is_redownload_unavailable(const PlistDict& d) {
+    auto match = [](const PlistDict& m) {
+        return normalize_spaces(dict_str(m, "message"))     == REDOWNLOAD_UNAVAILABLE_MESSAGE &&
+               normalize_spaces(dict_str(m, "explanation")) == REDOWNLOAD_UNAVAILABLE_EXPLANATION;
+    };
+    if (match(d)) return true;
+    auto it = d.find("dialog");   // Apple may nest them in a dialog dict
+    return it != d.end() && it->second.isDict() && match(it->second.dictVal);
+}
+
 // Same failure mapping as the top of download()/list_versions().
 static void throw_on_store_failure(const PlistDict& data) {
     std::string failureType     = dict_str(data, "failureType");
@@ -418,7 +478,7 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
         throw IpaError("received error: " + failureType);
 
     auto songList = dict_arr(data, "songList");
-    if (songList.empty()) {
+    if (!has_sinfs(songList)) {   // empty songList, or an item without sinf data
         if (!customerMessage.empty()) throw IpaError(customerMessage);
 
         // purchaseSuccess + empty songList — try redownload endpoint before giving up.
@@ -427,12 +487,14 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
         std::string jingle = dict_str(data, "jingleDocType");
         if ((jingle == "purchaseSuccess" || jingle.empty()) && !redownloadEndpoint.empty()) {
             if (m_debug)
-                fprintf(stderr, "[DEBUG] empty songList after purchase — trying redownload endpoint\n");
+                fprintf(stderr, songList.empty()
+                    ? "[DEBUG] empty songList after purchase — trying redownload endpoint\n"
+                    : "[DEBUG] no sinf data in response — trying redownload endpoint\n");
             PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
                                                   externalVersionID, /*isMac=*/false,
-                                                  "redownload");
+                                                  "redownload", /*needSinfs=*/true);
             auto rdList = dict_arr(rdData, "songList");
-            if (!rdList.empty()) {
+            if (has_sinfs(rdList)) {
                 data     = std::move(rdData);
                 songList = std::move(rdList);
                 goto process_songlist;
@@ -440,6 +502,8 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
             throw_on_store_failure(rdData);
         }
 
+        if (!songList.empty())
+            throw IpaError("download response does not contain sinf data");
         if (jingle == "purchaseSuccess")
             throw IpaError("app is not available for download in your region/storefront"
                            " (license was granted but download was blocked)");
@@ -837,7 +901,6 @@ PlistDict AppStore::send_download_product(const Account& acc, const App& app,
 
         // If redownload can't serve the app (empty songList — for any reason:
         //   "No Longer Available"               → transient 5002, app not in library
-        //   "Redownload Unavailable with This Apple Account" → no license yet
         //   any other refusal
         // ) → retry volumeStore.
         // The retry surfaces the real Apple error (e.g. 9610 → LicenseRequired
@@ -944,7 +1007,8 @@ PlistDict AppStore::redownload_product(const Account& acc, const App& app,
                                        const std::string& guid,
                                        const std::string& redownloadEndpoint,
                                        const std::string& externalVersionID,
-                                       bool isMac, const char* label)
+                                       bool isMac, const char* label,
+                                       bool needSinfs)
 {
     // Unpinned redownloads can fail or return a tvOS package — pin iOS builds.
     std::string pin = isMac ? externalVersionID
@@ -960,9 +1024,22 @@ PlistDict AppStore::redownload_product(const Account& acc, const App& app,
 
     PlistDict data = decode_plist_safe(res.body);
 
+    // No license for this account (not bought, bought by another user, refunded):
+    // same as volumeStore 9610 — main.cpp purchases with --purchase or tells the
+    // user to buy the app.
+    if (res.statusCode != 500 && is_redownload_unavailable(data)) {
+        if (m_debug)
+            fprintf(stderr, "[DEBUG] redownload unavailable for this Apple Account — license required\n");
+        throw LicenseRequired();
+    }
+
     // The bag's updateProduct can serve pinned versions when redownload returns
-    // an empty HTTP 500 or a message-only availability error.
-    if ((is_empty_redownload_error(res) || is_unavailable_response(res, data))
+    // an empty HTTP 500 or a message-only availability error. For downloads a
+    // successful answer without sinf data is no better, so it goes there too.
+    bool noSinfs = needSinfs && res.statusCode == 200
+                && dict_str(data, "failureType").empty()
+                && !has_sinfs(dict_arr(data, "songList"));
+    if ((is_empty_redownload_error(res) || is_unavailable_response(res, data) || noSinfs)
         && !pin.empty())
     {
         if (m_updateEndpoint.empty()) {

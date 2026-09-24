@@ -185,13 +185,15 @@ private:
     // for iOS, the latest from the platform catalogs.
     // If redownload answers HTTP 500 with an empty body, or 200 with a
     // "No Longer Available" message, and the version is pinned, the same request
-    // goes to the bag's updateProduct endpoint.
+    // goes to the bag's updateProduct endpoint. With needSinfs (download only),
+    // a 200 answer whose item carries no sinf data also goes to updateProduct.
     // Returns the decoded response of the last request sent.
     PlistDict redownload_product(const Account& acc, const App& app,
                                  const std::string& guid,
                                  const std::string& redownloadEndpoint,
                                  const std::string& externalVersionID,
-                                 bool isMac, const char* label);
+                                 bool isMac, const char* label,
+                                 bool needSinfs = false);
 
     // updateProduct request (upstream sendUpdateProduct). Returns the response
     // as-is when it carries a failureType; throws IpaError on a customer
