@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <thread>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 
 // ── Write callbacks ───────────────────────────────────────────────────────────
 
@@ -54,6 +56,46 @@ static size_t header_cb(char* buffer, size_t size, size_t nitems, void* userdata
         (*hdrs)[key] = value;
     }
     return size * nitems;
+}
+
+// ── Cookie persistence ────────────────────────────────────────────────────────
+// Cookies are read from / written to the file here instead of via
+// CURLOPT_COOKIEFILE / CURLOPT_COOKIEJAR. Those take a char* path whose
+// encoding depends on how libcurl was built, so on Windows profiles with
+// non-ASCII names (C:\Users\Анар) and no 8.3 short names the jar silently
+// failed to open. The file keeps the Netscape format libcurl used.
+
+// Enable the cookie engine and feed it the lines stored in `file`.
+static void load_cookies(CURL* curl, const std::string& file) {
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");   // engine on, no file
+    if (file.empty()) return;
+
+    std::ifstream in(std::filesystem::path(file), std::ios::binary);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        // "#HttpOnly_" lines are cookies; other '#' lines are comments.
+        if (line[0] == '#' && line.rfind("#HttpOnly_", 0) != 0) continue;
+        curl_easy_setopt(curl, CURLOPT_COOKIELIST, line.c_str());
+    }
+}
+
+// Write every cookie the engine holds back to `file` (call before cleanup).
+static void save_cookies(CURL* curl, const std::string& file) {
+    if (file.empty()) return;
+
+    curl_slist* list = nullptr;
+    if (curl_easy_getinfo(curl, CURLINFO_COOKIELIST, &list) != CURLE_OK || !list)
+        return;
+
+    std::ofstream out(std::filesystem::path(file), std::ios::binary | std::ios::trunc);
+    if (out) {
+        out << "# Netscape HTTP Cookie File\n";
+        for (curl_slist* p = list; p; p = p->next)
+            out << p->data << '\n';
+    }
+    curl_slist_free_all(list);
 }
 
 // ── Retry helpers ─────────────────────────────────────────────────────────────
@@ -156,12 +198,7 @@ void HttpClient::download(const std::string& url,
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS,      0L);
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION,  header_cb);
         curl_easy_setopt(curl, CURLOPT_HEADERDATA,      &respHeaders);
-        if (!m_cookieFile.empty()) {
-            curl_easy_setopt(curl, CURLOPT_COOKIEFILE, m_cookieFile.c_str());
-            curl_easy_setopt(curl, CURLOPT_COOKIEJAR,  m_cookieFile.c_str());
-        } else {
-            curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
-        }
+        load_cookies(curl, m_cookieFile);
 
         if (currentStart > 0) {
             std::string range = std::to_string(currentStart) + "-";
@@ -175,6 +212,7 @@ void HttpClient::download(const std::string& url,
         currentStart  += ds.received;    // advance offset by bytes actually written
 
         fclose(fp);
+        save_cookies(curl, m_cookieFile);
         curl_easy_cleanup(curl);
 
         if (rc == CURLE_OK) return;      // success — done
@@ -221,12 +259,7 @@ HttpResponse HttpClient::perform(const std::string& method,
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
         curl_easy_setopt(curl, CURLOPT_HEADERDATA,     &resp.headers);
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
-        if (!m_cookieFile.empty()) {
-            curl_easy_setopt(curl, CURLOPT_COOKIEFILE, m_cookieFile.c_str());
-            curl_easy_setopt(curl, CURLOPT_COOKIEJAR,  m_cookieFile.c_str());
-        } else {
-            curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
-        }
+        load_cookies(curl, m_cookieFile);
 
         struct curl_slist* hdrs = nullptr;
         for (auto& [k, v] : reqHeaders) {
@@ -251,12 +284,14 @@ HttpResponse HttpClient::perform(const std::string& method,
         if (rc == CURLE_OK) {
             long code = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+            save_cookies(curl, m_cookieFile);
             curl_easy_cleanup(curl);
             resp.statusCode = static_cast<int>(code);
             resp.body       = std::move(respBody);
             return resp;
         }
 
+        save_cookies(curl, m_cookieFile);
         curl_easy_cleanup(curl);
         ++attempt;
 
