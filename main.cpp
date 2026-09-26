@@ -749,6 +749,13 @@ static void cmd_show_account(const Args& args) {
     json out;
     out["name"]    = acc.name;
     out["email"]   = acc.email;
+    // Country code of the account's storefront ("143469-16,29" -> "RU").
+    // Unknown IDs throw — fall back to the raw storefront instead of crashing.
+    try {
+        out["storefront"] = country_code_from_storefront(acc.storeFront);
+    } catch (const std::exception&) {
+        out["storefront"] = acc.storeFront;
+    }
     out["success"] = true;
     log_output(out);
 }
