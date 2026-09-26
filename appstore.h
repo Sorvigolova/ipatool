@@ -230,7 +230,7 @@ private:
                      const std::string& authCode,
                      const std::string& guid,
                      const std::string& baseEndpoint,
-                     SapSigner* signer = nullptr); // nullptr = unsigned (pre-v2.4.0)
+                     SapSigner& signer);   // every authenticate POST is SAP-signed
 
     // ── Purchase implementation ───────────────────────────────────────────────
     PlistDict do_purchase(const Account& acc, const App& app,

@@ -333,38 +333,38 @@ Account AppStore::login(const std::string& email,
     BagOutput bag = fetch_bag_impl(guid);
     std::string loginEndpoint = endpoint.empty() ? bag.authEndpoint : endpoint;
 
-    // Create SAP signer — performs handshake with Apple servers (v2.4.0+)
+    // Create SAP signer — performs handshake with Apple servers (v2.4.0+).
+    // Apple rejects unsigned authenticate requests and still counts them as
+    // failed sign-ins (repeated failures lock the Apple ID), so any SAP problem
+    // stops the login before a single request is sent — same as the Go version.
+    if (bag.signSapSetup.empty() || bag.signSapSetupCert.empty()
+        || bag.sapVersion != 200 || bag.hardwareID.empty())
+        throw IpaError("bag has no usable SAP signing configuration; "
+                       "refusing to send an unsigned login request");
+
     std::unique_ptr<SapSigner> signer;
-    if (!bag.signSapSetup.empty() && !bag.signSapSetupCert.empty()
-        && bag.sapVersion == 200 && !bag.hardwareID.empty())
-    {
-        try {
-            SapSigner::Config sapCfg;
-            sapCfg.setupURL       = bag.signSapSetup;
-            sapCfg.certificateURL = bag.signSapSetupCert;
-            sapCfg.version        = bag.sapVersion;
-            sapCfg.hardwareID     = bag.hardwareID;
+    try {
+        SapSigner::Config sapCfg;
+        sapCfg.setupURL       = bag.signSapSetup;
+        sapCfg.certificateURL = bag.signSapSetupCert;
+        sapCfg.version        = bag.sapVersion;
+        sapCfg.hardwareID     = bag.hardwareID;
 
-            signer = SapSigner::Create(
-                sapCfg,
-                load_sap_asset("CoreFP"),
-                load_sap_asset("CommerceCore"),
-                load_sap_asset("CommerceKit"),
-                load_sap_asset("CoreFP.icxs")
-            );
-            if (m_debug) fprintf(stderr, "[DEBUG] SAP signer initialized OK\n");
-        } catch (const std::exception& e) {
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] SAP signer init failed: %s\n", e.what());
-            // Non-fatal: try unsigned (Apple may reject, but let it fail at the server)
-            signer.reset();
-        }
-    } else if (m_debug) {
-        fprintf(stderr, "[DEBUG] SAP config missing from bag — login will be unsigned\n");
+        signer = SapSigner::Create(
+            sapCfg,
+            load_sap_asset("CoreFP"),
+            load_sap_asset("CommerceCore"),
+            load_sap_asset("CommerceKit"),
+            load_sap_asset("CoreFP.icxs")
+        );
+    } catch (const std::exception& e) {
+        throw IpaError(std::string("failed to initialize SAP signer: ") + e.what());
     }
+    if (!signer)
+        throw IpaError("failed to initialize SAP signer");
+    if (m_debug) fprintf(stderr, "[DEBUG] SAP signer initialized OK\n");
 
-    Account acc = do_login(email, password, authCode, guid, loginEndpoint, signer.get());
-    return acc;
+    return do_login(email, password, authCode, guid, loginEndpoint, *signer);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1387,7 +1387,11 @@ static void debug_dump_auth_request(const std::string& url,
 }
 
 static void debug_dump_auth_response(const HttpResponse& res) {
-    debug_dump_response("authenticate", res);
+    // A 302 pod redirect echoes our request plist back in its body,
+    // password included — mask the response the same way as the request.
+    HttpResponse masked = res;
+    masked.body = mask_plist_password(res.body);
+    debug_dump_response("authenticate", masked);
 }
 
 Account AppStore::do_login(const std::string& email,
@@ -1395,7 +1399,7 @@ Account AppStore::do_login(const std::string& email,
                  const std::string& authCode,
                  const std::string& guid,
                  const std::string& baseEndpoint,
-                 SapSigner* signer)
+                 SapSigner& signer)
 {
     std::string  currentURL   = baseEndpoint;
     bool         retry        = true;
@@ -1424,17 +1428,15 @@ Account AppStore::do_login(const std::string& email,
         };
 
         // SAP-sign the request body (v2.4.0+)
-        if (signer) {
-            try {
-                auto sigBytes = signer->Sign(std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(body.data()), body.size()));
-                headers[HTTP_HEADER_SAP_SIGNATURE] = SapBase64::Encode(sigBytes);
-                if (m_debug)
-                    fprintf(stderr, "[DEBUG] SAP signature: %zu bytes\n", sigBytes.size());
-            } catch (const std::exception& e) {
-                if (m_debug)
-                    fprintf(stderr, "[DEBUG] SAP sign failed: %s\n", e.what());
-            }
+        // Never send an unsigned attempt — it would only burn a sign-in try.
+        try {
+            auto sigBytes = signer.Sign(std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+            headers[HTTP_HEADER_SAP_SIGNATURE] = SapBase64::Encode(sigBytes);
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] SAP signature: %zu bytes\n", sigBytes.size());
+        } catch (const std::exception& e) {
+            throw IpaError(std::string("failed to sign login request: ") + e.what());
         }
 
         // Transport retry: up to 3 attempts on 204/404/5xx (250ms×attempt)
