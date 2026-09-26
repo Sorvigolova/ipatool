@@ -615,6 +615,12 @@ static void cmd_login(const Args& args) {
             json loginOut;
             loginOut["name"]    = acc.name;
             loginOut["email"]   = acc.email;
+            try {
+                loginOut["storefront"] = country_code_from_storefront(acc.storeFront);
+            }
+            catch (const std::exception&) {
+                loginOut["storefront"] = acc.storeFront;
+            }
             loginOut["success"] = true;
             log_output(loginOut);
             return;
