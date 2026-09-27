@@ -129,10 +129,6 @@ private:
     std::unordered_map<uint64_t, GuestAlloc>         allocations_; // guestPtr→{size,reserved}
     void CoalesceFreeBlocks();
 
-    // Fake file descriptor for CoreFP.icxs
-    static constexpr int kIcxsFd = 100;
-    [[maybe_unused]] bool icxsFdOpen_ = false;
-
     // pthread_once / dispatch_once simulation
     std::unordered_map<uint64_t, bool> onceTokens_;
 
