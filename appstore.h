@@ -63,6 +63,7 @@ public:
         std::string authEndpoint;
         std::string redownloadEndpoint;  // https://downloaddispatch.itunes.apple.com/r/redownload
         std::string updateEndpoint;      // https://downloaddispatch.itunes.apple.com/up/updateProduct
+        std::string entDownloadEndpoint; // bag key volumeStoreDownloadProduct → .../wa/ent/download
         // SAP config fields (v2.4.0+ — from bag.xml sign-sap-* keys)
         std::string          signSapSetup;        // sign-sap-setup URL
         std::string          signSapSetupCert;    // sign-sap-setup-cert URL
@@ -115,10 +116,23 @@ public:
                             const std::string& outputPath = "",
                             const std::string& externalVersionID = "",
                             ProgressCb progress = nullptr,
-                            const std::string& redownloadEndpoint = "");
+                            const std::string& redownloadEndpoint = "",
+                            const std::string& entDownloadEndpoint = "",
+                            const std::string& kbsyncB64 = "");
+
+    // True when the last download()'s ent/download stage was rejected in a way
+    // that suggests the cached kbsync is stale (HTTP >= 500). The caller uses
+    // this to drop the cached blob so the next run regenerates it.
+    bool kbsync_rejected() const { return m_kbsyncRejected; }
 
 public:
     void set_debug(bool v); // also enables SapSigner HTTP dumps
+
+    // ── kbsync ────────────────────────────────────────────────────────────────
+    // Generates the kbsync blob for an account DSID by running storeagent's
+    // FairPlayGlobalContextInit + FairPlayKBSyncDataWithDSID under the
+    // emulator. Local only — no request is sent to Apple. Throws on failure.
+    std::vector<uint8_t> generate_kbsync(uint64_t dsid);
 
     // ── List Versions ────────────────────────────────────────────────────────
     struct ListVersionsOutput {
@@ -143,6 +157,20 @@ public:
 private:
     HttpClient m_http;
     bool       m_debug = false;
+    bool       m_kbsyncRejected = false; // set by the ent/download stage, read by caller
+
+    // ── ent/download first stage (uses kbsync) ───────────────────────────────
+    // POSTs the ent/download request with the given base64 kbsync and returns
+    // the decoded response. httpStatus receives the HTTP status code so the
+    // caller can tell a stale-kbsync rejection (>= 500) from a normal refusal.
+    // Body (all strings): creditDisplay="", guid, kbsync, salableAdamId,
+    // externalVersionId (when set). Matches the reference tool's request shape.
+    PlistDict send_ent_download(const Account& acc, const App& app,
+                                const std::string& guid,
+                                const std::string& entDownloadEndpoint,
+                                const std::string& kbsyncB64,
+                                const std::string& externalVersionID,
+                                int& httpStatus);
     // Bag "updateProduct" endpoint, remembered by fetch_bag_impl() so the
     // redownload fallback can use it without changing public signatures.
     std::string m_updateEndpoint;

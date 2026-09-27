@@ -76,6 +76,10 @@ struct Account {
     std::string   storeFront;
     SecureString  password;       // encrypted in memory
     std::string   pod;
+    // Cached kbsync blob (base64). Bound to directoryServicesID + hardwareID,
+    // NOT to the session token, so it survives password/xToken refreshes and is
+    // only regenerated when the download endpoint rejects it. Empty = none yet.
+    std::string   kbsync;
 };
 
 struct App {

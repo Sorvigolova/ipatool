@@ -24,6 +24,7 @@
 #include "hwid.h"
 #include "protect.h"   // secure_zero() — used directly for account file encryption
 #include "aes.h"        // aes::gcm_encrypt/decrypt — used directly for account file encryption
+#include "SapSigner.h"  // SapBase64 — kbsync output
 
 #include <iostream>
 #include <fstream>
@@ -285,6 +286,7 @@ static bool save_account(const Account& acc, const std::string& passphrase = "")
     j["storeFront"]          = std::string(acc.storeFront);
     j["password"]            = acc.password.get();
     j["pod"]                 = std::string(acc.pod);
+    j["kbsync"]              = std::string(acc.kbsync);
     std::string data = j.dump(2);
 
     try {
@@ -342,6 +344,7 @@ static bool load_account(Account& acc, const std::string& passphrase = "") {
         acc.lastName            = j.value("lastName", "");
         acc.storeFront          = j.value("storeFront", "");
         acc.pod                 = j.value("pod", "");
+        acc.kbsync              = j.value("kbsync", "");  // absent in older files → empty
 
         // Encrypt sensitive fields with mem key derived from machine_id
         acc.passwordToken.set(j.value("passwordToken", ""));
@@ -516,6 +519,11 @@ static bool silent_relogin(Account& acc, const std::string& passphrase) {
             AppStore store(COOKIE_FILE);
             auto pwd = acc.password.decrypt();
             Account fresh = store.login(acc.email, pwd.str(), authCode);
+            // kbsync is bound to DSID + hardwareID, not the session token, so a
+            // token refresh must not throw it away. Same account (same DSID) →
+            // carry the cached blob over instead of forcing a ~20 s+ regen.
+            if (fresh.directoryServicesID == acc.directoryServicesID)
+                fresh.kbsync = acc.kbsync;
             if (!save_account(fresh, passphrase)) return false;
             acc = fresh;
             return true;
@@ -609,6 +617,16 @@ static void cmd_login(const Args& args) {
     for (int attempt = 0; attempt < 2; ++attempt) {
         try {
             Account acc = store.login(email, password, authCode);
+            // Preserve a cached kbsync when logging back into the same account
+            // (same DSID): it is bound to DSID + hardwareID, not the session
+            // token, so there is no need to regenerate it after a fresh login.
+            {
+                Account prev;
+                if (load_account(prev, passphrase)
+                    && prev.directoryServicesID == acc.directoryServicesID
+                    && !prev.kbsync.empty())
+                    acc.kbsync = prev.kbsync;
+            }
             if (!save_account(acc, passphrase)) {
                 std::cerr << "Warning: could not save account\n";
             }
@@ -886,6 +904,99 @@ static void cmd_get_version_metadata(const Args& args) {
     }
 }
 
+// Test command: obtain the kbsync blob and print it, to check the FairPlay
+// emulation (storeagent GlobalContextInit + KBSyncDataWithDSID). No request is
+// sent to Apple.
+//
+// Caching: for the saved account's DSID, the blob is cached in the account file
+// (bound to DSID + hardwareID, survives token refresh). It is reused on the
+// next run and only regenerated with --refresh. Passing --dsid explicitly is a
+// pure generation test and neither reads nor writes the cache.
+static void cmd_kbsync(const Args& args) {
+    std::string dsidArg    = get(args, "dsid");
+    std::string passphrase = get(args, "keychain-passphrase", "");
+    bool        refresh    = get(args, "refresh") == "true";
+
+    Account  acc;
+    bool     haveAccount = false;
+    std::string dsidStr  = dsidArg;
+
+    if (dsidStr.empty()) {
+        if (!load_account(acc, passphrase)) {
+            std::cerr << "Not logged in. Log in first or pass --dsid DSID\n";
+            exit(1);
+        }
+        dsidStr     = acc.directoryServicesID;
+        haveAccount = true;
+    }
+
+    uint64_t dsid = 0;
+    try {
+        size_t pos = 0;
+        dsid = std::stoull(dsidStr, &pos);
+        if (pos != dsidStr.size() || dsid == 0) throw std::invalid_argument("dsid");
+    } catch (const std::exception&) {
+        print_red_err("Error: invalid DSID: " + dsidStr + "\n");
+        exit(1);
+    }
+
+    AppStore store(COOKIE_FILE);
+    if (get(args, "debug") == "true") store.set_debug(true);
+
+    std::vector<uint8_t> kbsync;
+    const char*          source = "generated";
+
+    // Cache hit: decode the stored blob and skip the ~20 s+ emulation.
+    if (haveAccount && !refresh && !acc.kbsync.empty()) {
+        try {
+            kbsync = SapBase64::Decode(acc.kbsync);
+            source = "cache";
+        } catch (const std::exception&) {
+            kbsync.clear(); // corrupt cache — fall through to regenerate
+        }
+    }
+
+    if (kbsync.empty()) {
+        try {
+            kbsync = store.generate_kbsync(dsid);
+        } catch (const std::exception& e) {
+            print_red_err(std::string("kbsync error: ") + e.what() + "\n");
+            exit(1);
+        }
+        // Persist to the account file so later runs reuse it.
+        if (haveAccount) {
+            acc.kbsync = SapBase64::Encode(kbsync);
+            if (!save_account(acc, passphrase))
+                std::cerr << "Warning: could not cache kbsync in account file\n";
+        }
+    }
+
+    // Real kbsync blobs are a few hundred bytes and start with 00 04 00 xx.
+    bool valid = kbsync.size() >= 64 &&
+                 kbsync[0] == 0x00 && kbsync[1] == 0x04 && kbsync[2] == 0x00;
+
+    std::string header;
+    char hx[4];
+    for (size_t i = 0; i < kbsync.size() && i < 8; ++i) {
+        snprintf(hx, sizeof(hx), i ? " %02x" : "%02x", kbsync[i]);
+        header += hx;
+    }
+
+    json out;
+    out["dsid"]    = dsidStr;
+    out["length"]  = kbsync.size();
+    out["header"]  = header;
+    out["kbsync"]  = SapBase64::Encode(kbsync);
+    out["source"]  = source;
+    out["success"] = valid;
+    log_output(out);
+
+    if (!valid) {
+        print_red_err("Error: kbsync does not look like a FairPlay blob\n");
+        exit(1);
+    }
+}
+
 static void cmd_revoke(const Args& args) {
     if (!std::ifstream(ACCOUNT_FILE).good()) {
         std::cerr << "Not logged in.\n";
@@ -924,11 +1035,47 @@ static void cmd_download(const Args& args) {
     if (get(args, "debug") == "true") store.set_debug(true);
 
     // Fetch bag for redownloadProduct (5002 fallback for licensed apps like Teams)
+    // and the ent/download endpoint (kbsync first stage).
     std::string redownloadEndpoint;
+    std::string entDownloadEndpoint;
     try {
         auto bag = store.fetch_bag();
-        redownloadEndpoint = bag.redownloadEndpoint;
+        redownloadEndpoint  = bag.redownloadEndpoint;
+        entDownloadEndpoint = bag.entDownloadEndpoint;
     } catch (...) { /* non-fatal: proceed without fallback */ }
+
+    // Prepare kbsync for the ent/download stage: reuse the cached blob, or
+    // generate it once (~20 s+) and cache it in the account file. On failure to
+    // generate, we simply skip the ent stage and rely on the legacy chain.
+    std::string kbsyncB64;
+    if (!entDownloadEndpoint.empty() && !acc.directoryServicesID.empty()) {
+        if (!acc.kbsync.empty()) {
+            kbsyncB64 = acc.kbsync;
+        } else {
+            try {
+                uint64_t dsid = std::stoull(acc.directoryServicesID);
+                auto blob = store.generate_kbsync(dsid);
+                kbsyncB64 = SapBase64::Encode(blob);
+                acc.kbsync = kbsyncB64;
+                if (!save_account(acc, passphrase))
+                    std::cerr << "Warning: could not cache kbsync in account file\n";
+            } catch (const std::exception& e) {
+                if (get(args, "debug") == "true")
+                    fprintf(stderr, "[DEBUG] kbsync generation failed (%s) — "
+                                    "skipping ent/download stage\n", e.what());
+            }
+        }
+    }
+
+    // After a download, drop a stale cached kbsync so the next run regenerates it.
+    auto invalidate_kbsync_if_rejected = [&]() {
+        if (store.kbsync_rejected() && !acc.kbsync.empty()) {
+            acc.kbsync.clear();
+            save_account(acc, passphrase);
+            if (get(args, "debug") == "true")
+                fprintf(stderr, "[DEBUG] cleared stale kbsync from account cache\n");
+        }
+    };
 
     App app;
 
@@ -1100,7 +1247,9 @@ static void cmd_download(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
+        auto out = store.download(acc, app, outputPath, versionID, progress,
+                                  redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+        invalidate_kbsync_if_rejected();
         json dlOut;
         dlOut["output"]    = out.destinationPath;
         dlOut["purchased"] = false;
@@ -1151,7 +1300,9 @@ static void cmd_download(const Args& args) {
         startTime     = std::chrono::steady_clock::now();
         prevDrawnCols = 0;
         try {
-            auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
+            auto out = store.download(acc, app, outputPath, versionID, progress,
+                                      redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+            invalidate_kbsync_if_rejected();
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = true;
@@ -1166,7 +1317,9 @@ static void cmd_download(const Args& args) {
             startTime     = std::chrono::steady_clock::now();
             prevDrawnCols = 0;
             try {
-                auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
+                auto out = store.download(acc, app, outputPath, versionID, progress,
+                                          redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+                invalidate_kbsync_if_rejected();
                 json dlOut;
                 dlOut["output"]    = out.destinationPath;
                 dlOut["purchased"] = true;
@@ -1191,7 +1344,9 @@ static void cmd_download(const Args& args) {
             lastDraw      = std::chrono::steady_clock::now() - std::chrono::milliseconds(200);
             startTime     = std::chrono::steady_clock::now();
             prevDrawnCols = 0;
-            auto out = store.download(acc, app, outputPath, versionID, progress, redownloadEndpoint);
+            auto out = store.download(acc, app, outputPath, versionID, progress,
+                                      redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+            invalidate_kbsync_if_rejected();
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = false;
@@ -1225,6 +1380,7 @@ Commands:
   download              Download an app IPA
   list-versions         List available versions of an app
   get-version-metadata  Get metadata for a specific app version
+  kbsync                Test: generate kbsync locally (no request to Apple)
 
 Global flags:
   --format                Output format: "text" (default) or "json"
@@ -1250,6 +1406,7 @@ Flags per command:
   download:             -b/--bundle-id | -i/--app-id   -o/--output  --external-version-id  --purchase  --keychain-passphrase
   list-versions:        -b/--bundle-id | -i/--app-id   --keychain-passphrase
   get-version-metadata: -b/--bundle-id | -i/--app-id   --external-version-id  --keychain-passphrase
+  kbsync:               [--dsid DSID] [--refresh]  (default: cached blob for the saved account)  --keychain-passphrase
 )";}
 
 
@@ -1308,6 +1465,8 @@ int main(int argc, char** argv) {
         cmd_purchase(args);
     } else if (cmd == "download") {
         cmd_download(args);
+    } else if (cmd == "kbsync") {
+        cmd_kbsync(args);
     } else if (cmd == "help" || cmd == "--help" || cmd == "-h") {
         print_help();
     } else {

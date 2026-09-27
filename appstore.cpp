@@ -445,23 +445,41 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
                         const std::string& outputPath,
                         const std::string& externalVersionID,
                         ProgressCb progress,
-                        const std::string& redownloadEndpoint)
+                        const std::string& redownloadEndpoint,
+                        const std::string& entDownloadEndpoint,
+                        const std::string& kbsyncB64)
 {
     std::string guid = get_guid();
+    m_kbsyncRejected = false;
 
-    if (m_debug) {
-        std::string pod_pfx;
-        if (!acc.pod.empty()) pod_pfx = "p" + acc.pod + "-";
-        std::string dbgUrl = "https://" + pod_pfx + std::string(PRIVATE_AS_DOMAIN)
-                           + PRIVATE_AS_PATH_DOWNLOAD + "?guid=" + guid;
-        fprintf(stderr, "[DEBUG] download URL: %s\n", dbgUrl.c_str());
-        fprintf(stderr, "[DEBUG] dsid: %s\n", acc.directoryServicesID.c_str());
-        fprintf(stderr, "[DEBUG] storefront: '%s'\n", acc.storeFront.c_str());
-        fprintf(stderr, "[DEBUG] passwordToken length: %zu\n", acc.passwordToken.get().size());
-        fprintf(stderr, "[DEBUG] pod: '%s'\n", acc.pod.c_str());
+    // ── Stage 0: ent/download (kbsync). Best-effort first stage — if it serves
+    //    the app (songList with sinf data), use it and skip the legacy chain.
+    //    Any miss falls through to the proven volumeStore→redownload→update path.
+    PlistDict data;
+    bool entServed = false;
+    if (!entDownloadEndpoint.empty() && !kbsyncB64.empty()) {
+        int st = 0;
+        PlistDict entData = send_ent_download(acc, app, guid, entDownloadEndpoint,
+                                              kbsyncB64, externalVersionID, st);
+        if (has_sinfs(dict_arr(entData, "songList"))) {
+            if (m_debug) fprintf(stderr, "[DEBUG] ent/download served the app\n");
+            data      = std::move(entData);
+            entServed = true;
+        } else if (st >= 500) {
+            // Server error → the cached kbsync is likely stale. Flag it so the
+            // caller drops it (next run regenerates), and fall back for now.
+            m_kbsyncRejected = true;
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] ent/download rejected (HTTP %d) — kbsync "
+                                "likely stale, falling back to volumeStore\n", st);
+        } else if (m_debug) {
+            fprintf(stderr, "[DEBUG] ent/download no sinf data (HTTP %d) — "
+                            "falling back to volumeStore\n", st);
+        }
     }
 
-    PlistDict data = send_download_product(acc, app, guid, externalVersionID, redownloadEndpoint);
+    if (!entServed)
+        data = send_download_product(acc, app, guid, externalVersionID, redownloadEndpoint);
 
     std::string failureType     = dict_str(data, "failureType");
     std::string customerMessage = dict_str(data, "customerMessage");
@@ -813,7 +831,74 @@ void AppStore::set_debug(bool v) {
     device_mac_set_debug(v);
 }
 
+std::vector<uint8_t> AppStore::generate_kbsync(uint64_t dsid) {
+    // Same hardware identity as the GUID sent with every request.
+    auto hardwareID = device_mac_address();
+
+    // FairPlay's global-context init is heavy (~20 s on a fast host, longer on
+    // a slow Unicorn build). Warn so a --debug run doesn't look frozen.
+    if (m_debug)
+        fprintf(stderr, "[DEBUG] kbsync: generating via FairPlay emulation, "
+                        "this can take up to a minute...\n");
+
+    auto machine = StoreAgentMachine::Create(
+        load_sap_asset("CoreFP"),
+        load_sap_asset("CommerceCore"),
+        load_sap_asset("CommerceKit"),
+        load_sap_asset("CoreFP.icxs"),
+        load_sap_asset("storeagent"));
+
+    uint32_t ctx = machine->InitializeGlobal(hardwareID);
+    if (m_debug)
+        fprintf(stderr, "[DEBUG] kbsync: FairPlay global context %u\n", ctx);
+
+    auto kbsync = machine->KBSyncData(ctx, dsid);
+    if (m_debug)
+        fprintf(stderr, "[DEBUG] kbsync: %zu bytes for DSID %llu\n",
+                kbsync.size(), static_cast<unsigned long long>(dsid));
+    return kbsync;
+}
+
 // ── sendDownloadProduct — shared volumeStore->redownload helper ─────────
+// ── ent/download first stage (kbsync) ────────────────────────────────────────
+PlistDict AppStore::send_ent_download(const Account& acc, const App& app,
+                                      const std::string& guid,
+                                      const std::string& entDownloadEndpoint,
+                                      const std::string& kbsyncB64,
+                                      const std::string& externalVersionID,
+                                      int& httpStatus)
+{
+    httpStatus = 0;
+    std::string url = entDownloadEndpoint + "?guid=" + guid;
+
+    // Headers match the reference tool exactly (note: form-urlencoded content
+    // type even though the body is a plist, plus an explicit Configurator UA).
+    std::map<std::string, std::string> hdrs = {
+        {"Content-Type",        "application/x-www-form-urlencoded; charset=utf-8"},
+        {"User-Agent",          "Configurator/2.18 (Macintosh; OS X 15.3.2; 24D81) "
+                                "AppleWebKit/0620.2.4.11.6"},
+        {"iCloud-DSID",         acc.directoryServicesID},
+        {"X-Dsid",              acc.directoryServicesID},
+        {"X-Apple-Store-Front", acc.storeFront},
+        {"X-Token",             acc.passwordToken.get()},
+    };
+
+    PlistDict p;
+    p["creditDisplay"] = PlistValue::makeString("");
+    p["guid"]          = PlistValue::makeString(guid);
+    p["kbsync"]        = PlistValue::makeString(kbsyncB64);
+    p["salableAdamId"] = PlistValue::makeString(std::to_string(app.id));
+    if (!externalVersionID.empty())
+        p["externalVersionId"] = PlistValue::makeString(externalVersionID);
+
+    std::string body = encode_plist_xml(p);
+    if (m_debug) debug_dump_request("ent/download", "POST", url, hdrs, body);
+    HttpResponse res = m_http.post(url, body, hdrs);
+    httpStatus = res.statusCode;
+    if (m_debug) debug_dump_response("ent/download", res);
+    return decode_plist(res.body);
+}
+
 PlistDict AppStore::send_download_product(const Account& acc, const App& app,
                                  const std::string& guid,
                                  const std::string& externalVersionID,
@@ -846,6 +931,8 @@ PlistDict AppStore::send_download_product(const Account& acc, const App& app,
     };
 
     // 1. Try volumeStore (primary — every app that works today keeps using this)
+    if (m_debug)
+        fprintf(stderr, "[DEBUG] volumeStore URL: %s\n", vsUrl.c_str());
     HttpResponse vsRes = m_http.post(vsUrl, encode_plist_xml(make_vs_payload()), hdrs);
     if (m_debug) {
         fprintf(stderr, "[DEBUG] volumeStore status: %d\n", vsRes.statusCode);
@@ -1250,9 +1337,10 @@ AppStore::BagOutput AppStore::fetch_bag_impl(const std::string& guid) {
     // Extract redownloadProduct (simple flat lookup under urlBag)
     auto ubIt = d.find("urlBag");
     if (ubIt != d.end() && ubIt->second.isDict()) {
-        out.redownloadEndpoint = dict_str(ubIt->second.dictVal, "redownloadProduct");
-        out.updateEndpoint     = dict_str(ubIt->second.dictVal, "updateProduct");
-        m_updateEndpoint       = out.updateEndpoint;
+        out.redownloadEndpoint  = dict_str(ubIt->second.dictVal, "redownloadProduct");
+        out.updateEndpoint      = dict_str(ubIt->second.dictVal, "updateProduct");
+        out.entDownloadEndpoint = dict_str(ubIt->second.dictVal, "volumeStoreDownloadProduct");
+        m_updateEndpoint        = out.updateEndpoint;
 
         // ── SAP config fields (v2.4.0+) — must be extracted here, before
         //    the early returns below for the auth endpoint. ──────────────────

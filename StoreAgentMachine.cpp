@@ -14,7 +14,13 @@ static constexpr int kArgRegs[6] = {
     UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX,
     UC_X86_REG_RCX, UC_X86_REG_R8,  UC_X86_REG_R9,
 };
-static constexpr uint64_t kTimeoutUs = 60'000'000ULL;
+// No wall-clock timeout on the guest. FairPlay's obfuscated global-context init
+// is legitimately heavy — ~15 s on fast native Unicorn, over a minute on a
+// slower build, and several minutes on old hardware — so any fixed deadline
+// eventually aborts a still-correct computation. Emulation stops when IP hits
+// kReturnAddr; genuine faults are still caught (uc_err + shim HasFault). The
+// trade-off: a true runaway would run until the user interrupts it (Ctrl+C).
+static constexpr uint64_t kTimeoutUs = 0ULL;
 
 static inline void UCK(uc_err e, const char* w) {
     if (e != UC_ERR_OK)
@@ -95,6 +101,9 @@ std::unique_ptr<StoreAgentMachine> StoreAgentMachine::Create(
     imgCommerceCore->Load(m->uc_);
     imgCommerceKit ->Load(m->uc_);
     imgAgent       ->Load(m->uc_);
+
+    // FairPlayDisposeStorage — frees buffers returned by FairPlay (kbsync)
+    try { m->disposeFn_ = imgCommerceKit->Export("_jEHf8Xzsv8K", kKitBase); } catch (...) {}
 
     return m;
 }
@@ -200,8 +209,12 @@ uint32_t StoreAgentMachine::InitializeGlobal(std::span<const uint8_t> hardwareID
     uint64_t pathAddr    = Scratch(scPath.data(), scPath.size());
     uint64_t ctxField    = Scratch(4); // uint32 out-param
 
+    // Signature: FairPlayGlobalContextInit(0, hardwareBlock, scInfoPath, &ctx).
+    // The leading 0 is a real argument (upstream storeagent.go passes it too);
+    // dropping it shifts every argument by one register and the call fails
+    // with -42023 (the context out-param never gets written).
     int32_t status = static_cast<int32_t>(
-        Invoke(kGlobalInit, { hwAddr, pathAddr, ctxField }));
+        Invoke(kGlobalInit, { 0ULL, hwAddr, pathAddr, ctxField }));
 
     uint32_t ctx = GuestRead32(ctxField);
     ClearScratch();
@@ -279,4 +292,33 @@ void StoreAgentMachine::CloseSession(uint64_t session) {
     ClearScratch();
     if (st != 0)
         throw std::runtime_error(std::format("StoreAgent CloseSession returned {}", st));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  KBSyncData — FairPlayKBSyncDataWithDSID (port of sapsigner emulator)
+// ═══════════════════════════════════════════════════════════════════════════
+
+std::vector<uint8_t> StoreAgentMachine::KBSyncData(uint32_t globalCtx, uint64_t dsid) {
+    uint64_t ptrFld = Scratch(8);   // out: pointer to the blob
+    uint64_t lenFld = Scratch(8);   // out: uint32 length (zeroed 8 bytes)
+
+    int32_t status = static_cast<int32_t>(
+        Invoke(kKBSyncData, { uint64_t(globalCtx), dsid, 0ULL, 1ULL, ptrFld, lenFld }));
+
+    uint64_t ptr = GuestRead64(ptrFld);
+    uint32_t len = GuestRead32(lenFld);
+    ClearScratch();
+
+    if (status != 0)
+        throw std::runtime_error(std::format("FairPlayKBSyncDataWithDSID returned {}", status));
+    if (!ptr || !len)
+        throw std::runtime_error("FairPlayKBSyncDataWithDSID returned an empty buffer");
+
+    std::vector<uint8_t> out(len);
+    UCK(uc_mem_read(uc_, ptr, out.data(), len), "read kbsync");
+
+    if (disposeFn_) {
+        try { Invoke(disposeFn_, { ptr }); } catch (...) {} // non-fatal
+    }
+    return out;
 }

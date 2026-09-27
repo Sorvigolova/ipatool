@@ -54,6 +54,11 @@ public:
     // Close the session.
     void CloseSession(uint64_t session);
 
+    // kbsync blob for an account DSID — FairPlayKBSyncDataWithDSID, the
+    // storeagent function behind -[… _kbSyncDataWithDSID:]. Takes the context
+    // from InitializeGlobal(); no keybag in "SC Info" is needed.
+    std::vector<uint8_t> KBSyncData(uint32_t globalCtx, uint64_t dsid);
+
     static constexpr size_t kChunkSize = 0x8000; // 32 KB — matches Go storeAgentChunkSize
 
 private:
@@ -80,6 +85,8 @@ private:
     static constexpr uint64_t kSessionInit  = kAgentBase + 0x0debd0;
     static constexpr uint64_t kDecryptEntry = kAgentBase + 0x0ee700;
     static constexpr uint64_t kSessionClose = kAgentBase + 0x1212d0;
+    // (ctx, dsid, 0, 1, &outPtr, &outLen) -> 0 on success
+    static constexpr uint64_t kKBSyncData   = kAgentBase + 0x0c93c0;
 
     // SC Info path expected by storeagent (shimmed via open())
     static constexpr const char* kSCInfoPath = "/Users/Shared/SC Info";
@@ -97,4 +104,5 @@ private:
     uc_engine*                uc_            = nullptr;
     std::unique_ptr<SapShims> shims_;
     uint64_t                  scratchCursor_ = 0;
+    uint64_t                  disposeFn_     = 0; // CommerceKit FairPlayDisposeStorage
 };

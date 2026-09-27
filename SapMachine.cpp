@@ -760,8 +760,12 @@ uint64_t SapMachine::Invoke(uint64_t fn, std::initializer_list<uint64_t> args) {
     UC_CHECK(uc_reg_write(uc_, UC_X86_REG_RSP, &rsp), "write RSP");
 
     // StartBounded: emulation stops when IP == kReturnAddr.
-    // Timeout in microseconds (sapGuestTimeout = 1 minute = 60,000,000 µs)
-    static constexpr uint64_t kTimeoutUs = 60'000'000ULL;
+    // Timeout in microseconds. FairPlay's obfuscated global-context init alone
+    // runs ~15 s even on a fast native Unicorn build; on a slower host (e.g. a
+    // Windows Unicorn) it can take well over a minute. 60 s was too tight and
+    // aborted a still-running call with "agent stopped". 5 min leaves headroom
+    // while still catching a genuine runaway.
+    static constexpr uint64_t kTimeoutUs = 300'000'000ULL;
     uc_err err = uc_emu_start(uc_, fn, kReturnAddr, kTimeoutUs, 0);
 
     if (err != UC_ERR_OK) {
