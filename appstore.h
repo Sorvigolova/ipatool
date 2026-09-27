@@ -140,8 +140,11 @@ public:
         std::string              latestExternalVersionID;
     };
 
-    ListVersionsOutput list_versions(const Account& acc, const App& app,
-                                     const std::string& redownloadEndpoint = "");
+    ListVersionsOutput list_versions(const Account& acc,
+                                    const App& app,
+                                    const std::string& redownloadEndpoint = "",
+                                    const std::string& entDownloadEndpoint = "",
+                                    const std::string& kbsyncB64 = "");
 
     // ── Get Version Metadata ─────────────────────────────────────────────────
     struct GetVersionMetadataOutput {
@@ -152,7 +155,9 @@ public:
     GetVersionMetadataOutput get_version_metadata(const Account& acc,
                                                    const App& app,
                                                    const std::string& versionID,
-                                                   const std::string& redownloadEndpoint = "");
+                                                   const std::string& redownloadEndpoint = "",
+                                                   const std::string& entDownloadEndpoint = "",
+                                                   const std::string& kbsyncB64 = "");
 
 private:
     HttpClient m_http;

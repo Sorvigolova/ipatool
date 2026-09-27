@@ -803,10 +803,34 @@ static void cmd_list_versions(const Args& args) {
     auto run = [&]() {
         // Fetch bag to get redownloadProduct endpoint for 5002 fallback
         std::string redownloadEndpoint;
+        std::string entDownloadEndpoint;
         try {
             auto bag = store.fetch_bag();
             redownloadEndpoint = bag.redownloadEndpoint;
+            entDownloadEndpoint = bag.entDownloadEndpoint;
         } catch (...) { /* non-fatal: fallback disabled if bag fails */ }
+
+        std::string kbsyncB64;
+        if (!entDownloadEndpoint.empty() && !acc.directoryServicesID.empty()) {
+            if (!acc.kbsync.empty()) {
+                kbsyncB64 = acc.kbsync;
+            }
+            else {
+                try {
+                    uint64_t dsid = std::stoull(acc.directoryServicesID);
+                    auto blob = store.generate_kbsync(dsid);
+                    kbsyncB64 = SapBase64::Encode(blob);
+                    acc.kbsync = kbsyncB64;
+                    if (!save_account(acc, passphrase))
+                        std::cerr << "Warning: could not cache kbsync in account file\n";
+                }
+                catch (const std::exception& e) {
+                    if (get(args, "debug") == "true")
+                        fprintf(stderr, "[DEBUG] kbsync generation failed (%s) — "
+                            "skipping ent/download stage\n", e.what());
+                }
+            }
+        }
 
         App app;
         if (!bundleID.empty()) {
@@ -815,7 +839,7 @@ static void cmd_list_versions(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.list_versions(acc, app, redownloadEndpoint);
+        auto out = store.list_versions(acc, app, redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
 
         json j;
         j["externalVersionIdentifiers"] = out.externalVersionIdentifiers;
@@ -865,10 +889,34 @@ static void cmd_get_version_metadata(const Args& args) {
     auto run = [&]() {
         // Fetch bag to get redownloadProduct endpoint for 5002 fallback
         std::string redownloadEndpoint;
+        std::string entDownloadEndpoint;
         try {
             auto bag = store.fetch_bag();
             redownloadEndpoint = bag.redownloadEndpoint;
+            entDownloadEndpoint = bag.entDownloadEndpoint;
         } catch (...) { /* non-fatal */ }
+
+        std::string kbsyncB64;
+        if (!entDownloadEndpoint.empty() && !acc.directoryServicesID.empty()) {
+            if (!acc.kbsync.empty()) {
+                kbsyncB64 = acc.kbsync;
+            }
+            else {
+                try {
+                    uint64_t dsid = std::stoull(acc.directoryServicesID);
+                    auto blob = store.generate_kbsync(dsid);
+                    kbsyncB64 = SapBase64::Encode(blob);
+                    acc.kbsync = kbsyncB64;
+                    if (!save_account(acc, passphrase))
+                        std::cerr << "Warning: could not cache kbsync in account file\n";
+                }
+                catch (const std::exception& e) {
+                    if (get(args, "debug") == "true")
+                        fprintf(stderr, "[DEBUG] kbsync generation failed (%s) — "
+                            "skipping ent/download stage\n", e.what());
+                }
+            }
+        }
 
         App app;
         if (!bundleID.empty()) {
@@ -877,7 +925,7 @@ static void cmd_get_version_metadata(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.get_version_metadata(acc, app, versionID, redownloadEndpoint);
+        auto out = store.get_version_metadata(acc, app, versionID, redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
 
         json j;
         j["externalVersionID"] = versionID;

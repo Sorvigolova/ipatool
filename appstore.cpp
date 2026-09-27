@@ -665,11 +665,45 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
 // AppStore — List Versions / Get Version Metadata
 // ─────────────────────────────────────────────────────────────────────────────
 
-AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc, const App& app,
-                                 const std::string& redownloadEndpoint) {
+AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc,
+                        const App& app,
+                        const std::string& redownloadEndpoint,
+                        const std::string& entDownloadEndpoint,
+                        const std::string& kbsyncB64)
+{
     std::string guid = get_guid();
+    m_kbsyncRejected = false;
 
-    PlistDict data = send_download_product(acc, app, guid, "", redownloadEndpoint);
+    // ── Stage 0: ent/download (kbsync). Best-effort first stage — if it serves
+    //    the app (songList with sinf data), use it and skip the legacy chain.
+    //    Any miss falls through to the proven volumeStore→redownload→update path.
+    PlistDict data;
+    bool entServed = false;
+    if (!entDownloadEndpoint.empty() && !kbsyncB64.empty()) {
+        int st = 0;
+        PlistDict entData = send_ent_download(acc, app, guid, entDownloadEndpoint,
+            kbsyncB64, "", st);
+        if (has_sinfs(dict_arr(entData, "songList"))) {
+            if (m_debug) fprintf(stderr, "[DEBUG] ent/download served the app\n");
+            data = std::move(entData);
+            entServed = true;
+        }
+        else if (st >= 500) {
+            // Server error → the cached kbsync is likely stale. Flag it so the
+            // caller drops it (next run regenerates), and fall back for now.
+            m_kbsyncRejected = true;
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] ent/download rejected (HTTP %d) — kbsync "
+                    "likely stale, falling back to volumeStore\n", st);
+        }
+        else if (m_debug) {
+            fprintf(stderr, "[DEBUG] ent/download no sinf data (HTTP %d) — "
+                "falling back to volumeStore\n", st);
+        }
+    }
+
+    if (!entServed)
+        data = send_download_product(acc, app, guid, "", redownloadEndpoint);
 
     std::string failureType     = dict_str(data, "failureType");
     std::string customerMessage = dict_str(data, "customerMessage");
@@ -746,10 +780,43 @@ AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc, const A
 AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account& acc,
                                                const App& app,
                                                const std::string& versionID,
-                                               const std::string& redownloadEndpoint) {
+                                               const std::string& redownloadEndpoint,
+                                               const std::string& entDownloadEndpoint,
+                                               const std::string& kbsyncB64)
+{
     std::string guid = get_guid();
+    m_kbsyncRejected = false;
 
-    PlistDict data = send_download_product(acc, app, guid, versionID, redownloadEndpoint);
+    // ── Stage 0: ent/download (kbsync). Best-effort first stage — if it serves
+    //    the app (songList with sinf data), use it and skip the legacy chain.
+    //    Any miss falls through to the proven volumeStore→redownload→update path.
+    PlistDict data;
+    bool entServed = false;
+    if (!entDownloadEndpoint.empty() && !kbsyncB64.empty()) {
+        int st = 0;
+        PlistDict entData = send_ent_download(acc, app, guid, entDownloadEndpoint,
+            kbsyncB64, versionID, st);
+        if (has_sinfs(dict_arr(entData, "songList"))) {
+            if (m_debug) fprintf(stderr, "[DEBUG] ent/download served the app\n");
+            data = std::move(entData);
+            entServed = true;
+        }
+        else if (st >= 500) {
+            // Server error → the cached kbsync is likely stale. Flag it so the
+            // caller drops it (next run regenerates), and fall back for now.
+            m_kbsyncRejected = true;
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] ent/download rejected (HTTP %d) — kbsync "
+                    "likely stale, falling back to volumeStore\n", st);
+        }
+        else if (m_debug) {
+            fprintf(stderr, "[DEBUG] ent/download no sinf data (HTTP %d) — "
+                "falling back to volumeStore\n", st);
+        }
+    }
+
+    if (!entServed)
+        data = send_download_product(acc, app, guid, versionID, redownloadEndpoint);
 
     std::string failureType     = dict_str(data, "failureType");
     std::string customerMessage = dict_str(data, "customerMessage");
