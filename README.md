@@ -118,6 +118,38 @@ Output: `build\Release\ipatool.exe` — depends only on permanent Windows system
 
 ---
 
+## Building on Windows (MSYS2 MinGW-w64 — single-file static)
+
+Builds a **fully static, self-contained `ipatool.exe`** with GCC — no third-party
+DLLs, runs on any Windows (incl. Windows 7). Unicorn is built by GCC here, so the
+FairPlay emulation (kbsync) is much faster than an MSVC-built Unicorn.
+
+From an **MSYS2 MINGW64** shell:
+
+```sh
+pacman -S mingw-w64-x86_64-{gcc,cmake,ninja,openssl,minizip,zlib,bzip2,nlohmann-json} perl
+
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON
+cmake --build build
+# Output: build/ipatool.exe
+```
+
+What the build does automatically:
+- Builds a **minimal curl from source** using Windows' native **Schannel** TLS
+  (`HTTP_ONLY`), so curl needs no OpenSSL and none of brotli/zstd/idn2/psl/libssh2/
+  nghttp2/3/ngtcp2.
+- Builds **Unicorn (x86-only) from source** with GCC → fast, static.
+- Statically links `libcrypto` (for AES/SHA), minizip, zlib and bzip2, plus
+  `-static -static-libgcc -static-libstdc++`.
+
+`perl` is required only by curl's build. Verify the result is self-contained:
+
+```sh
+ldd build/ipatool.exe | grep -iv 'windows\|system32'   # should print nothing
+```
+
+---
+
 ## Building on Linux
 
 ### Dynamic build

@@ -18,6 +18,12 @@ project(ipatool VERSION 1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# MinGW (Ninja/Makefiles) needs the RC language enabled explicitly to compile
+# sap_resources.rc via windres; the VS generator handles .rc on its own.
+if(MINGW)
+    enable_language(RC)
+endif()
+
 if(STATIC_BUILD AND NOT WIN32)
     message(STATUS "Static build enabled — will build curl from source")
     set(BUILD_SHARED_LIBS OFF)
@@ -130,8 +136,58 @@ if(STATIC_BUILD AND NOT WIN32)
     endif()
 endif()
 
+# ── MinGW static: build a minimal Schannel curl from source (single-file exe) ──
+# Windows' native TLS (Schannel) drops curl's whole optional-dependency tree
+# (OpenSSL, brotli, zstd, idn2, psl, libssh2, nghttp2/3, ngtcp2), so the final
+# binary needs none of those DLLs. HTTP_ONLY keeps just HTTP/HTTPS. This mirrors
+# the MSVC Windows build, which also uses Schannel.
+if(STATIC_BUILD AND MINGW)
+    # project() only enabled CXX, so CMAKE_C_COMPILER is empty here — enable C so
+    # the curl sub-build gets a valid compiler (curl is a C project).
+    enable_language(C)
+    include(ExternalProject)
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+        set(_curl_ts DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    else()
+        set(_curl_ts "")
+    endif()
+    set(_CURL_INSTALL "${CMAKE_BINARY_DIR}/curl_install")
+    ExternalProject_Add(curl_static_mingw
+        URL https://curl.se/download/curl-8.7.1.tar.gz
+        ${_curl_ts}
+        CMAKE_ARGS
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX=${_CURL_INSTALL}
+            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DCMAKE_RC_COMPILER=${CMAKE_RC_COMPILER}
+            -DBUILD_SHARED_LIBS=OFF
+            -DBUILD_CURL_EXE=OFF
+            -DBUILD_TESTING=OFF
+            -DHTTP_ONLY=ON
+            -DCURL_USE_SCHANNEL=ON
+            -DCURL_USE_OPENSSL=OFF
+            -DCURL_USE_LIBSSH2=OFF
+            -DCURL_USE_LIBPSL=OFF
+            -DUSE_LIBIDN2=OFF
+            -DCURL_BROTLI=OFF
+            -DCURL_ZSTD=OFF
+            -DUSE_NGHTTP2=OFF
+            -DUSE_NGTCP2=OFF
+            -DENABLE_UNIX_SOCKETS=OFF
+        BUILD_BYPRODUCTS "${_CURL_INSTALL}/lib/libcurl.a"
+    )
+    set(STATIC_CURL_INCLUDE "${_CURL_INSTALL}/include")
+    add_library(curl_static_lib STATIC IMPORTED GLOBAL)
+    set_target_properties(curl_static_lib PROPERTIES
+        IMPORTED_LOCATION "${_CURL_INSTALL}/lib/libcurl.a")
+    add_dependencies(curl_static_lib curl_static_mingw)
+    # Linking curl statically on Windows: consumers must define CURL_STATICLIB so
+    # curl.h does not mark the API as __declspec(dllimport).
+    add_compile_definitions(CURL_STATICLIB)
+endif()
+
 # ── Hint: if you didn't pass -DCMAKE_TOOLCHAIN_FILE, try to auto-detect vcpkg ─
-if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT} AND NOT MINGW)
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
         CACHE STRING "vcpkg toolchain")
     message(STATUS "Auto-detected vcpkg at $ENV{VCPKG_ROOT}")
@@ -139,10 +195,12 @@ endif()
 
 # ── Dependencies via vcpkg (or system) ────────────────────────────────────────
 
-# curl
-find_package(CURL CONFIG QUIET)          # vcpkg installs a CONFIG-mode package
-if(NOT CURL_FOUND)
-    find_package(CURL REQUIRED)          # system fallback (MODULE mode)
+# curl (skipped for MinGW static — we build our own minimal Schannel curl above)
+if(NOT (STATIC_BUILD AND MINGW))
+    find_package(CURL CONFIG QUIET)      # vcpkg installs a CONFIG-mode package
+    if(NOT CURL_FOUND)
+        find_package(CURL REQUIRED)      # system fallback (MODULE mode)
+    endif()
 endif()
 
 # nlohmann/json
@@ -232,6 +290,14 @@ if(STATIC_BUILD AND WIN32)
 endif()
 find_package(OpenSSL REQUIRED)
 
+# MinGW static: link libcrypto.a directly (our AES/SHA only; curl uses Schannel,
+# so libssl is not needed). find_package may hand back the .dll.a import lib, so
+# resolve the static archive explicitly.
+if(STATIC_BUILD AND MINGW)
+    find_library(CRYPTO_STATIC_MINGW NAMES libcrypto.a crypto REQUIRED)
+    message(STATUS "MinGW static libcrypto: ${CRYPTO_STATIC_MINGW}")
+endif()
+
 
 # ── fmt library (fallback for std::format on GCC < 13) ───────────────────────
 include(CheckCXXSourceCompiles)
@@ -288,6 +354,14 @@ if(STATIC_BUILD AND APPLE AND (NOT UNICORN_LIBRARY OR UNICORN_LIBRARY MATCHES "\
     message(STATUS "macOS static build: will build unicorn.a from source")
 endif()
 
+# MinGW static: a found .dll.a would link dynamically — build the static .a from
+# source instead (same GCC toolchain → fast TCG, no libunicorn.dll dependency).
+if(STATIC_BUILD AND MINGW)
+    unset(UNICORN_LIBRARY CACHE)
+    unset(UNICORN_INCLUDE_DIR CACHE)
+    message(STATUS "MinGW static build: will build libunicorn.a from source")
+endif()
+
 if(UNICORN_LIBRARY AND UNICORN_INCLUDE_DIR)
     message(STATUS "Unicorn Engine: ${UNICORN_LIBRARY}")
     message(STATUS "Unicorn headers: ${UNICORN_INCLUDE_DIR}")
@@ -312,6 +386,7 @@ elseif(APPLE)
             -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
             -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
             -DUNICORN_BUILD_SHARED=OFF
+            -DUNICORN_ARCH=x86
             -DUNICORN_ARCH_X86=ON
             -DUNICORN_ARCH_ARM=OFF
             -DUNICORN_ARCH_ARM64=OFF
@@ -371,8 +446,9 @@ echo \"unicorn patched: crc32c.c.o removed, crc32c stub added\"
         COMMENT "Patching libunicorn.a: replacing crc32c.c.o with clean stub"
     )
     message(STATUS "Unicorn will be built as static lib: ${UNICORN_LIBRARY}")
-elseif(NOT WIN32)
-    # Linux: build from source automatically
+elseif(NOT WIN32 OR MINGW)
+    # Linux / MinGW-w64: build from source with the same GCC toolchain (fast TCG,
+    # unlike an MSVC-built Unicorn). Static x86-only lib, ~30s.
     message(STATUS "System Unicorn not found — building from source (x86 only, ~30s)")
     include(FetchContent)
     FetchContent_Declare(
@@ -382,10 +458,10 @@ elseif(NOT WIN32)
         GIT_SHALLOW    TRUE
     )
     set(UNICORN_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-    foreach(_arch ARM ARM64 MIPS SPARC PPC RISCV S390X TRICORE M68K)
-        set(UNICORN_ARCH_${_arch} OFF CACHE BOOL "" FORCE)
-    endforeach()
-    set(UNICORN_ARCH_X86 ON CACHE BOOL "" FORCE)
+    # unicorn 2.1.x selects targets via the UNICORN_ARCH *string* list, not the
+    # per-arch UNICORN_ARCH_<NAME> booleans (those are ignored → all 16 QEMU
+    # targets get built, which is huge and slow). We only emulate x86-64.
+    set(UNICORN_ARCH "x86" CACHE STRING "" FORCE)
     FetchContent_MakeAvailable(unicorn_src)
     set(UNICORN_LIBRARY unicorn)
     set(UNICORN_INCLUDE_DIR ${unicorn_src_SOURCE_DIR}/include)
@@ -641,7 +717,25 @@ if(STATIC_BUILD AND APPLE)
     endif()
 endif()
 
-if(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
+if(STATIC_BUILD AND MINGW)
+    # ── MinGW single-file static ────────────────────────────────────────────────
+    # Our minimal Schannel curl + static libcrypto/unicorn/minizip; no third-party
+    # DLLs. minizip.a needs zlib+bzip2 → --start-group resolves archive ordering.
+    target_link_libraries(ipatool PRIVATE
+        curl_static_lib
+        nlohmann_json::nlohmann_json
+        ${UNICORN_LIBRARY}
+        ${CRYPTO_STATIC_MINGW}
+        -Wl,--start-group -lminizip -lz -lbz2 -Wl,--end-group
+        # Schannel + Windows system deps
+        ws2_32 crypt32 bcrypt secur32 wldap32 normaliz winhttp iphlpapi)
+    target_include_directories(ipatool PRIVATE "${STATIC_CURL_INCLUDE}")
+    add_dependencies(ipatool curl_static_mingw)
+    # -static → pull libgcc/libstdc++/libwinpthread in too; unicorn bundles its
+    # own zlib (crc32c.c) → allow the duplicate.
+    target_link_options(ipatool PRIVATE
+        -static -static-libgcc -static-libstdc++ -Wl,--allow-multiple-definition)
+elseif(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
     # Linux static: use full .a paths built above
     target_link_libraries(ipatool PRIVATE ${STATIC_LINK_LIBS})
     add_dependencies(ipatool curl_static)
@@ -698,13 +792,15 @@ else()
         target_link_libraries(ipatool PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     endif()
 endif()
-if(minizip_FOUND)
+if(minizip_FOUND AND NOT MINGW)
+    # MinGW links minizip (+z +bz2) itself in a --start-group above.
     target_link_libraries(ipatool PRIVATE minizip::minizip)
 endif()
 
 # ── Platform-specific ─────────────────────────────────────────────────────────
 
 if(WIN32)
+  if(MSVC)
     # iphlpapi  = GetAdaptersInfo (MAC address)
     # ws2_32    = Winsock (used by curl internally too)
     target_link_libraries(ipatool PRIVATE iphlpapi ws2_32 winhttp crypt32 wldap32 normaliz)
@@ -770,6 +866,22 @@ if(WIN32)
             "${_SSL_STATIC_DIR}/lib/libcrypto.lib"
         )
     endif()
+  else()
+    # ── MinGW-w64 (GCC) ─────────────────────────────────────────────────────────
+    target_compile_options(ipatool PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    target_compile_definitions(ipatool PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_options(ipatool PRIVATE -Wl,--allow-multiple-definition)
+    if(NOT STATIC_BUILD)
+        # Dynamic MinGW: the generic block already linked curl/openssl/unicorn;
+        # add the Windows system deps + minizip here. (Static is fully handled by
+        # the MinGW single-file branch above.)
+        # winhttp: SapWinHttpClient (the MSVC #pragma comment is ignored by GCC).
+        target_link_libraries(ipatool PRIVATE
+            iphlpapi ws2_32 crypt32 bcrypt secur32 wldap32 normaliz winhttp
+            -Wl,--start-group -lminizip -lz -lbz2 -Wl,--end-group)
+        target_link_options(ipatool PRIVATE -static-libgcc -static-libstdc++)
+    endif()
+  endif()
 else()
     target_compile_options(ipatool PRIVATE -Wall -Wextra -Wno-unused-parameter)
     if(APPLE AND NOT STATIC_BUILD)
@@ -809,7 +921,13 @@ message(STATUS "  minizip   : ${minizip_FOUND}")
 message(STATUS "  unicorn   : ${UNICORN_LIBRARY}")
 message(STATUS "  static    : ${STATIC_BUILD}")
 message(STATUS "")
-if(WIN32)
+if(MINGW)
+    message(STATUS "  Quick-start (Windows / MSYS2 MinGW-w64, single-file static):")
+    message(STATUS "    pacman -S mingw-w64-x86_64-{gcc,cmake,ninja,openssl,minizip,zlib,bzip2,nlohmann-json} perl")
+    message(STATUS "    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON")
+    message(STATUS "    cmake --build build")
+    message(STATUS "    (curl [Schannel] and unicorn [x86] are built from source → no third-party DLLs)")
+elseif(WIN32)
     if(STATIC_BUILD)
         message(STATUS "  Quick-start (Windows static):")
         message(STATUS "    vcpkg install curl nlohmann-json minizip openssl unicorn --triplet x64-windows-static")
