@@ -360,6 +360,42 @@ static bool load_account(Account& acc, const std::string& passphrase = "") {
 }
 
 
+// ── kbsync helpers (shared by download / list-versions / get-version-metadata) ─
+
+// Ensure a kbsync blob for the ent/download stage: reuse the cached one, or
+// generate it once (~20 s+) and cache it in the account file. Returns "" (stage
+// skipped) if there is no ent endpoint / DSID, or generation fails.
+static std::string prepare_kbsync(AppStore& store, Account& acc,
+                                  const std::string& entDownloadEndpoint,
+                                  const std::string& passphrase, bool debug) {
+    if (entDownloadEndpoint.empty() || acc.directoryServicesID.empty()) return "";
+    if (!acc.kbsync.empty()) return acc.kbsync;
+    try {
+        uint64_t dsid = std::stoull(acc.directoryServicesID);
+        acc.kbsync = SapBase64::Encode(store.generate_kbsync(dsid));
+        if (!save_account(acc, passphrase))
+            std::cerr << "Warning: could not cache kbsync in account file\n";
+        return acc.kbsync;
+    } catch (const std::exception& e) {
+        if (debug)
+            fprintf(stderr, "[DEBUG] kbsync generation failed (%s) — "
+                    "skipping ent/download stage\n", e.what());
+        return "";
+    }
+}
+
+// Drop a stale cached kbsync (server rejected it) so the next run regenerates it.
+static void invalidate_kbsync_if_rejected(AppStore& store, Account& acc,
+                                          const std::string& passphrase, bool debug) {
+    if (store.kbsync_rejected() && !acc.kbsync.empty()) {
+        acc.kbsync.clear();
+        save_account(acc, passphrase);
+        if (debug)
+            fprintf(stderr, "[DEBUG] cleared stale kbsync from account cache\n");
+    }
+}
+
+
 // ── CLI arg parsing ───────────────────────────────────────────────────────────
 
 struct Args {
@@ -812,27 +848,8 @@ static void cmd_list_versions(const Args& args) {
             entDownloadEndpoint = bag.entDownloadEndpoint;
         } catch (...) { /* non-fatal: fallback disabled if bag fails */ }
 
-        std::string kbsyncB64;
-        if (!entDownloadEndpoint.empty() && !acc.directoryServicesID.empty()) {
-            if (!acc.kbsync.empty()) {
-                kbsyncB64 = acc.kbsync;
-            }
-            else {
-                try {
-                    uint64_t dsid = std::stoull(acc.directoryServicesID);
-                    auto blob = store.generate_kbsync(dsid);
-                    kbsyncB64 = SapBase64::Encode(blob);
-                    acc.kbsync = kbsyncB64;
-                    if (!save_account(acc, passphrase))
-                        std::cerr << "Warning: could not cache kbsync in account file\n";
-                }
-                catch (const std::exception& e) {
-                    if (get(args, "debug") == "true")
-                        fprintf(stderr, "[DEBUG] kbsync generation failed (%s) — "
-                            "skipping ent/download stage\n", e.what());
-                }
-            }
-        }
+        std::string kbsyncB64 = prepare_kbsync(store, acc, entDownloadEndpoint,
+                                               passphrase, get(args, "debug") == "true");
 
         App app;
         if (!bundleID.empty()) {
@@ -842,6 +859,7 @@ static void cmd_list_versions(const Args& args) {
         }
 
         auto out = store.list_versions(acc, app, redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+        invalidate_kbsync_if_rejected(store, acc, passphrase, get(args, "debug") == "true");
 
         json j;
         j["externalVersionIdentifiers"] = out.externalVersionIdentifiers;
@@ -898,27 +916,8 @@ static void cmd_get_version_metadata(const Args& args) {
             entDownloadEndpoint = bag.entDownloadEndpoint;
         } catch (...) { /* non-fatal */ }
 
-        std::string kbsyncB64;
-        if (!entDownloadEndpoint.empty() && !acc.directoryServicesID.empty()) {
-            if (!acc.kbsync.empty()) {
-                kbsyncB64 = acc.kbsync;
-            }
-            else {
-                try {
-                    uint64_t dsid = std::stoull(acc.directoryServicesID);
-                    auto blob = store.generate_kbsync(dsid);
-                    kbsyncB64 = SapBase64::Encode(blob);
-                    acc.kbsync = kbsyncB64;
-                    if (!save_account(acc, passphrase))
-                        std::cerr << "Warning: could not cache kbsync in account file\n";
-                }
-                catch (const std::exception& e) {
-                    if (get(args, "debug") == "true")
-                        fprintf(stderr, "[DEBUG] kbsync generation failed (%s) — "
-                            "skipping ent/download stage\n", e.what());
-                }
-            }
-        }
+        std::string kbsyncB64 = prepare_kbsync(store, acc, entDownloadEndpoint,
+                                               passphrase, get(args, "debug") == "true");
 
         App app;
         if (!bundleID.empty()) {
@@ -928,6 +927,7 @@ static void cmd_get_version_metadata(const Args& args) {
         }
 
         auto out = store.get_version_metadata(acc, app, versionID, redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+        invalidate_kbsync_if_rejected(store, acc, passphrase, get(args, "debug") == "true");
 
         json j;
         j["externalVersionID"] = versionID;
@@ -1094,38 +1094,8 @@ static void cmd_download(const Args& args) {
         entDownloadEndpoint = bag.entDownloadEndpoint;
     } catch (...) { /* non-fatal: proceed without fallback */ }
 
-    // Prepare kbsync for the ent/download stage: reuse the cached blob, or
-    // generate it once (~20 s+) and cache it in the account file. On failure to
-    // generate, we simply skip the ent stage and rely on the legacy chain.
-    std::string kbsyncB64;
-    if (!entDownloadEndpoint.empty() && !acc.directoryServicesID.empty()) {
-        if (!acc.kbsync.empty()) {
-            kbsyncB64 = acc.kbsync;
-        } else {
-            try {
-                uint64_t dsid = std::stoull(acc.directoryServicesID);
-                auto blob = store.generate_kbsync(dsid);
-                kbsyncB64 = SapBase64::Encode(blob);
-                acc.kbsync = kbsyncB64;
-                if (!save_account(acc, passphrase))
-                    std::cerr << "Warning: could not cache kbsync in account file\n";
-            } catch (const std::exception& e) {
-                if (get(args, "debug") == "true")
-                    fprintf(stderr, "[DEBUG] kbsync generation failed (%s) — "
-                                    "skipping ent/download stage\n", e.what());
-            }
-        }
-    }
-
-    // After a download, drop a stale cached kbsync so the next run regenerates it.
-    auto invalidate_kbsync_if_rejected = [&]() {
-        if (store.kbsync_rejected() && !acc.kbsync.empty()) {
-            acc.kbsync.clear();
-            save_account(acc, passphrase);
-            if (get(args, "debug") == "true")
-                fprintf(stderr, "[DEBUG] cleared stale kbsync from account cache\n");
-        }
-    };
+    bool dbg = (get(args, "debug") == "true");
+    std::string kbsyncB64 = prepare_kbsync(store, acc, entDownloadEndpoint, passphrase, dbg);
 
     App app;
 
@@ -1299,7 +1269,7 @@ static void cmd_download(const Args& args) {
 
         auto out = store.download(acc, app, outputPath, versionID, progress,
                                   redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
-        invalidate_kbsync_if_rejected();
+        invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
         json dlOut;
         dlOut["output"]    = out.destinationPath;
         dlOut["purchased"] = false;
@@ -1352,7 +1322,7 @@ static void cmd_download(const Args& args) {
         try {
             auto out = store.download(acc, app, outputPath, versionID, progress,
                                       redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
-            invalidate_kbsync_if_rejected();
+            invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = true;
@@ -1369,7 +1339,7 @@ static void cmd_download(const Args& args) {
             try {
                 auto out = store.download(acc, app, outputPath, versionID, progress,
                                           redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
-                invalidate_kbsync_if_rejected();
+                invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
                 json dlOut;
                 dlOut["output"]    = out.destinationPath;
                 dlOut["purchased"] = true;
@@ -1396,7 +1366,7 @@ static void cmd_download(const Args& args) {
             prevDrawnCols = 0;
             auto out = store.download(acc, app, outputPath, versionID, progress,
                                       redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
-            invalidate_kbsync_if_rejected();
+            invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = false;
