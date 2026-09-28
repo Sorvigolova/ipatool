@@ -80,6 +80,10 @@ struct Account {
     // NOT to the session token, so it survives password/xToken refreshes and is
     // only regenerated when the download endpoint rejects it. Empty = none yet.
     std::string   kbsync;
+    // Fictitious-but-valid device serial for the ent/download serialNumber field.
+    // Derived from the request GUID (device MAC), so it is unique per machine.
+    // Generated at login; deterministic, so it survives token refreshes.
+    std::string   fserial;
 };
 
 struct App {

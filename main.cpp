@@ -287,6 +287,7 @@ static bool save_account(const Account& acc, const std::string& passphrase = "")
     j["password"]            = acc.password.get();
     j["pod"]                 = std::string(acc.pod);
     j["kbsync"]              = std::string(acc.kbsync);
+    j["fserial"]             = std::string(acc.fserial);
     std::string data = j.dump(2);
 
     try {
@@ -345,6 +346,7 @@ static bool load_account(Account& acc, const std::string& passphrase = "") {
         acc.storeFront          = j.value("storeFront", "");
         acc.pod                 = j.value("pod", "");
         acc.kbsync              = j.value("kbsync", "");  // absent in older files → empty
+        acc.fserial             = j.value("fserial", "");
 
         // Encrypt sensitive fields with mem key derived from machine_id
         acc.passwordToken.set(j.value("passwordToken", ""));

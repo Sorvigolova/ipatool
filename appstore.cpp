@@ -927,6 +927,18 @@ std::vector<uint8_t> AppStore::generate_kbsync(uint64_t dsid) {
 }
 
 // ── sendDownloadProduct — shared volumeStore->redownload helper ─────────
+// Device serial for ent/download: 9 bytes (54 C8 B0 A9 88 + last 4 bytes of the
+// GUID), base64-encoded. Unique per machine. guid is 12 hex chars (6 bytes).
+static std::string make_fserial(const std::string& guid) {
+    std::vector<uint8_t> bytes = { 0x54, 0xC8, 0xB0, 0xA9, 0x88 };
+    std::string tail = guid.size() >= 8 ? guid.substr(guid.size() - 8) : guid;
+    for (size_t i = 0; i + 1 < tail.size(); i += 2) {
+        try { bytes.push_back((uint8_t)std::stoul(tail.substr(i, 2), nullptr, 16)); }
+        catch (...) { break; }
+    }
+    return SapBase64::Encode(bytes);
+}
+
 // ── ent/download first stage (kbsync) ────────────────────────────────────────
 PlistDict AppStore::send_ent_download(const Account& acc, const App& app,
                                       const std::string& guid,
@@ -955,6 +967,10 @@ PlistDict AppStore::send_ent_download(const Account& acc, const App& app,
     p["guid"]          = PlistValue::makeString(guid);
     p["kbsync"]        = PlistValue::makeString(kbsyncB64);
     p["salableAdamId"] = PlistValue::makeString(std::to_string(app.id));
+    // Fall back to computing the serial from the GUID for accounts saved before
+    // fserial existed (it is deterministic, so this equals the login-time value).
+    p["serialNumber"]  = PlistValue::makeString(
+        acc.fserial.empty() ? make_fserial(guid) : acc.fserial);
     if (!externalVersionID.empty())
         p["externalVersionId"] = PlistValue::makeString(externalVersionID);
 
@@ -1668,6 +1684,7 @@ Account AppStore::do_login(const std::string& email,
     acc.storeFront          = sf;
     acc.password.set(       password);
     acc.pod                 = pod;
+    acc.fserial             = make_fserial(guid);  // fictitious device serial for ent/download
     return acc;
 }
 
