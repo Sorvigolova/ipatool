@@ -152,10 +152,15 @@ ldd build/ipatool.exe | grep -iv 'windows\|system32'   # should print nothing
 
 ## Building on Linux
 
+> **`libfmt-dev`** is needed only on GCC < 13 (no `std::format` yet) — e.g.
+> Ubuntu 22.04's default GCC 11. On GCC 13+ `std::format` is built in and fmt is
+> not used. If `libfmt-dev` is absent when it's needed, CMake builds fmt from
+> source automatically, so it's optional — it just avoids the extra build.
+
 ### Dynamic build
 
 ```sh
-sudo apt install libcurl4-openssl-dev nlohmann-json3-dev libminizip-dev libssl-dev libunicorn-dev
+sudo apt install libcurl4-openssl-dev nlohmann-json3-dev libminizip-dev libssl-dev libunicorn-dev libfmt-dev
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -165,7 +170,7 @@ cmake --build build
 ### Fully static build
 
 ```sh
-sudo apt install libssl-dev libminizip-dev zlib1g-dev libunicorn-dev
+sudo apt install libssl-dev libminizip-dev zlib1g-dev libunicorn-dev libfmt-dev
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON
 cmake --build build

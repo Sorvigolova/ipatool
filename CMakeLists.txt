@@ -307,15 +307,22 @@ check_cxx_source_compiles(
     HAS_STD_FORMAT
 )
 if(NOT HAS_STD_FORMAT)
-    message(STATUS "std::format not available — using fmtlib")
-    include(FetchContent)
-    FetchContent_Declare(
-        fmt
-        GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-        GIT_TAG        11.1.1
-        GIT_SHALLOW    TRUE
-    )
-    FetchContent_MakeAvailable(fmt)
+    # Prefer a system fmt (e.g. apt libfmt-dev / brew fmt) — no source build and
+    # no leftover libfmt.a; fall back to building it from source when absent.
+    find_package(fmt QUIET)
+    if(fmt_FOUND)
+        message(STATUS "std::format not available — using system fmt ${fmt_VERSION}")
+    else()
+        message(STATUS "std::format not available — building fmtlib from source")
+        include(FetchContent)
+        FetchContent_Declare(
+            fmt
+            GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+            GIT_TAG        11.1.1
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_MakeAvailable(fmt)
+    endif()
     set(IPATOOL_USE_FMT TRUE)   # linked after add_executable below
 else()
     message(STATUS "std::format available — no fmtlib needed")
