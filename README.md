@@ -3,7 +3,7 @@
 A C++20 port of [ipatool](https://github.com/majd/ipatool) — a command-line tool for downloading iOS (and macOS) app packages from the App Store.
 Uses **libcurl** for networking and a small **Unicorn Engine** sandbox to run Apple's FairPlay code for request signing and package decryption. Builds on **Windows (VS 2022)**, Linux, and macOS, with optional fully static binaries.
 
-> C++20 is required (for `std::format`). On toolchains whose `<format>` is incomplete (older Apple clang, GCC < 13) the build automatically falls back to bundled **fmtlib** — see `compat_format.h`.
+> C++20 is required. Text formatting uses a small dependency-free `ipt::format()` (see `compat_format.h`), so there is **no `std::format` / fmtlib dependency** and no toolchain-version caveats around `<format>`.
 
 ---
 
@@ -152,15 +152,10 @@ ldd build/ipatool.exe | grep -iv 'windows\|system32'   # should print nothing
 
 ## Building on Linux
 
-> **`libfmt-dev`** is needed only on GCC < 13 (no `std::format` yet) — e.g.
-> Ubuntu 22.04's default GCC 11. On GCC 13+ `std::format` is built in and fmt is
-> not used. If `libfmt-dev` is absent when it's needed, CMake builds fmt from
-> source automatically, so it's optional — it just avoids the extra build.
-
 ### Dynamic build
 
 ```sh
-sudo apt install libcurl4-openssl-dev nlohmann-json3-dev libminizip-dev libssl-dev libunicorn-dev libfmt-dev
+sudo apt install libcurl4-openssl-dev nlohmann-json3-dev libminizip-dev libssl-dev libunicorn-dev
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -170,7 +165,7 @@ cmake --build build
 ### Fully static build
 
 ```sh
-sudo apt install libssl-dev libminizip-dev zlib1g-dev libunicorn-dev libfmt-dev
+sudo apt install libssl-dev libminizip-dev zlib1g-dev libunicorn-dev
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON
 cmake --build build
@@ -186,7 +181,7 @@ Verify with `ldd build/ipatool` — should show only `linux-vdso.so.1`, `libc.so
 ## Building on macOS
 
 ```sh
-brew install curl nlohmann-json minizip openssl@3 unicorn fmt
+brew install curl nlohmann-json minizip openssl@3 unicorn
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
       -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
@@ -196,16 +191,10 @@ cmake --build build
 
 IOKit and CoreFoundation are built into macOS — no extra dependencies needed for machine ID.
 
-> **`fmt`** is needed only when Apple clang has no `std::format` — i.e. Xcode < 15
-> or a deployment target below 13.3 (see the Intel/Catalina section). With a newer
-> Xcode and target 13.3+, `std::format` is built in and `fmt` is unused. If `fmt`
-> is absent when needed, CMake builds it from source automatically, so it's
-> optional — installing it just skips that extra build.
-
 ### Native arm64 build (Apple silicon)
 
 ```sh
-brew install openssl@3 minizip nlohmann-json unicorn pkg-config fmt
+brew install openssl@3 minizip nlohmann-json unicorn pkg-config
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
       -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
@@ -224,23 +213,24 @@ cmake --build build
 ### Static build (Apple silicon, arm64)
 
 ```sh
-brew install openssl@3 minizip nlohmann-json unicorn pkg-config fmt
+brew install openssl@3 minizip nlohmann-json unicorn pkg-config
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
       -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
       -DCMAKE_OSX_ARCHITECTURES=arm64 \
-      -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
+      -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
 cmake --build build
 ```
 
-Deployment target 13.3 gives Apple clang native `std::format` (no fmtlib), at
-the cost of requiring macOS 13.3+ to run. Lower it (e.g. 11.0) for wider
-compatibility — the build then uses the bundled fmtlib fallback automatically.
+`11.0` is the oldest macOS that runs on Apple silicon, so this binary runs on
+every Apple silicon Mac. The deployment target no longer affects text
+formatting (the project uses its own `ipt::format()`, not `std::format`), so
+you may raise or lower it freely within Apple silicon's supported range.
 
 ### Static build on macOS Catalina (Intel)
 
 ```sh
-brew install openssl@3 minizip nlohmann-json unicorn pkg-config fmt
+brew install openssl@3 minizip nlohmann-json unicorn pkg-config
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
       -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
@@ -248,8 +238,6 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
       -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
 cmake --build build
 ```
-
-A deployment target below 13.3 makes Apple clang use the bundled fmtlib fallback for `std::format` — this is expected and harmless.
 
 CMake downloads and builds a minimal curl from source (HTTPS only) and statically links it with OpenSSL and minizip. System frameworks (`IOKit`, `CoreFoundation`, `SystemConfiguration`, `CoreServices`) and `libz` remain dynamic — they ship with every Mac. Run `otool -L build/ipatool` to confirm.
 
@@ -460,7 +448,7 @@ On Windows these are in `%USERPROFILE%\.ipatool\`. The account file is always en
 - `sap_resources.h` — resource IDs for the SAP dylibs embedded as Windows RC data
 
 **Misc**
-- `compat_format.h` — `std::format` shim that falls back to fmtlib when `<format>` is incomplete
+- `compat_format.h` — dependency-free `ipt::format()` (`{}` / `{:#x}`) used for diagnostics; no `std::format` / fmtlib
 - `CMakeLists.txt` — cross-platform build (vcpkg + static support + asset embedding)
 - `sap_assets/` — Apple FairPlay dylibs embedded at build time (not tracked for redistribution)
 ```

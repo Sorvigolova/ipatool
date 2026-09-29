@@ -303,35 +303,10 @@ if(STATIC_BUILD AND MINGW)
 endif()
 
 
-# ── fmt library (fallback for std::format on GCC < 13) ───────────────────────
-include(CheckCXXSourceCompiles)
-set(CMAKE_REQUIRED_FLAGS "-std=c++20")
-check_cxx_source_compiles(
-    "#include <format>\nint main(){return std::format(\"{}\",42).size();}"
-    HAS_STD_FORMAT
-)
-if(NOT HAS_STD_FORMAT)
-    # Prefer a system fmt (e.g. apt libfmt-dev / brew fmt) — no source build and
-    # no leftover libfmt.a; fall back to building it from source when absent.
-    find_package(fmt QUIET)
-    if(fmt_FOUND)
-        message(STATUS "std::format not available — using system fmt ${fmt_VERSION}")
-    else()
-        message(STATUS "std::format not available — building fmtlib from source")
-        include(FetchContent)
-        FetchContent_Declare(
-            fmt
-            GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-            GIT_TAG        11.1.1
-            GIT_SHALLOW    TRUE
-        )
-        FetchContent_MakeAvailable(fmt)
-    endif()
-    set(IPATOOL_USE_FMT TRUE)   # linked after add_executable below
-else()
-    message(STATUS "std::format available — no fmtlib needed")
-    set(IPATOOL_USE_FMT FALSE)
-endif()
+# Text formatting is provided by the dependency-free ipt::format() in
+# compat_format.h — no std::format / {fmt} needed, so nothing to detect or link
+# here. See that header for why (Apple availability-gating + <chrono> pulling in
+# <format>).
 
 # ── Unicorn Engine (for SAP signing: Apple dylib x86-64 emulation) ────────────
 #
@@ -530,11 +505,6 @@ target_include_directories(ipatool PRIVATE
 
 if(UNICORN_NEEDS_EXTERNAL_BUILD)
     add_dependencies(ipatool unicorn_static_build)
-endif()
-
-if(IPATOOL_USE_FMT)
-    target_link_libraries(ipatool PRIVATE fmt::fmt-header-only)
-    target_compile_definitions(ipatool PRIVATE FMT_HEADER_ONLY=1)
 endif()
 
 # ── SAP asset embedding ───────────────────────────────────────────────────────

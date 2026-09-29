@@ -24,7 +24,7 @@ static constexpr uint64_t kTimeoutUs = 0ULL;
 
 static inline void UCK(uc_err e, const char* w) {
     if (e != UC_ERR_OK)
-        throw std::runtime_error(std::format("{}: {}", w, uc_strerror(e)));
+        throw std::runtime_error(ipt::format("{}: {}", w, uc_strerror(e)));
 }
 static inline uint64_t AlignUp(uint64_t v, uint64_t a) { return (v+a-1)&~(a-1); }
 
@@ -133,14 +133,14 @@ uint64_t StoreAgentMachine::Invoke(uint64_t fn, std::initializer_list<uint64_t> 
 
     uc_err err = uc_emu_start(uc_, fn, kReturnAddr, kTimeoutUs, 0);
     if (err != UC_ERR_OK && !shims_->HasFault())
-        throw std::runtime_error(std::format("uc_emu_start: {}", uc_strerror(err)));
+        throw std::runtime_error(ipt::format("uc_emu_start: {}", uc_strerror(err)));
     if (shims_->HasFault())
         throw std::runtime_error(shims_->TakeFault());
 
     uint64_t rip = 0;
     UCK(uc_reg_read(uc_, UC_X86_REG_RIP, &rip), "read RIP");
     if (rip != kReturnAddr)
-        throw std::runtime_error(std::format("agent stopped at {:#x}", rip));
+        throw std::runtime_error(ipt::format("agent stopped at {:#x}", rip));
 
     uint64_t rax = 0;
     UCK(uc_reg_read(uc_, UC_X86_REG_RAX, &rax), "read RAX");
@@ -220,7 +220,7 @@ uint32_t StoreAgentMachine::InitializeGlobal(std::span<const uint8_t> hardwareID
     ClearScratch();
 
     if (status != 0)
-        throw std::runtime_error(std::format("StoreAgent GlobalInit returned {}", status));
+        throw std::runtime_error(ipt::format("StoreAgent GlobalInit returned {}", status));
     if (!ctx)
         throw std::runtime_error("StoreAgent GlobalInit returned null context");
     return ctx;
@@ -246,7 +246,7 @@ uint64_t StoreAgentMachine::InitializeSession(uint32_t globalCtx,
     ClearScratch();
 
     if (status != 0)
-        throw std::runtime_error(std::format("StoreAgent SessionInit returned {}", status));
+        throw std::runtime_error(ipt::format("StoreAgent SessionInit returned {}", status));
     if (!session)
         throw std::runtime_error("StoreAgent SessionInit returned null session");
     return session;
@@ -259,7 +259,7 @@ uint64_t StoreAgentMachine::InitializeSession(uint32_t globalCtx,
 void StoreAgentMachine::DecryptChunk(uint64_t session, std::span<uint8_t> data) {
     if (data.empty()) return;
     if (data.size() > kChunkSize)
-        throw std::runtime_error(std::format("DecryptChunk: {} > {}", data.size(), kChunkSize));
+        throw std::runtime_error(ipt::format("DecryptChunk: {} > {}", data.size(), kChunkSize));
 
     uint64_t addr = Scratch(data.data(), data.size());
 
@@ -274,7 +274,7 @@ void StoreAgentMachine::DecryptChunk(uint64_t session, std::span<uint8_t> data) 
 
     if (status != 0) {
         ClearScratch();
-        throw std::runtime_error(std::format("StoreAgent decrypt returned {}", status));
+        throw std::runtime_error(ipt::format("StoreAgent decrypt returned {}", status));
     }
 
     // Read decrypted bytes back to host
@@ -291,7 +291,7 @@ void StoreAgentMachine::CloseSession(uint64_t session) {
     int32_t st = static_cast<int32_t>(Invoke(kSessionClose, { session }));
     ClearScratch();
     if (st != 0)
-        throw std::runtime_error(std::format("StoreAgent CloseSession returned {}", st));
+        throw std::runtime_error(ipt::format("StoreAgent CloseSession returned {}", st));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -310,7 +310,7 @@ std::vector<uint8_t> StoreAgentMachine::KBSyncData(uint32_t globalCtx, uint64_t 
     ClearScratch();
 
     if (status != 0)
-        throw std::runtime_error(std::format("FairPlayKBSyncDataWithDSID returned {}", status));
+        throw std::runtime_error(ipt::format("FairPlayKBSyncDataWithDSID returned {}", status));
     if (!ptr || !len)
         throw std::runtime_error("FairPlayKBSyncDataWithDSID returned an empty buffer");
 

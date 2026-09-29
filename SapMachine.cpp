@@ -19,7 +19,7 @@ static constexpr int kArgRegs[6] = {
 
 static inline void UC_CHECK(uc_err err, const char* what) {
     if (err != UC_ERR_OK)
-        throw std::runtime_error(std::format("{}: {}", what, uc_strerror(err)));
+        throw std::runtime_error(ipt::format("{}: {}", what, uc_strerror(err)));
 }
 
 static inline uint64_t AlignUp(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
@@ -84,7 +84,7 @@ uint64_t SapShims::AddFunction(std::string name, Handler handler) {
     if (it != symbols_.end()) return it->second;
 
     if (codeCursor_ + kSlotSize > kShimBase + kShimCodeSize)
-        throw std::runtime_error(std::format("shim code area full (adding {})", name));
+        throw std::runtime_error(ipt::format("shim code area full (adding {})", name));
 
     uint64_t addr = codeCursor_;
     codeCursor_  += kSlotSize;
@@ -104,7 +104,7 @@ uint64_t SapShims::AddData(std::string name, const void* data, size_t len) {
     dataCursor_ = AlignUp(dataCursor_, 8);
     size_t reserved = std::max(len, size_t(8));
     if (dataCursor_ + reserved > kShimBase + kShimSize)
-        throw std::runtime_error(std::format("shim data area full ({})", name));
+        throw std::runtime_error(ipt::format("shim data area full ({})", name));
 
     uint64_t addr = dataCursor_;
     dataCursor_  += reserved;
@@ -137,11 +137,11 @@ void SapShims::HookCallback(uc_engine*, uint64_t addr, uint32_t, void* user) {
 void SapShims::Dispatch(uint64_t addr) {
     auto it = entries_.find(addr);
     if (it == entries_.end()) {
-        Fail(std::format("guest entered unknown shim {:#x}", addr));
+        Fail(ipt::format("guest entered unknown shim {:#x}", addr));
         return;
     }
     try { it->second.second(); }
-    catch (const std::exception& e) { Fail(std::format("{}: {}", it->second.first, e.what())); }
+    catch (const std::exception& e) { Fail(ipt::format("{}: {}", it->second.first, e.what())); }
 }
 
 void SapShims::Fail(std::string msg) {
@@ -203,7 +203,7 @@ std::string SapShims::GuestReadCString(uint64_t a) {
 
 uint64_t SapShims::HeapAlloc(uint64_t size) {
     if (size > kMaxGuestTransfer)
-        throw std::runtime_error(std::format("allocation {} exceeds limit", size));
+        throw std::runtime_error(ipt::format("allocation {} exceeds limit", size));
 
     uint64_t reserved = AlignUp(std::max(size, uint64_t(1)), 16);
 
@@ -237,7 +237,7 @@ void SapShims::HeapFree(uint64_t ptr) {
     if (!ptr) return;
     auto it = allocations_.find(ptr);
     if (it == allocations_.end())
-        throw std::runtime_error(std::format("free unknown pointer {:#x}", ptr));
+        throw std::runtime_error(ipt::format("free unknown pointer {:#x}", ptr));
 
     uint64_t reserved = it->second.reserved;
 
@@ -255,7 +255,7 @@ uint64_t SapShims::HeapRealloc(uint64_t oldPtr, uint64_t newSize) {
 
     auto it = allocations_.find(oldPtr);
     if (it == allocations_.end())
-        throw std::runtime_error(std::format("realloc unknown pointer {:#x}", oldPtr));
+        throw std::runtime_error(ipt::format("realloc unknown pointer {:#x}", oldPtr));
 
     // If new size fits in existing reservation — update in place
     if (newSize <= it->second.reserved) {
@@ -771,7 +771,7 @@ uint64_t SapMachine::Invoke(uint64_t fn, std::initializer_list<uint64_t> args) {
     if (err != UC_ERR_OK) {
         if (shims_->HasFault())
             throw std::runtime_error(shims_->TakeFault());
-        throw std::runtime_error(std::format("uc_emu_start: {}", uc_strerror(err)));
+        throw std::runtime_error(ipt::format("uc_emu_start: {}", uc_strerror(err)));
     }
 
     if (shims_->HasFault())
@@ -780,7 +780,7 @@ uint64_t SapMachine::Invoke(uint64_t fn, std::initializer_list<uint64_t> args) {
     uint64_t rip = 0;
     UC_CHECK(uc_reg_read(uc_, UC_X86_REG_RIP, &rip), "read RIP");
     if (rip != kReturnAddr)
-        throw std::runtime_error(std::format("guest stopped at {:#x}, expected {:#x}", rip, kReturnAddr));
+        throw std::runtime_error(ipt::format("guest stopped at {:#x}, expected {:#x}", rip, kReturnAddr));
 
     uint64_t rax = 0;
     UC_CHECK(uc_reg_read(uc_, UC_X86_REG_RAX, &rax), "read RAX");
@@ -856,7 +856,7 @@ uint64_t SapMachine::Initialize(std::span<const uint8_t> hwID) {
     int32_t  status = static_cast<int32_t>(Invoke(entry_.initialize, { ctxFld, hwAddr }));
     uint64_t ctx    = GuestRead64(ctxFld);
     ClearScratch();
-    if (status != 0) throw std::runtime_error(std::format("Initialize returned {}", status));
+    if (status != 0) throw std::runtime_error(ipt::format("Initialize returned {}", status));
     if (!ctx) throw std::runtime_error("Initialize returned null context");
     return ctx;
 }
@@ -877,7 +877,7 @@ SapMachine::Exchange(uint32_t version, std::span<const uint8_t> hwID,
         inAddr, uint64_t(input.size()),
         outPtrFld, outLenFld, resFld
     }));
-    if (status != 0) { ClearScratch(); throw std::runtime_error(std::format("Exchange returned {}", status)); }
+    if (status != 0) { ClearScratch(); throw std::runtime_error(ipt::format("Exchange returned {}", status)); }
 
     auto out = ConsumeOutput(outPtrFld, outLenFld);
     int32_t result = static_cast<int32_t>(GuestRead32(resFld));
@@ -894,7 +894,7 @@ std::vector<uint8_t> SapMachine::Sign(uint64_t ctx, std::span<const uint8_t> inp
     int32_t status = static_cast<int32_t>(Invoke(entry_.sign, {
         ctx, inAddr, uint64_t(input.size()), outPtrFld, outLenFld
     }));
-    if (status != 0) { ClearScratch(); throw std::runtime_error(std::format("Sign returned {}", status)); }
+    if (status != 0) { ClearScratch(); throw std::runtime_error(ipt::format("Sign returned {}", status)); }
 
     auto sig = ConsumeOutput(outPtrFld, outLenFld);
     ClearScratch();
@@ -906,5 +906,5 @@ void SapMachine::Teardown(uint64_t ctx) {
     BeginCall();
     int32_t st = static_cast<int32_t>(Invoke(entry_.teardown, { ctx }));
     ClearScratch();
-    if (st != 0) throw std::runtime_error(std::format("Teardown returned {}", st));
+    if (st != 0) throw std::runtime_error(ipt::format("Teardown returned {}", st));
 }

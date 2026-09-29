@@ -136,7 +136,7 @@ std::vector<uint8_t> SapPlist::ExtractData(const std::vector<uint8_t>& xmlBytes,
         // Skip whitespace between </key> and <data>
         if (foundKey == key) {
             if (!FindTag(xml, "data", pos, foundData))
-                throw std::runtime_error(std::format("plist: key '{}' has no <data> value", key));
+                throw std::runtime_error(ipt::format("plist: key '{}' has no <data> value", key));
             return SapBase64::Decode(Strip(foundData));
         }
         // Skip whatever value follows (data, string, integer, …)
@@ -154,7 +154,7 @@ std::vector<uint8_t> SapPlist::ExtractData(const std::vector<uint8_t>& xmlBytes,
         size_t c = xml.find(closeTag, end);
         pos = (c != std::string::npos) ? c + closeTag.size() : end + 1;
     }
-    throw std::runtime_error(std::format("plist: key '{}' not found", key));
+    throw std::runtime_error(ipt::format("plist: key '{}' not found", key));
 }
 
 std::vector<uint8_t> SapPlist::MakeData(std::string_view key,
@@ -248,7 +248,7 @@ SapWinHttpClient::SapWinHttpClient(std::wstring userAgent)
                             WINHTTP_NO_PROXY_NAME,
                             WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession_)
-        throw std::runtime_error(std::format("WinHttpOpen failed: {}", GetLastError()));
+        throw std::runtime_error(ipt::format("WinHttpOpen failed: {}", GetLastError()));
 
     // 30-second timeout (matches Go: http.Client{Timeout: 30 * time.Second})
     DWORD timeout = 30000;
@@ -301,20 +301,20 @@ std::vector<uint8_t> SapWinHttpClient::Send(std::string_view method,
     uc.dwSchemeLength  = 1;
 
     if (!WinHttpCrackUrl(wurl.c_str(), (DWORD)wurl.size(), 0, &uc))
-        throw std::runtime_error(std::format("WinHttpCrackUrl: {}", GetLastError()));
+        throw std::runtime_error(ipt::format("WinHttpCrackUrl: {}", GetLastError()));
 
     bool isHttps = (uc.nScheme == INTERNET_SCHEME_HTTPS);
     DWORD port   = uc.nPort ? uc.nPort : (isHttps ? 443 : 80);
 
     HINTERNET hConn = WinHttpConnect(hSession_, host, (INTERNET_PORT)port, 0);
-    if (!hConn) throw std::runtime_error(std::format("WinHttpConnect: {}", GetLastError()));
+    if (!hConn) throw std::runtime_error(ipt::format("WinHttpConnect: {}", GetLastError()));
 
     DWORD flags = isHttps ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hReq = WinHttpOpenRequest(hConn, ToWide(method).c_str(),
                                          path, nullptr,
                                          WINHTTP_NO_REFERER,
                                          WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hReq) { WinHttpCloseHandle(hConn); throw std::runtime_error(std::format("WinHttpOpenRequest: {}", GetLastError())); }
+    if (!hReq) { WinHttpCloseHandle(hConn); throw std::runtime_error(ipt::format("WinHttpOpenRequest: {}", GetLastError())); }
 
     // Set Content-Type header if present
     if (!contentType.empty()) {
@@ -355,12 +355,12 @@ std::vector<uint8_t> SapWinHttpClient::Send(std::string_view method,
     DWORD sendErr = GetLastError();
     if (!sent) {
         WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
-        throw std::runtime_error(std::format("WinHttpSendRequest failed: {}", sendErr));
+        throw std::runtime_error(ipt::format("WinHttpSendRequest failed: {}", sendErr));
     }
     if (!WinHttpReceiveResponse(hReq, nullptr)) {
         DWORD recvErr = GetLastError();
         WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
-        throw std::runtime_error(std::format("WinHttpReceiveResponse failed: {}", recvErr));
+        throw std::runtime_error(ipt::format("WinHttpReceiveResponse failed: {}", recvErr));
     }
 
     // Raw header block (request or response) as UTF-8, for --debug
@@ -410,7 +410,7 @@ std::vector<uint8_t> SapWinHttpClient::Send(std::string_view method,
 
     if (statusCode != 200) {
         WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
-        throw std::runtime_error(std::format("Apple returned HTTP {}", statusCode));
+        throw std::runtime_error(ipt::format("Apple returned HTTP {}", statusCode));
     }
 
     WinHttpCloseHandle(hReq);
@@ -502,7 +502,7 @@ static std::vector<uint8_t> curl_request(
     if (res != CURLE_OK)
         throw std::runtime_error(std::string("curl: ") + curl_easy_strerror(res));
     if (resp.statusCode != 200)
-        throw std::runtime_error(std::format("Apple returned HTTP {}", resp.statusCode));
+        throw std::runtime_error(ipt::format("Apple returned HTTP {}", resp.statusCode));
 
     return resp.body;
 }
@@ -573,7 +573,7 @@ std::unique_ptr<SapSigner> SapSigner::Create(
 {
     // Validate config
     if (config.version != kSupportedVersion)
-        throw std::runtime_error(std::format("unsupported SAP version {}", config.version));
+        throw std::runtime_error(ipt::format("unsupported SAP version {}", config.version));
     if (config.hardwareID.empty() || config.hardwareID.size() > 20)
         throw std::runtime_error("SAP hardware ID must be 1-20 bytes");
     if (config.setupURL.empty() || config.setupURL.substr(0, 8) != "https://")
@@ -610,7 +610,7 @@ std::unique_ptr<SapSigner> SapSigner::Create(
     // 4. First Exchange: machine → request bytes, state must be 1
     auto [request, state1] = machine->Exchange(config.version, config.hardwareID, ctx, cert);
     if (state1 != 1)
-        throw std::runtime_error(std::format("SAP setup entered unexpected state {}", state1));
+        throw std::runtime_error(ipt::format("SAP setup entered unexpected state {}", state1));
     if (request.empty())
         throw std::runtime_error("SAP setup message is empty");
 
@@ -620,7 +620,7 @@ std::unique_ptr<SapSigner> SapSigner::Create(
     // 6. Second Exchange: complete handshake, state must be 0
     auto [_, state2] = machine->Exchange(config.version, config.hardwareID, ctx, reply);
     if (state2 != 0)
-        throw std::runtime_error(std::format("SAP setup completed in unexpected state {}", state2));
+        throw std::runtime_error(ipt::format("SAP setup completed in unexpected state {}", state2));
 
     // 7. All good — build the signer
     auto s       = std::unique_ptr<SapSigner>(new SapSigner());
@@ -693,7 +693,7 @@ std::vector<uint8_t> SapSigner::HardwareIDFromMAC(std::string_view mac) {
         i += 2;
     }
     if (result.empty() || result.size() > 20)
-        throw std::runtime_error(std::format("invalid MAC address: '{}'", mac));
+        throw std::runtime_error(ipt::format("invalid MAC address: '{}'", mac));
     return result;
 }
 

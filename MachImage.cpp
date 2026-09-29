@@ -156,7 +156,7 @@ static inline uint64_t AlignUp(uint64_t v, uint64_t a) {
 
 std::unique_ptr<MachImage> MachImage::Open(std::string name, std::vector<uint8_t> data) {
     if (data.size() < 4)
-        throw std::runtime_error(std::format("MachImage::Open({}): file too small", name));
+        throw std::runtime_error(ipt::format("MachImage::Open({}): file too small", name));
 
     auto img = std::unique_ptr<MachImage>(new MachImage());
     img->name_ = std::move(name);
@@ -214,20 +214,20 @@ void MachImage::ParseLoadCommands() {
     size_t total        = data_.size();
 
     if (total < sizeof(mach_header_64))
-        throw std::runtime_error(std::format("{}: too small", name_));
+        throw std::runtime_error(ipt::format("{}: too small", name_));
 
     mach_header_64 mh;
     std::memcpy(&mh, base, sizeof(mh));
 
     if (mh.magic != MH_MAGIC_64)
-        throw std::runtime_error(std::format("{}: not a 64-bit Mach-O (magic={:#x})", name_, mh.magic));
+        throw std::runtime_error(ipt::format("{}: not a 64-bit Mach-O (magic={:#x})", name_, mh.magic));
     if ((mh.cputype & 0x00FFFFFFu) != (CPU_TYPE_X86_64 & 0x00FFFFFFu))
-        throw std::runtime_error(std::format("{}: not x86-64", name_));
+        throw std::runtime_error(ipt::format("{}: not x86-64", name_));
 
     const uint8_t* lc_ptr = base + sizeof(mach_header_64);
     const uint8_t* lc_end = lc_ptr + mh.sizeofcmds;
     if (lc_end > base + total)
-        throw std::runtime_error(std::format("{}: load commands extend past file", name_));
+        throw std::runtime_error(ipt::format("{}: load commands extend past file", name_));
 
     // Pointers to deferred sections (export trie, dyld info, symtab)
     const uint8_t* rebaseOpcodes    = nullptr; uint32_t rebaseSize    = 0;
@@ -244,7 +244,7 @@ void MachImage::ParseLoadCommands() {
         std::memcpy(&lc, lc_ptr, sizeof(lc));
 
         if (lc.cmdsize < sizeof(load_command) || lc_ptr + lc.cmdsize > lc_end)
-            throw std::runtime_error(std::format("{}: malformed load command", name_));
+            throw std::runtime_error(ipt::format("{}: malformed load command", name_));
 
         if (lc.cmd == LC_SEGMENT_64) {
             segment_command_64 sc;
@@ -259,9 +259,9 @@ void MachImage::ParseLoadCommands() {
 
             // Validate
             if (seg.fileSize > seg.vmSize)
-                throw std::runtime_error(std::format("{}: segment {} file > mem", name_, seg.name));
+                throw std::runtime_error(ipt::format("{}: segment {} file > mem", name_, seg.name));
             if (seg.fileOff + seg.fileSize > total)
-                throw std::runtime_error(std::format("{}: segment {} beyond EOF", name_, seg.name));
+                throw std::runtime_error(ipt::format("{}: segment {} beyond EOF", name_, seg.name));
 
             // Image base = vmaddr of first non-__PAGEZERO segment
             if (firstText && seg.name != "__PAGEZERO") {
@@ -278,7 +278,7 @@ void MachImage::ParseLoadCommands() {
             auto SafePtr = [&](uint32_t off, uint32_t sz) -> const uint8_t* {
                 if (sz == 0) return nullptr;
                 if (uint64_t(off) + sz > total)
-                    throw std::runtime_error(std::format("{}: dyld_info out of bounds", name_));
+                    throw std::runtime_error(ipt::format("{}: dyld_info out of bounds", name_));
                 return base + off;
             };
 
@@ -336,13 +336,13 @@ void MachImage::ParseRebaseOpcodes(const uint8_t* start, size_t len) {
 
     auto CurrentSegName = [&]() -> const std::string& {
         if (segIdx < 0 || segIdx >= static_cast<int>(segments_.size()))
-            throw std::runtime_error(std::format("{}: rebase: invalid segment index {}", name_, segIdx));
+            throw std::runtime_error(ipt::format("{}: rebase: invalid segment index {}", name_, segIdx));
         return segments_[segIdx].name;
     };
 
     auto EmitRebase = [&]() {
         if (type != 1 /*REBASE_TYPE_POINTER*/)
-            throw std::runtime_error(std::format("{}: unsupported rebase type {}", name_, type));
+            throw std::runtime_error(ipt::format("{}: unsupported rebase type {}", name_, type));
         // Read original pointer value from data[]
         uint64_t fileOff = SegmentFileOffset(CurrentSegName(), offset, POINTER_SIZE);
         uint64_t origVal = ReadPointer(fileOff);
@@ -389,7 +389,7 @@ void MachImage::ParseRebaseOpcodes(const uint8_t* start, size_t len) {
             break;
         }
         default:
-            throw std::runtime_error(std::format("{}: unknown rebase opcode {:#x}", name_, opcode));
+            throw std::runtime_error(ipt::format("{}: unknown rebase opcode {:#x}", name_, opcode));
         }
     }
 }
@@ -408,13 +408,13 @@ void MachImage::ParseBindOpcodes(const uint8_t* start, size_t len, bool isLazy) 
 
     auto CurrentSegName = [&]() -> const std::string& {
         if (segIdx < 0 || segIdx >= static_cast<int>(segments_.size()))
-            throw std::runtime_error(std::format("{}: bind: invalid segment {}", name_, segIdx));
+            throw std::runtime_error(ipt::format("{}: bind: invalid segment {}", name_, segIdx));
         return segments_[segIdx].name;
     };
 
     auto EmitBind = [&]() {
         if (symName.empty())
-            throw std::runtime_error(std::format("{}: bind: empty symbol name", name_));
+            throw std::runtime_error(ipt::format("{}: bind: empty symbol name", name_));
         binds_.push_back({ CurrentSegName(), offset, symName, addend });
     };
 
@@ -476,7 +476,7 @@ void MachImage::ParseBindOpcodes(const uint8_t* start, size_t len, bool isLazy) 
             break;
         }
         default:
-            throw std::runtime_error(std::format("{}: unknown bind opcode {:#x}", name_, opcode));
+            throw std::runtime_error(ipt::format("{}: unknown bind opcode {:#x}", name_, opcode));
         }
     }
 }
@@ -554,11 +554,11 @@ void MachImage::ParseSymtab(const uint8_t* syms, uint32_t nsyms,
 uint64_t MachImage::Export(std::string_view symbol, uint64_t loadBase) const {
     auto it = exports_.find(std::string(symbol));
     if (it == exports_.end())
-        throw std::runtime_error(std::format("{}: symbol not found: {}", name_, symbol));
+        throw std::runtime_error(ipt::format("{}: symbol not found: {}", name_, symbol));
 
     uint64_t vmAddr = it->second;
     if (vmAddr < imageBase_)
-        throw std::runtime_error(std::format("{}: symbol {} precedes image base", name_, symbol));
+        throw std::runtime_error(ipt::format("{}: symbol {} precedes image base", name_, symbol));
 
     return loadBase + (vmAddr - imageBase_);
 }
@@ -568,12 +568,12 @@ uint64_t MachImage::Export(std::string_view symbol, uint64_t loadBase) const {
 void MachImage::Relocate(uint64_t loadBase,
                           std::function<uint64_t(std::string_view)> resolve) {
     if (relocated_)
-        throw std::runtime_error(std::format("{}: already relocated", name_));
+        throw std::runtime_error(ipt::format("{}: already relocated", name_));
 
     // Apply rebases: pointer value is currently in-image vmAddr, slide it.
     for (const auto& r : rebases_) {
         if (r.origValue < imageBase_)
-            throw std::runtime_error(std::format("{}: rebase value below image base", name_));
+            throw std::runtime_error(ipt::format("{}: rebase value below image base", name_));
 
         uint64_t newAddr = loadBase + (r.origValue - imageBase_);
         uint64_t fileOff = SegmentFileOffset(r.segment, r.offset, POINTER_SIZE);
@@ -591,7 +591,7 @@ void MachImage::Relocate(uint64_t loadBase,
         } else {
             uint64_t mag = static_cast<uint64_t>(-(b.addend + 1)) + 1;
             if (mag > symAddr)
-                throw std::runtime_error(std::format("{}: bind addend underflow for {}", name_, b.symbolName));
+                throw std::runtime_error(ipt::format("{}: bind addend underflow for {}", name_, b.symbolName));
             finalAddr = symAddr - mag;
         }
 
@@ -607,23 +607,23 @@ void MachImage::Relocate(uint64_t loadBase,
 
 void MachImage::Load(uc_engine* uc) const {
     if (!relocated_)
-        throw std::runtime_error(std::format("{}: must be relocated before Load()", name_));
+        throw std::runtime_error(ipt::format("{}: must be relocated before Load()", name_));
 
     // Calculate span: max (vmAddr + vmSize - imageBase) over all loadable segments.
     uint64_t span = 0;
     for (const auto& s : segments_) {
         if (s.name == "__PAGEZERO" || s.vmSize == 0) continue;
         if (s.vmAddr < imageBase_)
-            throw std::runtime_error(std::format("{}: segment {} below image base", name_, s.name));
+            throw std::runtime_error(ipt::format("{}: segment {} below image base", name_, s.name));
         span = std::max(span, s.vmAddr - imageBase_ + s.vmSize);
     }
     span = AlignUp(span, PAGE_SIZE);
     if (span == 0)
-        throw std::runtime_error(std::format("{}: no loadable segments", name_));
+        throw std::runtime_error(ipt::format("{}: no loadable segments", name_));
 
     uc_err err = uc_mem_map(uc, loadedBase_, span, UC_PROT_ALL);
     if (err != UC_ERR_OK)
-        throw std::runtime_error(std::format("{}: uc_mem_map failed: {}", name_, uc_strerror(err)));
+        throw std::runtime_error(ipt::format("{}: uc_mem_map failed: {}", name_, uc_strerror(err)));
 
     for (const auto& s : segments_) {
         if (s.name == "__PAGEZERO" || s.fileSize == 0) continue;
@@ -632,7 +632,7 @@ void MachImage::Load(uc_engine* uc) const {
         err = uc_mem_write(uc, guestAddr,
                            data_.data() + s.fileOff, s.fileSize);
         if (err != UC_ERR_OK)
-            throw std::runtime_error(std::format("{}: uc_mem_write segment {} failed: {}",
+            throw std::runtime_error(ipt::format("{}: uc_mem_write segment {} failed: {}",
                                                   name_, s.name, uc_strerror(err)));
     }
 }
@@ -645,30 +645,30 @@ uint64_t MachImage::SegmentFileOffset(std::string_view segName,
         if (s.name != segName) continue;
 
         if (offset + size > s.vmSize)
-            throw std::runtime_error(std::format("{}: fixup at {:#x} exceeds segment {}",
+            throw std::runtime_error(ipt::format("{}: fixup at {:#x} exceeds segment {}",
                                                   name_, offset, segName));
         if (offset + size > s.fileSize)
-            throw std::runtime_error(std::format("{}: fixup at {:#x} past file data in {}",
+            throw std::runtime_error(ipt::format("{}: fixup at {:#x} past file data in {}",
                                                   name_, offset, segName));
 
         uint64_t result = s.fileOff + offset;
         if (result + size > data_.size())
-            throw std::runtime_error(std::format("{}: fixup at {:#x} beyond EOF", name_, result));
+            throw std::runtime_error(ipt::format("{}: fixup at {:#x} beyond EOF", name_, result));
 
         return result;
     }
-    throw std::runtime_error(std::format("{}: fixup references unknown segment {}", name_, segName));
+    throw std::runtime_error(ipt::format("{}: fixup references unknown segment {}", name_, segName));
 }
 
 void MachImage::PutPointer(uint64_t fileOffset, uint64_t value) {
     if (fileOffset + 8 > data_.size())
-        throw std::runtime_error(std::format("{}: PutPointer at {:#x} beyond EOF", name_, fileOffset));
+        throw std::runtime_error(ipt::format("{}: PutPointer at {:#x} beyond EOF", name_, fileOffset));
     std::memcpy(data_.data() + fileOffset, &value, 8);
 }
 
 uint64_t MachImage::ReadPointer(uint64_t fileOffset) const {
     if (fileOffset + 8 > data_.size())
-        throw std::runtime_error(std::format("{}: ReadPointer at {:#x} beyond EOF", name_, fileOffset));
+        throw std::runtime_error(ipt::format("{}: ReadPointer at {:#x} beyond EOF", name_, fileOffset));
     uint64_t v;
     std::memcpy(&v, data_.data() + fileOffset, 8);
     return v;
