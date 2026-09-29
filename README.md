@@ -186,7 +186,7 @@ Verify with `ldd build/ipatool` — should show only `linux-vdso.so.1`, `libc.so
 ## Building on macOS
 
 ```sh
-brew install curl nlohmann-json minizip openssl unicorn
+brew install curl nlohmann-json minizip openssl@3 unicorn fmt
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
       -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
@@ -196,10 +196,16 @@ cmake --build build
 
 IOKit and CoreFoundation are built into macOS — no extra dependencies needed for machine ID.
 
-### Native Apple silicon (arm64) build — recommended
+> **`fmt`** is needed only when Apple clang has no `std::format` — i.e. Xcode < 15
+> or a deployment target below 13.3 (see the Intel/Catalina section). With a newer
+> Xcode and target 13.3+, `std::format` is built in and `fmt` is unused. If `fmt`
+> is absent when needed, CMake builds it from source automatically, so it's
+> optional — installing it just skips that extra build.
+
+### Native arm64 build (Apple silicon)
 
 ```sh
-brew install openssl@3 minizip nlohmann-json unicorn pkg-config
+brew install openssl@3 minizip nlohmann-json unicorn pkg-config fmt
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
       -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
@@ -208,12 +214,33 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build
 ```
 
-> Build **native arm64** on Apple silicon. Unicorn emulates the x86-64 guest dylibs regardless of the host architecture, so there is no need to build an Intel host binary. An x86-64 host binary run under Rosetta double-emulates Unicorn's JIT and is many times slower.
+> On Apple silicon, target **native arm64** rather than an Intel (x86-64) host
+> binary. This is a CPU-architecture choice, independent of the dynamic-vs-static
+> options below. Unicorn emulates the x86-64 guest dylibs regardless of the host
+> architecture, so an Intel host binary buys nothing — and run under Rosetta it
+> double-emulates Unicorn's JIT and is many times slower. (On a real Intel Mac,
+> use the Intel section below instead.)
+
+### Static build (Apple silicon, arm64)
+
+```sh
+brew install openssl@3 minizip nlohmann-json unicorn pkg-config fmt
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
+      -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
+      -DCMAKE_OSX_ARCHITECTURES=arm64 \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
+cmake --build build
+```
+
+Deployment target 13.3 gives Apple clang native `std::format` (no fmtlib), at
+the cost of requiring macOS 13.3+ to run. Lower it (e.g. 11.0) for wider
+compatibility — the build then uses the bundled fmtlib fallback automatically.
 
 ### Static build on macOS Catalina (Intel)
 
 ```sh
-brew install openssl@3 minizip nlohmann-json unicorn pkg-config
+brew install openssl@3 minizip nlohmann-json unicorn pkg-config fmt
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
       -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
@@ -370,13 +397,15 @@ ipatool auth revoke
 Default output is human-readable text with colors (when stdout is a TTY):
 
 ```
-10:32:15 INF name=John Appleseed email=john@example.com success=true
+10:32:15 INF name=John Appleseed email=john@example.com storefront=US success=true
 ```
 
 With `--format json`:
 ```json
-{"name":"John Appleseed","email":"john@example.com","success":true}
+{"name":"John Appleseed","email":"john@example.com","storefront":"US","success":true}
 ```
+
+(`auth login` and `auth info` include `storefront` — the account's country code.)
 
 Colors are disabled automatically when output is piped. On Windows 7/8 the legacy Console API is used for colors; on Windows 10+ ANSI escape codes are used.
 

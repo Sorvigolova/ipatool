@@ -245,6 +245,12 @@ if(NOT minizip_FOUND)
             add_library(minizip::minizip INTERFACE IMPORTED)
             target_include_directories(minizip::minizip INTERFACE ${MINIZIP_INCLUDE_DIRS})
             target_link_libraries(minizip::minizip INTERFACE ${MINIZIP_LIBRARIES})
+            # pkg-config gives the library NAME (-lminizip) but not its -L path.
+            # On Apple Silicon Homebrew lives in /opt/homebrew/lib, which the
+            # linker does not search by default (unlike Intel's /usr/local/lib),
+            # so add the directory explicitly — otherwise the link fails with
+            # "ld: library 'minizip' not found".
+            target_link_directories(minizip::minizip INTERFACE ${MINIZIP_LIBRARY_DIRS})
             set(minizip_FOUND TRUE)
         endif()
     endif()
