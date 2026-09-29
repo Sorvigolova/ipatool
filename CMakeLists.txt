@@ -240,17 +240,15 @@ endif()
 if(NOT minizip_FOUND)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
-        pkg_check_modules(MINIZIP QUIET minizip)
+        # IMPORTED_TARGET makes pkg-config resolve full library paths into the
+        # PkgConfig::MINIZIP target, so no -L search is needed. Plain
+        # pkg_check_modules only yields the bare name (-lminizip) without a path,
+        # which fails to link on Apple Silicon (Homebrew lives in
+        # /opt/homebrew/lib, not searched by default): "ld: library 'minizip' not found".
+        pkg_check_modules(MINIZIP QUIET IMPORTED_TARGET minizip)
         if(MINIZIP_FOUND)
             add_library(minizip::minizip INTERFACE IMPORTED)
-            target_include_directories(minizip::minizip INTERFACE ${MINIZIP_INCLUDE_DIRS})
-            target_link_libraries(minizip::minizip INTERFACE ${MINIZIP_LIBRARIES})
-            # pkg-config gives the library NAME (-lminizip) but not its -L path.
-            # On Apple Silicon Homebrew lives in /opt/homebrew/lib, which the
-            # linker does not search by default (unlike Intel's /usr/local/lib),
-            # so add the directory explicitly — otherwise the link fails with
-            # "ld: library 'minizip' not found".
-            target_link_directories(minizip::minizip INTERFACE ${MINIZIP_LIBRARY_DIRS})
+            target_link_libraries(minizip::minizip INTERFACE PkgConfig::MINIZIP)
             set(minizip_FOUND TRUE)
         endif()
     endif()
