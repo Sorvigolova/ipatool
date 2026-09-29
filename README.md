@@ -213,7 +213,7 @@ cmake --build build
 ### Static build (Apple silicon, arm64)
 
 ```sh
-brew install minizip nlohmann-json unicorn pkg-config
+brew install nlohmann-json unicorn pkg-config
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
       -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -226,18 +226,19 @@ every Apple silicon Mac. The deployment target no longer affects text
 formatting (the project uses its own `ipt::format()`, not `std::format`), so
 you may raise or lower it freely within Apple silicon's supported range.
 
-> **OpenSSL is built from source** for the static build (targeting the same
-> arch and deployment target), so Homebrew's `openssl@3` is *not* needed and
-> `-DOPENSSL_ROOT_DIR` is unnecessary. This avoids Homebrew's bottle — compiled
-> for the build machine's macOS — producing "built for newer macOS version"
-> linker warnings and an unclean `minos`. The first configure downloads and
-> compiles OpenSSL (a few minutes); override the version with
-> `-DOPENSSL_VERSION=<x.y.z>` if desired.
+> **OpenSSL and minizip are built from source** for the static build, targeting
+> the same arch and deployment target, so Homebrew's `openssl@3` and `minizip`
+> are *not* needed (nor is `-DOPENSSL_ROOT_DIR`). This avoids Homebrew's
+> bottles — compiled for the build machine's macOS — producing "built for newer
+> macOS version" linker warnings and an unclean `minos`. The first configure
+> downloads and compiles them (a few minutes, cached afterwards); override the
+> versions with `-DOPENSSL_VERSION=<x.y.z>` / `-DZLIB_VERSION=<x.y.z>` if
+> desired. minizip links against the system `libz` (present on every Mac).
 
 ### Static build on macOS Catalina (Intel)
 
 ```sh
-brew install minizip nlohmann-json unicorn pkg-config
+brew install nlohmann-json unicorn pkg-config
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
       -DCMAKE_OSX_ARCHITECTURES=x86_64 \

@@ -90,6 +90,46 @@ if(STATIC_BUILD AND NOT WIN32)
         set(_openssl_prefix    "${OSSL_INSTALL_DIR}")
         set(_curl_openssl_flag --with-openssl=${_openssl_prefix})
         message(STATUS "Static curl build will use our OpenSSL at: ${_openssl_prefix}")
+
+        # ── minizip from source (macOS static) ───────────────────────────────
+        # Same story as OpenSSL: Homebrew's libminizip.a is built for the build
+        # machine's macOS. The project uses the *classic* minizip API
+        # (<minizip/zip.h>, zipOpen/unzOpen/…), which is just three C files in
+        # zlib's contrib/minizip. Compile them ourselves for the exact arch +
+        # deployment target against the system libz, and install headers under
+        # include/minizip/ so the existing #include <minizip/zip.h> resolves.
+        set(ZLIB_VERSION "1.3.1" CACHE STRING
+            "zlib version whose contrib/minizip is built for the macOS static build")
+
+        set(_mz_archflags "")
+        foreach(_a ${CMAKE_OSX_ARCHITECTURES})
+            list(APPEND _mz_archflags -arch ${_a})
+        endforeach()
+        set(_mz_minflag "")
+        if(DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET)
+            set(_mz_minflag -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET})
+        endif()
+
+        message(STATUS "Static build will compile minizip (zlib ${ZLIB_VERSION} contrib) from source")
+        ExternalProject_Add(minizip_static
+            URL https://github.com/madler/zlib/archive/refs/tags/v${ZLIB_VERSION}.tar.gz
+            ${_ep_timestamp_opt}
+            CONFIGURE_COMMAND ""
+            BUILD_IN_SOURCE 1
+            BUILD_COMMAND
+                    cc ${_mz_archflags} ${_mz_minflag} -O2 -I<SOURCE_DIR> -I<SOURCE_DIR>/contrib/minizip -c contrib/minizip/ioapi.c -o ioapi.o
+            COMMAND cc ${_mz_archflags} ${_mz_minflag} -O2 -I<SOURCE_DIR> -I<SOURCE_DIR>/contrib/minizip -c contrib/minizip/zip.c   -o zip.o
+            COMMAND cc ${_mz_archflags} ${_mz_minflag} -O2 -I<SOURCE_DIR> -I<SOURCE_DIR>/contrib/minizip -c contrib/minizip/unzip.c -o unzip.o
+            COMMAND ar rcs libminizip.a ioapi.o zip.o unzip.o
+            INSTALL_COMMAND ${CMAKE_COMMAND} -E make_directory <INSTALL_DIR>/lib
+            COMMAND ${CMAKE_COMMAND} -E make_directory <INSTALL_DIR>/include/minizip
+            COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/libminizip.a          <INSTALL_DIR>/lib/libminizip.a
+            COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/contrib/minizip/zip.h   <INSTALL_DIR>/include/minizip/zip.h
+            COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/contrib/minizip/unzip.h <INSTALL_DIR>/include/minizip/unzip.h
+            COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/contrib/minizip/ioapi.h <INSTALL_DIR>/include/minizip/ioapi.h
+        )
+        ExternalProject_Get_Property(minizip_static INSTALL_DIR)
+        set(MZIP_INSTALL_DIR "${INSTALL_DIR}")
     else()
         # Linux: system OpenSSL -dev package (its libs already match the target).
         find_package(OpenSSL REQUIRED)
@@ -310,6 +350,10 @@ endif()
 if(minizip_FOUND)
     message(STATUS "minizip found — full ZIP patching enabled")
     add_compile_definitions(HAVE_MINIZIP)
+elseif(STATIC_BUILD AND APPLE)
+    # Built from source further below (with HAVE_MINIZIP forced on the target),
+    # so the "not found" warning would be misleading here.
+    message(STATUS "minizip will be built from source (macOS static)")
 else()
     if(WIN32)
         message(WARNING
@@ -707,19 +751,15 @@ if(STATIC_BUILD AND APPLE)
     add_dependencies(ipatool openssl_static)
     target_include_directories(ipatool PRIVATE "${OSSL_INSTALL_DIR}/include")
 
-    find_program(BREW_EXECUTABLE brew)
-    if(BREW_EXECUTABLE)
-        execute_process(
-            COMMAND ${BREW_EXECUTABLE} --prefix minizip
-            OUTPUT_VARIABLE _minizip_prefix
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-    endif()
-    if(_minizip_prefix AND EXISTS "${_minizip_prefix}/lib/libminizip.a")
-        set(MINIZIP_STATIC "${_minizip_prefix}/lib/libminizip.a")
-        target_include_directories(ipatool PRIVATE "${_minizip_prefix}/include")
-    endif()
+    # minizip was also built from source (see top of file); reference its install
+    # paths directly and depend on the target. HAVE_MINIZIP is normally set at
+    # configure time from a found system/brew minizip — force it on here since we
+    # supply our own and no brew minizip need be installed. (add_compile_definitions
+    # wouldn't reach the already-created ipatool target, so use the target form.)
+    set(MINIZIP_STATIC "${MZIP_INSTALL_DIR}/lib/libminizip.a")
+    add_dependencies(ipatool minizip_static)
+    target_include_directories(ipatool PRIVATE "${MZIP_INSTALL_DIR}/include")
+    target_compile_definitions(ipatool PRIVATE HAVE_MINIZIP)
 
     message(STATUS "Static OpenSSL SSL:    ${OPENSSL_SSL_STATIC}")
     message(STATUS "Static OpenSSL Crypto: ${OPENSSL_CRYPTO_STATIC}")
