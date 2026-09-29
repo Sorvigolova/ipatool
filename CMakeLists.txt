@@ -29,37 +29,70 @@ if(STATIC_BUILD AND NOT WIN32)
     set(BUILD_SHARED_LIBS OFF)
 
     include(ExternalProject)
-    find_package(OpenSSL REQUIRED)
 
-    # On macOS, curl's configure needs an explicit --with-openssl=<path> —
-    # plain --with-openssl doesn't reliably find Homebrew's keg-only
-    # openssl@3 (it's not on the default search path on purpose, to avoid
-    # clashing with the system's old/absent OpenSSL headers).
-    # On Linux, bare --with-openssl auto-detects the system -dev package fine.
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+        set(_ep_timestamp_opt DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    else()
+        set(_ep_timestamp_opt "")
+    endif()
+
+    # curl's configure gets --with-openssl. On Linux, bare --with-openssl
+    # auto-detects the system -dev package fine. On macOS we build OpenSSL from
+    # source (below) and point curl at that same build.
     set(_curl_openssl_flag --with-openssl)
+
     if(APPLE)
-        if(DEFINED OPENSSL_ROOT_DIR AND EXISTS "${OPENSSL_ROOT_DIR}")
-            set(_openssl_prefix "${OPENSSL_ROOT_DIR}")
+        # ── OpenSSL from source (macOS static) ───────────────────────────────
+        # Homebrew's openssl@3 bottle is compiled for the build machine's macOS,
+        # so linking it into an older -mmacosx-version-min target yields
+        # "object file was built for newer macOS version" warnings and an
+        # unclean minos. Build OpenSSL ourselves for the exact arch + deployment
+        # target, then feed that build to curl's configure AND to the final link
+        # — self-contained, no Homebrew openssl needed. Override the version with
+        # -DOPENSSL_VERSION=<x.y.z> if the default 404s or you want a newer one.
+        set(OPENSSL_VERSION "3.5.7" CACHE STRING
+            "OpenSSL version to build from source for the macOS static build")
+
+        if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+            set(_ossl_target darwin64-arm64-cc)
+        elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+            set(_ossl_target darwin64-x86_64-cc)
+        elseif(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
+            set(_ossl_target darwin64-arm64-cc)
         else()
-            find_program(BREW_EXECUTABLE brew)
-            if(BREW_EXECUTABLE)
-                execute_process(
-                    COMMAND ${BREW_EXECUTABLE} --prefix openssl@3
-                    OUTPUT_VARIABLE _openssl_prefix
-                    OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET
-                )
-            endif()
+            set(_ossl_target darwin64-x86_64-cc)
         endif()
-        if(_openssl_prefix AND EXISTS "${_openssl_prefix}")
-            message(STATUS "Static curl build will use OpenSSL at: ${_openssl_prefix}")
-            set(_curl_openssl_flag --with-openssl=${_openssl_prefix})
-        else()
-            message(WARNING
-                "Could not locate Homebrew's openssl@3 for the static curl build. "
-                "Pass -DOPENSSL_ROOT_DIR=<path> explicitly, or run "
-                "'brew install openssl@3' first.")
+
+        # OpenSSL's Configure appends trailing tokens as extra compiler flags, so
+        # -mmacosx-version-min lands on every .o exactly like it does for curl.
+        set(_ossl_extra_flags "")
+        if(DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET)
+            set(_ossl_extra_flags -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET})
         endif()
+
+        message(STATUS "Static build will compile OpenSSL ${OPENSSL_VERSION} (${_ossl_target}) from source")
+        ExternalProject_Add(openssl_static
+            URL https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz
+            ${_ep_timestamp_opt}
+            CONFIGURE_COMMAND
+                <SOURCE_DIR>/Configure ${_ossl_target}
+                    no-shared no-tests
+                    --prefix=<INSTALL_DIR>
+                    --openssldir=<INSTALL_DIR>/ssl
+                    --libdir=lib
+                    ${_ossl_extra_flags}
+            BUILD_COMMAND   $(MAKE)
+            INSTALL_COMMAND $(MAKE) install_sw
+            BUILD_IN_SOURCE 1
+        )
+        ExternalProject_Get_Property(openssl_static INSTALL_DIR)
+        set(OSSL_INSTALL_DIR   "${INSTALL_DIR}")
+        set(_openssl_prefix    "${OSSL_INSTALL_DIR}")
+        set(_curl_openssl_flag --with-openssl=${_openssl_prefix})
+        message(STATUS "Static curl build will use our OpenSSL at: ${_openssl_prefix}")
+    else()
+        # Linux: system OpenSSL -dev package (its libs already match the target).
+        find_package(OpenSSL REQUIRED)
     endif()
 
     # curl's configure is a separate autotools build invoked via
@@ -120,6 +153,12 @@ if(STATIC_BUILD AND NOT WIN32)
         INSTALL_COMMAND $(MAKE) install
         BUILD_IN_SOURCE 0
     )
+
+    # On macOS curl must configure/link against the OpenSSL we just built, so
+    # openssl_static has to finish (build + install) before curl starts.
+    if(APPLE)
+        add_dependencies(curl_static openssl_static)
+    endif()
 
     ExternalProject_Get_Property(curl_static INSTALL_DIR)
     set(STATIC_CURL_INCLUDE "${INSTALL_DIR}/include")
@@ -292,7 +331,11 @@ if(STATIC_BUILD AND WIN32)
     set(OPENSSL_USE_STATIC_LIBS TRUE)
     set(OPENSSL_MSVC_STATIC_RT TRUE)
 endif()
-find_package(OpenSSL REQUIRED)
+# macOS static builds OpenSSL from source (see top of file) and links its .a
+# directly, so it needs neither a system/brew OpenSSL nor the CMake targets.
+if(NOT (STATIC_BUILD AND APPLE))
+    find_package(OpenSSL REQUIRED)
+endif()
 
 # MinGW static: link libcrypto.a directly (our AES/SHA only; curl uses Schannel,
 # so libssl is not needed). find_package may hand back the .dll.a import lib, so
@@ -651,17 +694,18 @@ if(STATIC_BUILD AND APPLE AND NOT UNICORN_NEEDS_EXTERNAL_BUILD)
 endif() # if(STATIC_BUILD AND APPLE AND NOT UNICORN_NEEDS_EXTERNAL_BUILD)
 
 if(STATIC_BUILD AND APPLE)
-    # Force static versions of OpenSSL/minizip via their Homebrew prefixes.
+    # OpenSSL was built from source at the top of this file. Its static libs are
+    # produced at BUILD time, so we can't find_library() them now (they don't
+    # exist yet at configure time) — reference the install paths directly and
+    # make ipatool depend on openssl_static so it's compiled/installed first.
+    # Its headers also come from there (no brew openssl on the include path).
     # zlib is left dynamic — it's a system library on every Mac (/usr/lib/libz.1.dylib),
     # not a Homebrew dependency, so there's no portability reason to statically link it,
     # and Homebrew doesn't ship a zlib formula by default (it'd require a separate install).
-    if(NOT _openssl_prefix)
-        message(FATAL_ERROR
-            "Static macOS build needs openssl@3 — pass -DOPENSSL_ROOT_DIR=<path> "
-            "or run 'brew install openssl@3'.")
-    endif()
-    find_library(OPENSSL_SSL_STATIC    NAMES libssl.a    PATHS "${_openssl_prefix}/lib" REQUIRED NO_DEFAULT_PATH)
-    find_library(OPENSSL_CRYPTO_STATIC NAMES libcrypto.a PATHS "${_openssl_prefix}/lib" REQUIRED NO_DEFAULT_PATH)
+    set(OPENSSL_SSL_STATIC    "${OSSL_INSTALL_DIR}/lib/libssl.a")
+    set(OPENSSL_CRYPTO_STATIC "${OSSL_INSTALL_DIR}/lib/libcrypto.a")
+    add_dependencies(ipatool openssl_static)
+    target_include_directories(ipatool PRIVATE "${OSSL_INSTALL_DIR}/include")
 
     find_program(BREW_EXECUTABLE brew)
     if(BREW_EXECUTABLE)

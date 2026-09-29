@@ -213,10 +213,9 @@ cmake --build build
 ### Static build (Apple silicon, arm64)
 
 ```sh
-brew install openssl@3 minizip nlohmann-json unicorn pkg-config
+brew install minizip nlohmann-json unicorn pkg-config
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
-      -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
       -DCMAKE_OSX_ARCHITECTURES=arm64 \
       -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
 cmake --build build
@@ -227,13 +226,20 @@ every Apple silicon Mac. The deployment target no longer affects text
 formatting (the project uses its own `ipt::format()`, not `std::format`), so
 you may raise or lower it freely within Apple silicon's supported range.
 
+> **OpenSSL is built from source** for the static build (targeting the same
+> arch and deployment target), so Homebrew's `openssl@3` is *not* needed and
+> `-DOPENSSL_ROOT_DIR` is unnecessary. This avoids Homebrew's bottle — compiled
+> for the build machine's macOS — producing "built for newer macOS version"
+> linker warnings and an unclean `minos`. The first configure downloads and
+> compiles OpenSSL (a few minutes); override the version with
+> `-DOPENSSL_VERSION=<x.y.z>` if desired.
+
 ### Static build on macOS Catalina (Intel)
 
 ```sh
-brew install openssl@3 minizip nlohmann-json unicorn pkg-config
+brew install minizip nlohmann-json unicorn pkg-config
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
-      -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
       -DCMAKE_OSX_ARCHITECTURES=x86_64 \
       -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
 cmake --build build
