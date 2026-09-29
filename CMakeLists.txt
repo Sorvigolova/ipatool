@@ -466,6 +466,8 @@ elseif(APPLE)
             -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
             -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
             -DUNICORN_BUILD_SHARED=OFF
+            -DUNICORN_BUILD_SAMPLES=OFF
+            -DUNICORN_BUILD_TESTS=OFF
             -DUNICORN_ARCH=x86
             -DUNICORN_ARCH_X86=ON
             -DUNICORN_ARCH_ARM=OFF
@@ -538,6 +540,8 @@ elseif(NOT WIN32 OR MINGW)
         GIT_SHALLOW    TRUE
     )
     set(UNICORN_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(UNICORN_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)  # skip sample_x86, shellcode, …
+    set(UNICORN_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
     # unicorn 2.1.x selects targets via the UNICORN_ARCH *string* list, not the
     # per-arch UNICORN_ARCH_<NAME> booleans (those are ignored → all 16 QEMU
     # targets get built, which is huge and slow). We only emulate x86-64.
