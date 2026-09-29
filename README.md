@@ -198,11 +198,15 @@ brew install openssl@3 minizip nlohmann-json unicorn pkg-config
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
       -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
-      -DCMAKE_OSX_ARCHITECTURES=arm64 \
-      -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+      -DCMAKE_OSX_ARCHITECTURES=arm64
 cmake --build build
 ```
 
+> This dynamic build targets the machine it's built on, so no
+> `-DCMAKE_OSX_DEPLOYMENT_TARGET` is set — it links against the Homebrew
+> libraries as they are. (Set a deployment target only for the static builds
+> below, which are meant to run on older macOS versions.)
+>
 > On Apple silicon, target **native arm64** rather than an Intel (x86-64) host
 > binary. This is a CPU-architecture choice, independent of the dynamic-vs-static
 > options below. Unicorn emulates the x86-64 guest dylibs regardless of the host
