@@ -829,15 +829,19 @@ static void cmd_list_versions(const Args& args) {
     std::string passphrase = get(args, "keychain-passphrase", "");
 
     if (bundleID.empty() && appIDStr.empty()) {
-        std::cerr << "Usage: ipatool list-versions (-b BUNDLE_ID | -i APP_ID)\n";
+        std::cerr << "Usage: ipatool list-versions (-b BUNDLE_ID | -i APP_ID) [--purchase]\n";
         exit(1);
     }
+
+    bool acquireLicense = (get(args, "purchase") == "true");
 
     Account acc;
     if (!load_account(acc, passphrase)) { std::cerr << "Not logged in.\n"; exit(1); }
 
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
+
+    App app;
 
     auto run = [&]() {
         // Fetch bag to get redownloadProduct endpoint for 5002 fallback
@@ -852,7 +856,6 @@ static void cmd_list_versions(const Args& args) {
         std::string kbsyncB64 = prepare_kbsync(store, acc, entDownloadEndpoint,
                                                passphrase, get(args, "debug") == "true");
 
-        App app;
         if (!bundleID.empty()) {
             app = store.lookup(acc, bundleID);
         } else {
@@ -869,6 +872,34 @@ static void cmd_list_versions(const Args& args) {
         log_output(j);
     };
 
+    // --purchase: acquire a free license then retry, mirroring `download --purchase`.
+    auto purchaseAndRetry = [&]() {
+        try {
+            store.purchase(acc, app);
+        } catch (const PasswordTokenExpired&) {
+            if (!silent_relogin(acc, passphrase)) {
+                print_red_err("Error: session expired. Please log in again.\n");
+                exit(1);
+            }
+            try { store.purchase(acc, app); }
+            catch (const std::exception& pe) {
+                print_red_err(std::string("Purchase error: ") + pe.what() + "\n");
+                exit(1);
+            }
+        } catch (const std::exception& pe) {
+            print_red_err(std::string("Purchase error: ") + pe.what() + "\n");
+            exit(1);
+        }
+        // Apple may queue the free license asynchronously — brief wait before retry.
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        try {
+            run();
+        } catch (const std::exception& e) {
+            print_red_err(std::string("Error: ") + e.what() + "\n");
+            exit(1);
+        }
+    };
+
     try {
         try {
             run();
@@ -880,6 +911,17 @@ static void cmd_list_versions(const Args& args) {
             }
             run();
         }
+    } catch (const LicenseRequired&) {
+        if (!acquireLicense) {
+            print_red_err("Error: you must purchase this app first.\n");
+            if (!bundleID.empty())
+                print_red_err("Run: ipatool purchase -b " + bundleID + "\n");
+            else
+                print_red_err("Run: ipatool search to find the bundle ID, then: ipatool purchase -b BUNDLE_ID\n");
+            print_red_err("Or re-run with --purchase to acquire the license automatically.\n");
+            exit(1);
+        }
+        purchaseAndRetry();
     } catch (const std::exception& e) {
         print_red_err(std::string("Error: ") + e.what() + "\n");
         exit(1);
@@ -1427,7 +1469,7 @@ Flags per command:
   search:               <term>  -l/--limit  --keychain-passphrase
   purchase:             -b/--bundle-id | -i/--app-id   --keychain-passphrase
   download:             -b/--bundle-id | -i/--app-id   -o/--output  --external-version-id  --purchase  --keychain-passphrase
-  list-versions:        -b/--bundle-id | -i/--app-id   --keychain-passphrase
+  list-versions:        -b/--bundle-id | -i/--app-id   --purchase  --keychain-passphrase
   get-version-metadata: -b/--bundle-id | -i/--app-id   --external-version-id  --keychain-passphrase
   kbsync:               [--dsid DSID] [--refresh]  (default: cached blob for the saved account)  --keychain-passphrase
 )";}

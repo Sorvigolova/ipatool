@@ -338,9 +338,10 @@ Downloads an app as an `.ipa` (iOS) or decrypted `.pkg` (macOS).
 
 #### `list-versions`
 ```
-ipatool list-versions (-b BUNDLE_ID | -i APP_ID) [--keychain-passphrase PASSPHRASE]
+ipatool list-versions (-b BUNDLE_ID | -i APP_ID) [--purchase] [--keychain-passphrase PASSPHRASE]
 ```
 Returns all available external version IDs for an app.
+- `--purchase` acquires the (free) license first if the app isn't yet in your library, then lists versions. Without it, an app you don't own returns a "must purchase" error.
 
 #### `get-version-metadata`
 ```
