@@ -12,9 +12,13 @@
 #  include <windows.h>
 #  include <winhttp.h>
 #  include <iphlpapi.h>
-#  pragma comment(lib, "winhttp.lib")
-#  pragma comment(lib, "iphlpapi.lib")
-#  pragma comment(lib, "ws2_32.lib")
+#  if defined(_MSC_VER)
+// MSVC auto-links via these pragmas; MinGW/GCC links the same libs through CMake
+// and would otherwise warn "ignoring #pragma comment [-Wunknown-pragmas]".
+#    pragma comment(lib, "winhttp.lib")
+#    pragma comment(lib, "iphlpapi.lib")
+#    pragma comment(lib, "ws2_32.lib")
+#  endif
 #else
 // POSIX (Linux / macOS)
 #  include <ifaddrs.h>
@@ -323,9 +327,11 @@ std::vector<uint8_t> SapWinHttpClient::Send(std::string_view method,
     }
 
     // Add User-Agent header (set on session, but also set on request to match iTunes UA)
+    // -1L → header string is null-terminated, let WinHTTP compute its length.
+    // (The old WINHTTP_NO_HEADER_INDEX here is NULL, i.e. length 0 — wrong field.)
     WinHttpAddRequestHeaders(hReq,
         (L"User-Agent: " + userAgent_).c_str(),
-        WINHTTP_NO_HEADER_INDEX,
+        (DWORD)-1L,
         WINHTTP_ADDREQ_FLAG_REPLACE | WINHTTP_ADDREQ_FLAG_ADD);
 
     // Windows 7 root certificate store doesn't include newer DigiCert roots
@@ -335,8 +341,11 @@ std::vector<uint8_t> SapWinHttpClient::Send(std::string_view method,
     // which still protects against MITM attacks to different servers.
     {
         DWORD dwSecFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA;
-        OSVERSIONINFOW osvi = { sizeof(osvi) };
-#pragma warning(suppress: 4996)
+        OSVERSIONINFOW osvi{};
+        osvi.dwOSVersionInfoSize = sizeof(osvi);
+#if defined(_MSC_VER)
+#  pragma warning(suppress: 4996)  // GetVersionExW deprecation (MSVC only)
+#endif
         GetVersionExW(&osvi);
         bool isWin7 = (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion == 1);
         if (isWin7) {

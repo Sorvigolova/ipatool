@@ -28,8 +28,11 @@
 #  endif
 #  include <windows.h>
 #  include <iphlpapi.h>
-#  pragma comment(lib, "iphlpapi.lib")
-#  pragma comment(lib, "ws2_32.lib")
+#  if defined(_MSC_VER)
+// MSVC auto-links via these pragmas; MinGW/GCC links the same libs through CMake.
+#    pragma comment(lib, "iphlpapi.lib")
+#    pragma comment(lib, "ws2_32.lib")
+#  endif
 #else
 #  include <sys/socket.h>
 #  include <sys/ioctl.h>
