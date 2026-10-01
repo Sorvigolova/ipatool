@@ -25,6 +25,7 @@
 #include "protect.h"   // secure_zero() — used directly for account file encryption
 #include "aes.h"        // aes::gcm_encrypt/decrypt — used directly for account file encryption
 #include "SapSigner.h"  // SapBase64 — kbsync output
+#include "path_utf8.h"  // ipt::fs_path — Unicode account-file paths on Windows
 
 #include <iostream>
 #include <fstream>
@@ -164,7 +165,7 @@ static const std::string COOKIE_FILE  = CONFIG_DIR + "/cookies";
 static void ensure_config_dir() {
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::create_directories(CONFIG_DIR, ec);
+    fs::create_directories(ipt::fs_path(CONFIG_DIR), ec);
 }
 
 // ── AES-256-GCM file encryption ───────────────────────────────────────────────
@@ -292,7 +293,7 @@ static bool save_account(const Account& acc, const std::string& passphrase = "")
 
     try {
         auto blob = aes_gcm_encrypt(data, machine_id, passphrase);
-        std::ofstream f(ACCOUNT_FILE, std::ios::binary);
+        std::ofstream f(ipt::fs_path(ACCOUNT_FILE), std::ios::binary);
         if (!f) {
             print_red_err("Error: failed to write account file.\n");
             return false;
@@ -307,7 +308,7 @@ static bool save_account(const Account& acc, const std::string& passphrase = "")
 }
 
 static bool load_account(Account& acc, const std::string& passphrase = "") {
-    std::ifstream f(ACCOUNT_FILE, std::ios::binary);
+    std::ifstream f(ipt::fs_path(ACCOUNT_FILE), std::ios::binary);
     if (!f) return false;
 
     std::vector<unsigned char> raw((std::istreambuf_iterator<char>(f)),
@@ -1048,15 +1049,17 @@ static void cmd_kbsync(const Args& args) {
 }
 
 static void cmd_revoke(const Args& args) {
-    if (!std::ifstream(ACCOUNT_FILE).good()) {
+    if (!std::ifstream(ipt::fs_path(ACCOUNT_FILE)).good()) {
         std::cerr << "Not logged in.\n";
         exit(1);
     }
-    if (std::remove(ACCOUNT_FILE.c_str()) != 0) {
+    std::error_code rmEc;
+    if (!std::filesystem::remove(ipt::fs_path(ACCOUNT_FILE), rmEc)) {
         std::cerr << "Error: failed to remove account file: " << ACCOUNT_FILE << "\n";
         exit(1);
     }
-    std::remove(COOKIE_FILE.c_str()); // best-effort, ignore error
+    std::error_code cookieEc;
+    std::filesystem::remove(ipt::fs_path(COOKIE_FILE), cookieEc); // best-effort, ignore error
     json out;
     out["success"] = true;
     log_output(out);

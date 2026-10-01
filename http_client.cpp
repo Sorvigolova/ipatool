@@ -1,4 +1,5 @@
 #include "http_client.h"
+#include "path_utf8.h"   // ipt::fopen_utf8 / ipt::fs_path — Unicode paths on Windows
 #include <curl/curl.h>
 #include <stdexcept>
 #include <cctype>
@@ -70,7 +71,7 @@ static void load_cookies(CURL* curl, const std::string& file) {
     curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");   // engine on, no file
     if (file.empty()) return;
 
-    std::ifstream in(std::filesystem::path(file), std::ios::binary);
+    std::ifstream in(ipt::fs_path(file), std::ios::binary);
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -89,7 +90,7 @@ static void save_cookies(CURL* curl, const std::string& file) {
     if (curl_easy_getinfo(curl, CURLINFO_COOKIELIST, &list) != CURLE_OK || !list)
         return;
 
-    std::ofstream out(std::filesystem::path(file), std::ios::binary | std::ios::trunc);
+    std::ofstream out(ipt::fs_path(file), std::ios::binary | std::ios::trunc);
     if (out) {
         out << "# Netscape HTTP Cookie File\n";
         for (curl_slist* p = list; p; p = p->next)
@@ -169,7 +170,7 @@ void HttpClient::download(const std::string& url,
         // ── Open file ────────────────────────────────────────────────────
         // Append when resuming so previously written bytes are preserved.
         const char* openMode = (currentStart > 0) ? "ab" : "wb";
-        FILE* fp = fopen(destPath.c_str(), openMode);
+        FILE* fp = ipt::fopen_utf8(destPath, openMode);
         if (!fp) throw std::runtime_error("failed to open file: " + destPath);
 
         CURL* curl = curl_easy_init();

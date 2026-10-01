@@ -47,9 +47,41 @@
 #ifdef HAVE_MINIZIP
 #  include <minizip/zip.h>
 #  include <minizip/unzip.h>
+#  ifdef _WIN32
+#    include <minizip/iowin32.h>   // CreateFileW-based I/O for Unicode paths
+#  endif
 #endif
 
+#include "path_utf8.h"   // ipt::fs_path / ipt::utf8_to_wide — Unicode paths on Windows
+
 namespace fs = std::filesystem;
+
+#ifdef HAVE_MINIZIP
+// minizip's default ioapi opens files with the narrow CRT fopen, which mangles
+// non-ASCII (e.g. Cyrillic) paths on Windows. On Windows route zip/unzip through
+// the win32 wide-char I/O (CreateFileW) with a UTF-16 path; elsewhere the plain
+// UTF-8 path works natively.
+static unzFile ipt_unzOpen(const std::string& path) {
+#  ifdef _WIN32
+    zlib_filefunc64_def ff;
+    fill_win32_filefunc64W(&ff);
+    std::wstring w = ipt::utf8_to_wide(path);
+    return unzOpen2_64(reinterpret_cast<const void*>(w.c_str()), &ff);
+#  else
+    return unzOpen(path.c_str());
+#  endif
+}
+static zipFile ipt_zipOpen(const std::string& path, int append) {
+#  ifdef _WIN32
+    zlib_filefunc64_def ff;
+    fill_win32_filefunc64W(&ff);
+    std::wstring w = ipt::utf8_to_wide(path);
+    return zipOpen2_64(reinterpret_cast<const void*>(w.c_str()), append, nullptr, &ff);
+#  else
+    return zipOpen(path.c_str(), append);
+#  endif
+}
+#endif
 
 #include "sap_resources.h"
 #include "sap_embedded_assets.h"
@@ -601,11 +633,11 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
             // Unencrypted (drmVersionNumber=0) — rename directly
             if (m_debug) fprintf(stderr, "[DEBUG] macOS pkg is unencrypted, saving directly\n");
             std::error_code ec;
-            fs::rename(tmpPkg, pkgDest, ec);
+            fs::rename(ipt::fs_path(tmpPkg), ipt::fs_path(pkgDest), ec);
             if (ec) {
-                fs::copy_file(tmpPkg, pkgDest,
+                fs::copy_file(ipt::fs_path(tmpPkg), ipt::fs_path(pkgDest),
                               fs::copy_options::overwrite_existing, ec);
-                fs::remove(tmpPkg, ec);
+                fs::remove(ipt::fs_path(tmpPkg), ec);
                 if (ec) throw IpaError("failed to save pkg: " + ec.message());
             }
         } else {
@@ -625,8 +657,8 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
 
             std::string decTmp = pkgDest + ".dec";
             {
-                std::ifstream src_f(tmpPkg, std::ios::binary);
-                std::ofstream dst_f(decTmp, std::ios::binary | std::ios::trunc);
+                std::ifstream src_f(ipt::fs_path(tmpPkg), std::ios::binary);
+                std::ofstream dst_f(ipt::fs_path(decTmp), std::ios::binary | std::ios::trunc);
                 if (!src_f) throw IpaError("cannot open encrypted pkg");
                 if (!dst_f) throw IpaError("cannot open decrypted pkg output");
                 std::vector<uint8_t> buf(StoreAgentMachine::kChunkSize);
@@ -640,10 +672,10 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
                 }
             }
             machine->CloseSession(session);
-            fs::remove(tmpPkg);
+            fs::remove(ipt::fs_path(tmpPkg));
             std::error_code ec;
-            fs::rename(decTmp, pkgDest, ec);
-            if (ec) { fs::copy_file(decTmp, pkgDest, fs::copy_options::overwrite_existing); fs::remove(decTmp); }
+            fs::rename(ipt::fs_path(decTmp), ipt::fs_path(pkgDest), ec);
+            if (ec) { fs::copy_file(ipt::fs_path(decTmp), ipt::fs_path(pkgDest), fs::copy_options::overwrite_existing); fs::remove(ipt::fs_path(decTmp)); }
         }
         return { pkgDest, sinfs };
     }
@@ -656,7 +688,7 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
     m_http.download(downloadURL, tmpDest, rangeStart, progress);
 
     apply_patches(item, acc, tmpDest, dest, sinfs);
-    fs::remove(tmpDest);
+    fs::remove(ipt::fs_path(tmpDest));
 
     return {dest, sinfs};
 }
@@ -1842,7 +1874,7 @@ void AppStore::apply_patches(const PlistDict& item,
     patch_with_minizip(srcPath, dstPath, metaBytes, artworkBytes, sinfs);
 #else
     std::error_code ec;
-    fs::copy_file(srcPath, dstPath,
+    fs::copy_file(ipt::fs_path(srcPath), ipt::fs_path(dstPath),
                   fs::copy_options::overwrite_existing, ec);
     if (ec) throw IpaError("failed to copy IPA: " + ec.message());
 #endif
@@ -1857,8 +1889,8 @@ void AppStore::patch_with_minizip(const std::string& srcPath,
 {
     // ── Step 1: raw-copy the original IPA → destination ──────────────────
     {
-        std::ifstream in(srcPath,  std::ios::binary);
-        std::ofstream out(dstPath, std::ios::binary | std::ios::trunc);
+        std::ifstream in(ipt::fs_path(srcPath),  std::ios::binary);
+        std::ofstream out(ipt::fs_path(dstPath), std::ios::binary | std::ios::trunc);
         if (!in)  throw IpaError("minizip: cannot open source IPA");
         if (!out) throw IpaError("minizip: cannot create output IPA");
         out << in.rdbuf();
@@ -1870,7 +1902,7 @@ void AppStore::patch_with_minizip(const std::string& srcPath,
     std::vector<std::string> sinfPaths;
 
     if (!sinfs.empty()) {
-        unzFile probe = unzOpen(srcPath.c_str());
+        unzFile probe = ipt_unzOpen(srcPath);
         if (!probe) throw IpaError("minizip: cannot open source for probe");
         int rc = unzGoToFirstFile(probe);
         while (rc == UNZ_OK) {
@@ -1916,7 +1948,7 @@ void AppStore::patch_with_minizip(const std::string& srcPath,
     }
 
     // ── Step 3: open the copy in append mode and inject new files ─────────
-    zipFile dst = zipOpen(dstPath.c_str(), APPEND_STATUS_ADDINZIP);
+    zipFile dst = ipt_zipOpen(dstPath, APPEND_STATUS_ADDINZIP);
     if (!dst) throw IpaError("minizip: failed to open output IPA for append");
 
     // iTunes order: iTunesMetadata.plist first, sinf(s), iTunesArtwork last
@@ -2084,10 +2116,15 @@ std::string AppStore::resolve_destination(const App& app,
 {
     std::string fname = make_filename(app, version);
     if (outputPath.empty()) {
-        return (fs::current_path() / fname).string();
+        return ipt::to_utf8(fs::current_path() / fname);
     }
-    fs::path p(outputPath);
-    if (fs::is_directory(p)) return (p / fname).string();
+    // Keep the user's UTF-8 path intact: fs::path::string() returns the active
+    // ANSI code page on Windows, so join as plain UTF-8 instead of round-tripping.
+    if (fs::is_directory(ipt::fs_path(outputPath))) {
+        char last = outputPath.empty() ? '\0' : outputPath.back();
+        std::string sep = (last == '/' || last == '\\') ? "" : "/";
+        return outputPath + sep + fname;
+    }
     return outputPath;
 }
 
@@ -2107,7 +2144,7 @@ std::string AppStore::make_filename(const App& app, const std::string& version) 
 
 int64_t AppStore::file_size(const std::string& path) {
     std::error_code ec;
-    auto sz = fs::file_size(path, ec);
+    auto sz = fs::file_size(ipt::fs_path(path), ec);
     return ec ? 0 : (int64_t)sz;
 }
 
@@ -2212,8 +2249,8 @@ AppStore::DownloadOutput AppStore::download_mac(const Account& acc, const App& a
     // Cleanup staging on exit
     auto cleanup = [&](bool success) {
         std::error_code ec;
-        std::filesystem::remove(encPath, ec);
-        if (!success) std::filesystem::remove(decPath, ec);
+        std::filesystem::remove(ipt::fs_path(encPath), ec);
+        if (!success) std::filesystem::remove(ipt::fs_path(decPath), ec);
     };
 
     // 4. Download encrypted .pkg
@@ -2236,8 +2273,8 @@ AppStore::DownloadOutput AppStore::download_mac(const Account& acc, const App& a
 
     // 6. Stream-decrypt 32KB chunks
     {
-        std::ifstream src_f(encPath, std::ios::binary);
-        std::ofstream dst_f(decPath, std::ios::binary | std::ios::trunc);
+        std::ifstream src_f(ipt::fs_path(encPath), std::ios::binary);
+        std::ofstream dst_f(ipt::fs_path(decPath), std::ios::binary | std::ios::trunc);
         if (!src_f) throw IpaError("failed to open encrypted pkg: " + encPath);
         if (!dst_f) throw IpaError("failed to open decrypted pkg: " + decPath);
 
@@ -2258,13 +2295,13 @@ AppStore::DownloadOutput AppStore::download_mac(const Account& acc, const App& a
     // 7. Publish: atomic rename decrypted → final destination
     {
         std::error_code ec;
-        std::filesystem::rename(decPath, dest, ec);
+        std::filesystem::rename(ipt::fs_path(decPath), ipt::fs_path(dest), ec);
         if (ec) {
             // Fallback: copy then remove
-            std::filesystem::copy_file(decPath, dest,
+            std::filesystem::copy_file(ipt::fs_path(decPath), ipt::fs_path(dest),
                 std::filesystem::copy_options::overwrite_existing, ec);
             if (ec) throw IpaError("failed to publish pkg: " + ec.message());
-            std::filesystem::remove(decPath, ec);
+            std::filesystem::remove(ipt::fs_path(decPath), ec);
         }
     }
 
