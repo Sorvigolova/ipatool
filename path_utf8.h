@@ -45,10 +45,8 @@ inline FILE* fopen_utf8(const std::string& path, const char* mode) {
     return _wfopen(utf8_to_wide(path).c_str(), wmode.c_str());
 }
 
-// Convert a filesystem path back to UTF-8 (path::string() would return the
-// active ANSI code page on Windows, re-mangling non-ASCII).
-inline std::string to_utf8(const std::filesystem::path& p) {
-    std::wstring w = p.wstring();
+// UTF-16 → UTF-8.
+inline std::string wide_to_utf8(const std::wstring& w) {
     if (w.empty()) return std::string();
     int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
                                 nullptr, 0, nullptr, nullptr);
@@ -56,6 +54,12 @@ inline std::string to_utf8(const std::filesystem::path& p) {
     WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
                         s.data(), n, nullptr, nullptr);
     return s;
+}
+
+// Convert a filesystem path back to UTF-8 (path::string() would return the
+// active ANSI code page on Windows, re-mangling non-ASCII).
+inline std::string to_utf8(const std::filesystem::path& p) {
+    return wide_to_utf8(p.wstring());
 }
 
 #else  // POSIX — UTF-8 is the native encoding

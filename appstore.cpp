@@ -259,15 +259,25 @@ SearchResult parse_search_json(const std::string& body) {
 // ── URL encode helper ─────────────────────────────────────────────────────────
 
 std::string url_encode(const std::string& s) {
-    std::ostringstream out;
+    // ASCII-only unreserved set, checked explicitly: std::isalnum is
+    // locale-dependent and on Windows (e.g. a CP1251 locale) can classify high
+    // UTF-8 bytes as "alphanumeric", leaving them unescaped and corrupting a
+    // Cyrillic term in the query. Also zero-pad each byte (%02X), so a byte
+    // below 0x10 is not emitted as a single hex digit.
+    static const char* hexd = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
     for (unsigned char c : s) {
-        if (std::isalnum(c) || c=='-' || c=='_' || c=='.' || c=='~') {
-            out << c;
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back((char)c);
         } else {
-            out << '%' << std::uppercase << std::hex << (int)c;
+            out.push_back('%');
+            out.push_back(hexd[c >> 4]);
+            out.push_back(hexd[c & 0x0F]);
         }
     }
-    return out.str();
+    return out;
 }
 
 std::string build_query(const std::map<std::string, std::string>& params) {
@@ -448,7 +458,9 @@ AppStore::SearchOutput AppStore::search(const Account& acc, const std::string& t
     std::string cc  = country_code_from_storefront(acc.storeFront);
     std::string url = search_url(term, cc, limit);
 
+    if (m_debug) debug_dump_request("search", "GET", url, {}, "");
     HttpResponse res = m_http.get(url);
+    if (m_debug) debug_dump_response("search", res);
     if (res.statusCode != 200)
         throw IpaError("search request failed: " + std::to_string(res.statusCode));
 
@@ -460,7 +472,9 @@ App AppStore::lookup(const Account& acc, const std::string& bundleID) {
     std::string cc  = country_code_from_storefront(acc.storeFront);
     std::string url = lookup_url(bundleID, cc);
 
+    if (m_debug) debug_dump_request("lookup", "GET", url, {}, "");
     HttpResponse res = m_http.get(url);
+    if (m_debug) debug_dump_response("lookup", res);
     if (res.statusCode != 200)
         throw IpaError("lookup request failed: " + std::to_string(res.statusCode));
 
@@ -481,7 +495,9 @@ App AppStore::lookup_by_id(const Account& acc, int64_t appID) {
     std::string url = std::string("https://") + ITUNES_API_DOMAIN
                     + ITUNES_API_PATH_LOOKUP + "?" + build_query(p);
 
+    if (m_debug) debug_dump_request("lookup-by-id", "GET", url, {}, "");
     HttpResponse res = m_http.get(url);
+    if (m_debug) debug_dump_response("lookup-by-id", res);
     if (res.statusCode != 200)
         throw IpaError("lookup request failed: " + std::to_string(res.statusCode));
 

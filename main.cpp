@@ -55,6 +55,7 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#  include <shellapi.h>   // CommandLineToArgvW — UTF-8 argv rebuild
 #endif
 
 // OpenSSL for AES-256-GCM encryption of the account file
@@ -709,7 +710,7 @@ static void cmd_search(const Args& args) {
     std::string passphrase = get(args, "keychain-passphrase", "");
 
     if (term.empty()) {
-        std::cerr << "Usage: ipatool search <term> [-l LIMIT]\n";
+        std::cerr << "Usage: ipatool search <term> [-l LIMIT] [--debug]\n";
         exit(1);
     }
 
@@ -1455,6 +1456,7 @@ Commands:
 
 Global flags:
   --format                Output format: "text" (default) or "json"
+  --debug                 Print request/response traces (URLs, headers, bodies) to stderr
   --keychain-passphrase   Passphrase to encrypt/decrypt the saved account file.
                           When set on login, credentials are stored encrypted.
                           Required on all subsequent commands if login used it.
@@ -1486,6 +1488,30 @@ Flags per command:
 
 int main(int argc, char** argv) {
     init_color();
+
+#ifdef _WIN32
+    // The narrow CRT argv is encoded in the active ANSI code page, so non-ASCII
+    // arguments (e.g. a Cyrillic search term) arrive mis-encoded. Rebuild argv
+    // as UTF-8 from the wide command line so every command sees real Unicode.
+    std::vector<std::string> _utf8args;
+    std::vector<char*>       _utf8argv;
+    {
+        int wargc = 0;
+        LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+        if (wargv) {
+            _utf8args.reserve(wargc);
+            for (int i = 0; i < wargc; ++i)
+                _utf8args.push_back(ipt::wide_to_utf8(wargv[i]));
+            LocalFree(wargv);
+            _utf8argv.reserve(wargc + 1);
+            for (auto& s : _utf8args) _utf8argv.push_back(s.data());
+            _utf8argv.push_back(nullptr);
+            argc = wargc;
+            argv = _utf8argv.data();
+        }
+    }
+#endif
+
     if (argc < 2) { print_help(); return 0; }
 
     Args args = parse_args(argc, argv);
