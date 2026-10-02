@@ -1133,10 +1133,12 @@ static void cmd_download(const Args& args) {
     // and the ent/download endpoint (kbsync first stage).
     std::string redownloadEndpoint;
     std::string entDownloadEndpoint;
+    std::string songDownloadDoneEndpoint;
     try {
         auto bag = store.fetch_bag();
-        redownloadEndpoint  = bag.redownloadEndpoint;
-        entDownloadEndpoint = bag.entDownloadEndpoint;
+        redownloadEndpoint       = bag.redownloadEndpoint;
+        entDownloadEndpoint      = bag.entDownloadEndpoint;
+        songDownloadDoneEndpoint = bag.songDownloadDoneEndpoint;
     } catch (...) { /* non-fatal: proceed without fallback */ }
 
     bool dbg = (get(args, "debug") == "true");
@@ -1313,7 +1315,8 @@ static void cmd_download(const Args& args) {
         }
 
         auto out = store.download(acc, app, outputPath, versionID, progress,
-                                  redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+                                  redownloadEndpoint, entDownloadEndpoint, kbsyncB64,
+                                  songDownloadDoneEndpoint);
         invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
         json dlOut;
         dlOut["output"]    = out.destinationPath;
@@ -1366,7 +1369,8 @@ static void cmd_download(const Args& args) {
         prevDrawnCols = 0;
         try {
             auto out = store.download(acc, app, outputPath, versionID, progress,
-                                      redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+                                      redownloadEndpoint, entDownloadEndpoint, kbsyncB64,
+                                  songDownloadDoneEndpoint);
             invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
             json dlOut;
             dlOut["output"]    = out.destinationPath;
@@ -1383,7 +1387,8 @@ static void cmd_download(const Args& args) {
             prevDrawnCols = 0;
             try {
                 auto out = store.download(acc, app, outputPath, versionID, progress,
-                                          redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+                                          redownloadEndpoint, entDownloadEndpoint, kbsyncB64,
+                                  songDownloadDoneEndpoint);
                 invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
                 json dlOut;
                 dlOut["output"]    = out.destinationPath;
@@ -1410,7 +1415,8 @@ static void cmd_download(const Args& args) {
             startTime     = std::chrono::steady_clock::now();
             prevDrawnCols = 0;
             auto out = store.download(acc, app, outputPath, versionID, progress,
-                                      redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+                                      redownloadEndpoint, entDownloadEndpoint, kbsyncB64,
+                                  songDownloadDoneEndpoint);
             invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
             json dlOut;
             dlOut["output"]    = out.destinationPath;

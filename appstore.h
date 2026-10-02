@@ -64,6 +64,7 @@ public:
         std::string redownloadEndpoint;  // https://downloaddispatch.itunes.apple.com/r/redownload
         std::string updateEndpoint;      // https://downloaddispatch.itunes.apple.com/up/updateProduct
         std::string entDownloadEndpoint; // bag key volumeStoreDownloadProduct → .../wa/ent/download
+        std::string songDownloadDoneEndpoint; // bag key songDownloadDone → MZFastFinance .../songDownloadDone
         // SAP config fields (v2.4.0+ — from bag.xml sign-sap-* keys)
         std::string          signSapSetup;        // sign-sap-setup URL
         std::string          signSapSetupCert;    // sign-sap-setup-cert URL
@@ -118,7 +119,8 @@ public:
                             ProgressCb progress = nullptr,
                             const std::string& redownloadEndpoint = "",
                             const std::string& entDownloadEndpoint = "",
-                            const std::string& kbsyncB64 = "");
+                            const std::string& kbsyncB64 = "",
+                            const std::string& songDownloadDoneEndpoint = "");
 
     // True when the last download()'s ent/download stage was rejected in a way
     // that suggests the cached kbsync is stale (HTTP >= 500). The caller uses
@@ -179,6 +181,13 @@ private:
     // Bag "updateProduct" endpoint, remembered by fetch_bag_impl() so the
     // redownload fallback can use it without changing public signatures.
     std::string m_updateEndpoint;
+
+    // GET the bag's songDownloadDone URL (built with the account pod + songId +
+    // guid) to report a completed download to Apple. Returns true when the
+    // response carries jingleDocType "success". Best-effort; never fatal.
+    bool report_download_done(const Account& acc, int64_t songId,
+                              const std::string& downloadId,
+                              const std::string& songDownloadDoneEndpoint);
 
     static std::string get_guid();
 

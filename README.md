@@ -334,6 +334,7 @@ Downloads an app as an `.ipa` (iOS) or decrypted `.pkg` (macOS).
 - `--purchase` acquires the license if needed, then downloads
 - Output filename format: `{bundleID}_{appID}_{version}.ipa`
 - Resumable — re-running the same command continues an interrupted download
+- The finished file is verified against the store's `md5`. A mismatch (only possible on a fully received transfer — partial transfers resume instead) discards the file and re-downloads it once from scratch; if it still fails, the command aborts and leaves no corrupt `.tmp` behind. On a match the download is reported back to Apple (`songDownloadDone`), as iTunes/Configurator does — best-effort, never fails the download
 - iOS IPAs are patched to iTunes format (`iTunesMetadata.plist`, `iTunesArtwork`, sinf DRM token injected into `SC_Info/`); encrypted macOS `.pkg` files are decrypted via the StoreAgent sandbox
 
 #### `list-versions`

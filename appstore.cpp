@@ -16,6 +16,7 @@
 #include <filesystem>   // C++17 — replaces getcwd / stat / S_ISDIR
 #include <regex>
 #include <ctime>
+#include <openssl/evp.h>   // MD5 (EVP) for whole-image download verification
 
 // ── Platform headers ──────────────────────────────────────────────────────────
 
@@ -88,6 +89,43 @@ static zipFile ipt_zipOpen(const std::string& path, int append) {
 
 #include "sap_resources.h"
 #include "sap_embedded_assets.h"
+
+// Lowercase hex MD5 of a whole file (streamed), used to verify a finished
+// download against the <key>md5</key> the store returns. "" on open/hash error.
+static std::string md5_file_hex(const std::string& path) {
+    FILE* f = ipt::fopen_utf8(path, "rb");
+    if (!f) return "";
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) { fclose(f); return ""; }
+    if (EVP_DigestInit_ex(ctx, EVP_md5(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx); fclose(f); return "";
+    }
+    std::vector<uint8_t> buf(1u << 20);  // 1 MiB chunks
+    size_t n;
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0)
+        EVP_DigestUpdate(ctx, buf.data(), n);
+    fclose(f);
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int mdLen = 0;
+    EVP_DigestFinal_ex(ctx, md, &mdLen);
+    EVP_MD_CTX_free(ctx);
+    static const char* hexd = "0123456789abcdef";
+    std::string out;
+    out.reserve(mdLen * 2);
+    for (unsigned i = 0; i < mdLen; ++i) {
+        out.push_back(hexd[md[i] >> 4]);
+        out.push_back(hexd[md[i] & 0xF]);
+    }
+    return out;
+}
+
+// Case-insensitive ASCII equality (md5 hex compare).
+static bool ascii_iequals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    return true;
+}
 
 // Load a SAP dylib asset.
 // Priority: 1) Linux/macOS objcopy embedded  2) Windows RCDATA  3) file fallback
@@ -482,7 +520,8 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
                         ProgressCb progress,
                         const std::string& redownloadEndpoint,
                         const std::string& entDownloadEndpoint,
-                        const std::string& kbsyncB64)
+                        const std::string& kbsyncB64,
+                        const std::string& songDownloadDoneEndpoint)
 {
     std::string guid = get_guid();
     m_kbsyncRejected = false;
@@ -569,6 +608,13 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
 
     const PlistDict& item       = itemVal.dictVal;
     std::string      downloadURL = dict_str(item, "URL");
+    std::string      md5Expected = dict_str(item, "md5");
+    // download-id for the completion ping — comes from the same item as the URL
+    // (usually empty, but can be populated), passed through verbatim.
+    std::string      downloadId  = dict_str(item, "download-id");
+    // songId for the completion ping; it equals the adamId, so fall back to it.
+    int64_t          songId      = dict_int(item, "songId");
+    if (songId == 0) songId = app.id;
     std::string      version     = "unknown";
 
     auto metaIt  = item.find("metadata");
@@ -597,6 +643,57 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
             sinfs.push_back(std::move(s));
         }
     }
+
+    // Verify the finished raw download against the store's md5, then report the
+    // completion to Apple. Called on the raw downloaded temp file (before any
+    // repack/decrypt), since the md5 describes the file exactly as served.
+    auto verify_and_report = [&](const std::string& rawTmpPath) {
+        if (!md5Expected.empty()) {
+            std::string actual = md5_file_hex(rawTmpPath);
+            if (actual.empty())
+                throw IpaError("could not compute md5 of downloaded file");
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] md5 check: expected=%s actual=%s\n",
+                        md5Expected.c_str(), actual.c_str());
+
+            if (!ascii_iequals(actual, md5Expected)) {
+                // download() only returns on a fully received transfer (curl
+                // CURLE_OK; short reads are retried), so a mismatch here means a
+                // complete-but-corrupt file — safe to discard. Re-download once
+                // from scratch (remove → rangeStart 0 → full GET) and re-check.
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] md5 mismatch — discarding and re-downloading once\n");
+                fs::remove(ipt::fs_path(rawTmpPath));
+                m_http.download(downloadURL, rawTmpPath, 0, progress);
+
+                actual = md5_file_hex(rawTmpPath);
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] md5 recheck: expected=%s actual=%s\n",
+                            md5Expected.c_str(), actual.c_str());
+                if (!ascii_iequals(actual, md5Expected)) {
+                    // Still bad — leave no corrupt .tmp behind so a manual re-run
+                    // starts clean instead of resuming onto garbage.
+                    fs::remove(ipt::fs_path(rawTmpPath));
+                    throw IpaError("download hash mismatch after re-download (expected md5 " +
+                                   md5Expected + ", got " + actual + ")");
+                }
+            }
+        } else if (m_debug) {
+            fprintf(stderr, "[DEBUG] no md5 in response — skipping hash verification\n");
+        }
+        // Completion ping is best-effort: a failure here must not invalidate the
+        // file we already downloaded and verified.
+        if (!songDownloadDoneEndpoint.empty()) {
+            try {
+                bool ok = report_download_done(acc, songId, downloadId, songDownloadDoneEndpoint);
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] songDownloadDone: %s\n",
+                            ok ? "success reported" : "no success marker in response");
+            } catch (const std::exception& e) {
+                if (m_debug) fprintf(stderr, "[DEBUG] songDownloadDone request failed: %s\n", e.what());
+            }
+        }
+    };
 
     // ── macOS .pkg detection ───────────────────────────────────────────────────
     // Detect by URL extension or metadata software-platform.
@@ -631,6 +728,8 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
         std::string tmpPkg = pkgDest + ".tmp";
         int64_t rangeStart = file_size(tmpPkg);
         m_http.download(downloadURL, tmpPkg, rangeStart, progress);
+
+        verify_and_report(tmpPkg);
 
         if (dpInfo.empty()) {
             // Unencrypted (drmVersionNumber=0) — rename directly
@@ -689,6 +788,8 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
 
     int64_t rangeStart = file_size(tmpDest);
     m_http.download(downloadURL, tmpDest, rangeStart, progress);
+
+    verify_and_report(tmpDest);
 
     apply_patches(item, acc, tmpDest, dest, sinfs);
     fs::remove(ipt::fs_path(tmpDest));
@@ -1015,6 +1116,52 @@ PlistDict AppStore::send_ent_download(const Account& acc, const App& app,
     httpStatus = res.statusCode;
     if (m_debug) debug_dump_response("ent/download", res);
     return decode_plist(res.body);
+}
+
+// Report a completed download to Apple via the bag's songDownloadDone URL.
+// The host gets the account pod prefix (p<pod>-…) and the query carries songId
+// (= adamId), an empty download-id, the pod, and the request guid. GET only —
+// just cookies + headers, no body. Success = jingleDocType "success".
+bool AppStore::report_download_done(const Account& acc, int64_t songId,
+                                    const std::string& downloadId,
+                                    const std::string& songDownloadDoneEndpoint)
+{
+    if (songDownloadDoneEndpoint.empty()) return false;
+    std::string guid = get_guid();
+
+    // Inject the pod prefix right after the scheme:
+    //   https://buy.itunes.apple.com/… → https://p<pod>-buy.itunes.apple.com/…
+    std::string url = songDownloadDoneEndpoint;
+    if (!acc.pod.empty()) {
+        auto pos = url.find("://");
+        if (pos != std::string::npos)
+            url.insert(pos + 3, "p" + acc.pod + "-");
+    }
+    url += "?songId="       + std::to_string(songId)
+         + "&download-id="  + downloadId
+         + "&Pod="          + acc.pod
+         + "&guid="         + guid;
+
+    // Same shape as send_ent_download, minus X-Token; GET carries no body.
+    // Accept-Encoding is intentionally omitted — curl does not auto-decompress
+    // a manually requested gzip, and the plist response is tiny anyway.
+    std::map<std::string, std::string> hdrs = {
+        {"User-Agent",          "Configurator/2.18 (Macintosh; OS X 15.3.2; 24D81) "
+                                "AppleWebKit/0620.2.4.11.6"},
+        {"Accept",              "*/*"},
+        {"Accept-Language",     "en-US"},
+        {"iCloud-DSID",         acc.directoryServicesID},
+        {"X-Dsid",              acc.directoryServicesID},
+        {"X-Apple-Store-Front", acc.storeFront},
+    };
+
+    if (m_debug) debug_dump_request("songDownloadDone", "GET", url, hdrs, "");
+    HttpResponse res = m_http.get(url, hdrs);
+    if (m_debug) debug_dump_response("songDownloadDone", res);
+
+    if (res.statusCode != 200) return false;
+    // jingleDocType success — tolerant to plist whitespace/formatting.
+    return res.body.find("<string>success</string>") != std::string::npos;
 }
 
 PlistDict AppStore::send_download_product(const Account& acc, const App& app,
@@ -1458,6 +1605,7 @@ AppStore::BagOutput AppStore::fetch_bag_impl(const std::string& guid) {
         out.redownloadEndpoint  = dict_str(ubIt->second.dictVal, "redownloadProduct");
         out.updateEndpoint      = dict_str(ubIt->second.dictVal, "updateProduct");
         out.entDownloadEndpoint = dict_str(ubIt->second.dictVal, "volumeStoreDownloadProduct");
+        out.songDownloadDoneEndpoint = dict_str(ubIt->second.dictVal, "songDownloadDone");
         m_updateEndpoint        = out.updateEndpoint;
 
         // ── SAP config fields (v2.4.0+) — must be extracted here, before
