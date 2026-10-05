@@ -23,6 +23,18 @@ PlistValue downloadable_item() {
 } // namespace
 
 int main() {
+    App freeApp;
+    freeApp.price = 0.0;
+    expect(preferred_purchase_protocol(freeApp, true)
+               == PurchaseProtocol::LegacyFinance,
+           "keeps fully free apps on the legacy purchase flow");
+
+    App paidApp;
+    paidApp.price = 4.99;
+    expect(preferred_purchase_protocol(paidApp, true)
+               == PurchaseProtocol::ModernMZBuy,
+           "uses modern MZBuy for paid apps when kbsync is available");
+
     expect(is_purchase_unavailable_message(
                "Purchase of this item is not currently available."),
            "recognizes Apple's purchase-unavailable response");

@@ -884,7 +884,7 @@ static void cmd_list_versions(const Args& args) {
         log_output(j);
     };
 
-    // --purchase: acquire a free license then retry, mirroring `download --purchase`.
+    // --purchase: acquire the entitlement then retry the version lookup.
     auto purchaseAndRetry = [&]() {
         try {
             store.purchase(acc, app, kbsyncB64);
@@ -916,7 +916,7 @@ static void cmd_list_versions(const Args& args) {
             print_red_err(std::string("Purchase error: ") + pe.what() + "\n");
             exit(1);
         }
-        // Apple may queue the free license asynchronously — brief wait before retry.
+        // Apple may queue the entitlement asynchronously — brief wait before retry.
         std::this_thread::sleep_for(std::chrono::seconds(2));
         try {
             run();
@@ -1337,7 +1337,7 @@ static void cmd_download(const Args& args) {
         if (!bundleID.empty()) {
             app = store.lookup(acc, bundleID);
         } else {
-            app.id = std::stoll(appIDStr);
+            app = store.lookup_by_id(acc, std::stoll(appIDStr));
         }
 
         auto out = store.download(acc, app, outputPath, versionID, progress,
@@ -1487,7 +1487,7 @@ Commands:
   auth info             Show saved account info
   auth revoke           Revoke and delete saved credentials
   search                Search for apps
-  purchase              Acquire a free app license
+  purchase              Acquire an App Store entitlement
   download              Download an app IPA
   list-versions         List available versions of an app
   get-version-metadata  Get metadata for a specific app version

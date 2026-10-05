@@ -504,28 +504,50 @@ PlistDict AppStore::purchase(const Account& acc, const App& app,
         return result;
     };
 
-    // STDQ acquires a free entitlement and also lets Apple's MZBuy service
-    // resolve an existing paid or Family Sharing entitlement without charging
-    // because the request price is zero. If Apple refuses that operation,
-    // STDRDL is the no-charge redownload fallback.
+    const bool hasKbsync = !kbsyncB64.empty();
+    const bool preferModern = preferred_purchase_protocol(app, hasKbsync)
+                            == PurchaseProtocol::ModernMZBuy;
+
+    // Fully free apps must keep the legacy Finance request. The modern MZBuy
+    // request is rejected by Apple for some free products, even though the
+    // legacy request succeeds. Paid apps with kbsync use MZBuy directly.
+    if (!preferModern) {
+        try {
+            return complete(do_purchase(acc, app, guid, PRICING_APPSTORE,
+                                        "", externalVersionID));
+        } catch (const PurchaseUnavailable&) {
+            if (!hasKbsync) throw;
+        } catch (const LicenseRequired&) {
+            if (!hasKbsync) throw;
+        } catch (const IpaError& e) {
+            if (std::string(e.what()).find("temporarily unavailable") != std::string::npos)
+                return complete(do_purchase(acc, app, guid, PRICING_ARCADE,
+                                            "", externalVersionID));
+            throw;
+        }
+    }
+
+    if (!hasKbsync)
+        throw PurchaseUnavailable();
+
+    // Paid/family-shared apps, and free apps whose legacy path was refused,
+    // use MZBuy. If STDQ is unavailable, STDRDL resolves an existing
+    // entitlement without charging a new purchase.
     try {
         PlistDict result = do_purchase(acc, app, guid, PRICING_APPSTORE,
                                        kbsyncB64, externalVersionID);
-        if (kbsyncB64.empty()
-            || dict_str(result, "failureType") != FAILURE_ALREADY_PURCHASED)
+        if (dict_str(result, "failureType") != FAILURE_ALREADY_PURCHASED)
             return complete(std::move(result));
     } catch (const PurchaseUnavailable&) {
-        if (kbsyncB64.empty()) throw;
+        // Retry as a no-charge redownload below.
+    } catch (const LicenseRequired&) {
+        // Retry as a no-charge redownload below.
     } catch (const IpaError& e) {
-        if (std::string(e.what()).find("temporarily unavailable") != std::string::npos) {
+        if (std::string(e.what()).find("temporarily unavailable") != std::string::npos)
             return complete(do_purchase(acc, app, guid, PRICING_ARCADE,
                                         kbsyncB64, externalVersionID));
-        }
         throw;
     }
-
-    if (kbsyncB64.empty())
-        throw PurchaseUnavailable();
 
     PlistDict redownload = do_purchase(acc, app, guid, PRICING_REDOWNLOAD,
                                        kbsyncB64, externalVersionID);

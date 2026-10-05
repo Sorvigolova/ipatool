@@ -1,8 +1,13 @@
 #include "purchase_flow.h"
-#include "ipatool.h"
 
 #include <algorithm>
 #include <cctype>
+
+PurchaseProtocol preferred_purchase_protocol(const App& app, bool hasKbsync) {
+    return hasKbsync && app.price > 0.0
+        ? PurchaseProtocol::ModernMZBuy
+        : PurchaseProtocol::LegacyFinance;
+}
 
 std::string normalize_apple_text(const std::string& input) {
     std::string out;

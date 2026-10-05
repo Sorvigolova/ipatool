@@ -264,7 +264,7 @@ Commands:
   auth info             Show currently saved account info
   auth revoke           Delete saved credentials
   search                Search for apps on the App Store
-  purchase              Acquire a free app license
+  purchase              Acquire an App Store entitlement
   download              Download an app IPA / macOS pkg
   list-versions         List available versions of an app
   get-version-metadata  Get metadata for a specific app version
@@ -433,7 +433,7 @@ On Windows these are in `%USERPROFILE%\.ipatool\`. The account file is always en
 ## Notes
 
 - If you move to a new machine or reinstall the OS, run `auth revoke` + `auth login` again
-- Paid apps are not supported — only free apps and apps already in your account's library
+- Paid apps must already be owned by the Apple Account directly or through Family Sharing; ipatool resolves the entitlement but never charges a new purchase
 - `purchase` must be run before `download` for any app not in your library
 - Older versions obtained via `--external-version-id` may no longer be signed by Apple and might not install
 - Session token expiry is handled automatically — the tool re-authenticates silently using stored credentials (2FA prompts once). The cached kbsync is preserved across such token refreshes
