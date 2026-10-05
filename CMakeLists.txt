@@ -15,6 +15,8 @@ endif()
 
 project(ipatool VERSION 1.0 LANGUAGES CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -578,6 +580,7 @@ add_executable(ipatool
     SapMachine.cpp
     SapSigner.cpp
     StoreAgentMachine.cpp
+    purchase_flow.cpp
     # Windows resources (SAP assets embedded in EXE)
     $<$<PLATFORM_ID:Windows>:sap_resources.rc>
     # Headers
@@ -985,6 +988,16 @@ endif()
 # ── Install ───────────────────────────────────────────────────────────────────
 
 install(TARGETS ipatool DESTINATION bin)
+
+if(BUILD_TESTING)
+    add_executable(purchase_flow_tests
+        tests/purchase_flow_tests.cpp
+        purchase_flow.cpp
+        plist.cpp
+    )
+    target_include_directories(purchase_flow_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME purchase_flow_tests COMMAND purchase_flow_tests)
+endif()
 
 # ── Helper message ────────────────────────────────────────────────────────────
 

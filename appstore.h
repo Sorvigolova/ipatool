@@ -101,9 +101,12 @@ public:
 
     App lookup_by_id(const Account& acc, int64_t appID);
 
-    // ── Purchase (free apps) ──────────────────────────────────────────────────
-
-    PlistDict purchase(const Account& acc, const App& app); // returns purchase result incl. songList for paid apps
+    // ── Purchase / entitlement acquisition ───────────────────────────────────
+    // kbsyncB64 enables the modern MZBuy request used by iTunes for paid and
+    // family-shared apps. Without it, the legacy free-license request is used.
+    PlistDict purchase(const Account& acc, const App& app,
+                       const std::string& kbsyncB64 = "",
+                       const std::string& externalVersionID = "");
 
     // ── Download ──────────────────────────────────────────────────────────────
 
@@ -165,6 +168,8 @@ private:
     HttpClient m_http;
     bool       m_debug = false;
     bool       m_kbsyncRejected = false; // set by the ent/download stage, read by caller
+    int64_t    m_purchaseResultAppID = 0;
+    PlistDict  m_purchaseResult;
 
     // ── ent/download first stage (uses kbsync) ───────────────────────────────
     // POSTs the ent/download request with the given base64 kbsync and returns
@@ -276,7 +281,9 @@ private:
 
     // ── Purchase implementation ───────────────────────────────────────────────
     PlistDict do_purchase(const Account& acc, const App& app,
-                         const std::string& guid, const std::string& pricingParam);
+                         const std::string& guid, const std::string& pricingParam,
+                         const std::string& kbsyncB64 = "",
+                         const std::string& externalVersionID = "");
 
     // ── ZIP patching ──────────────────────────────────────────────────────────
     // Injects a patched iTunesMetadata.plist into the downloaded IPA.

@@ -264,7 +264,7 @@ Commands:
   auth info             Show currently saved account info
   auth revoke           Delete saved credentials
   search                Search for apps on the App Store
-  purchase              Acquire a free app license
+  purchase              Acquire an App Store entitlement
   download              Download an app IPA / macOS pkg
   list-versions         List available versions of an app
   get-version-metadata  Get metadata for a specific app version
@@ -319,7 +319,9 @@ Searches the App Store. Default limit is 5.
 ```
 ipatool purchase (-b BUNDLE_ID | -i APP_ID) [--keychain-passphrase PASSPHRASE]
 ```
-Acquires a free license. Must be run once before downloading any app not already in your library.
+Acquires an App Store entitlement before downloading. Free apps use the normal
+license flow; paid apps already owned directly or through Family Sharing use
+Apple's redownload entitlement flow and are not charged again.
 
 #### `download`
 ```
@@ -331,7 +333,9 @@ Downloads an app as an `.ipa` (iOS) or decrypted `.pkg` (macOS).
 - The download first tries the `ent/download` stage using a cached/generated **kbsync**; if that does not serve the app it falls back to `volumeStore → redownload → updateProduct`
 - `--external-version-id` downloads a specific older version (get IDs from `list-versions`)
 - `-o` can be a file path or a directory; defaults to the current directory
-- `--purchase` acquires the license if needed, then downloads
+- `--purchase` acquires the entitlement if needed, then downloads. For a paid
+  app, the same Apple Account must already own the app or receive it through
+  Family Sharing; ipatool never attempts to charge a new purchase.
 - Output filename format: `{bundleID}_{appID}_{version}.ipa`
 - Resumable — re-running the same command continues an interrupted download
 - The finished file is verified against the store's `md5`. A mismatch (only possible on a fully received transfer — partial transfers resume instead) discards the file and re-downloads it once from scratch; if it still fails, the command aborts and leaves no corrupt `.tmp` behind. On a match the download is reported back to Apple (`songDownloadDone`), as iTunes/Configurator does — best-effort, never fails the download
@@ -342,7 +346,10 @@ Downloads an app as an `.ipa` (iOS) or decrypted `.pkg` (macOS).
 ipatool list-versions (-b BUNDLE_ID | -i APP_ID) [--purchase] [--keychain-passphrase PASSPHRASE]
 ```
 Returns all available external version IDs for an app.
-- `--purchase` acquires the (free) license first if the app isn't yet in your library, then lists versions. Without it, an app you don't own returns a "must purchase" error.
+- `--purchase` acquires the entitlement first if the app isn't yet in your
+  library, then lists versions. This also resolves paid apps shared through
+  Family Sharing. Without it, an app you don't own returns a "must purchase"
+  error.
 
 #### `get-version-metadata`
 ```
@@ -426,7 +433,7 @@ On Windows these are in `%USERPROFILE%\.ipatool\`. The account file is always en
 ## Notes
 
 - If you move to a new machine or reinstall the OS, run `auth revoke` + `auth login` again
-- Paid apps are not supported — only free apps and apps already in your account's library
+- Paid apps must already be owned by the Apple Account directly or through Family Sharing; ipatool resolves the entitlement but never charges a new purchase
 - `purchase` must be run before `download` for any app not in your library
 - Older versions obtained via `--external-version-id` may no longer be signed by Apple and might not install
 - Session token expiry is handled automatically — the tool re-authenticates silently using stored credentials (2FA prompts once). The cached kbsync is preserved across such token refreshes

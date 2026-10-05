@@ -764,6 +764,15 @@ static void cmd_purchase(const Args& args) {
     }
 
     AppStore store(COOKIE_FILE);
+    if (get(args, "debug") == "true") store.set_debug(true);
+
+    // Family-shared paid apps use the modern MZBuy request, which carries the
+    // FairPlay kbsync blob. Prepare it here just like download --purchase.
+    std::string entDownloadEndpoint;
+    try { entDownloadEndpoint = store.fetch_bag().entDownloadEndpoint; }
+    catch (...) { /* legacy purchase request remains available */ }
+    std::string kbsyncB64 = prepare_kbsync(
+        store, acc, entDownloadEndpoint, passphrase, get(args, "debug") == "true");
 
     // Resolve App — lookup by bundle ID or numeric app ID
     auto resolve_app = [&]() -> App {
@@ -775,12 +784,13 @@ static void cmd_purchase(const Args& args) {
     try {
         App app = resolve_app();
         std::cout << "Purchasing: " << app.name << " (" << app.bundleID << ")\n";
-        store.purchase(acc, app);
+        store.purchase(acc, app, kbsyncB64);
         json purchaseOut;
         purchaseOut["success"] = true;
         log_output(purchaseOut);
-    } catch (const PaidAppNotSupported&) {
-        print_red_err("Error: purchasing paid apps is not supported.\n");
+    } catch (const PurchaseUnavailable&) {
+        print_red_err("Purchase is unavailable for this item; if it is shared through Family Sharing, "
+                      "use download --purchase so ipatool can resolve the redownload entitlement.\n");
         exit(1);
     } catch (const PasswordTokenExpired&) {
         if (!silent_relogin(acc, passphrase)) {
@@ -789,7 +799,7 @@ static void cmd_purchase(const Args& args) {
         }
         try {
             App app = resolve_app();
-            store.purchase(acc, app);
+            store.purchase(acc, app, kbsyncB64);
             json purchaseOut;
             purchaseOut["success"] = true;
             log_output(purchaseOut);
@@ -843,6 +853,7 @@ static void cmd_list_versions(const Args& args) {
     if (get(args, "debug") == "true") store.set_debug(true);
 
     App app;
+    std::string kbsyncB64;
 
     auto run = [&]() {
         // Fetch bag to get redownloadProduct endpoint for 5002 fallback
@@ -854,8 +865,8 @@ static void cmd_list_versions(const Args& args) {
             entDownloadEndpoint = bag.entDownloadEndpoint;
         } catch (...) { /* non-fatal: fallback disabled if bag fails */ }
 
-        std::string kbsyncB64 = prepare_kbsync(store, acc, entDownloadEndpoint,
-                                               passphrase, get(args, "debug") == "true");
+        kbsyncB64 = prepare_kbsync(store, acc, entDownloadEndpoint,
+                                   passphrase, get(args, "debug") == "true");
 
         if (!bundleID.empty()) {
             app = store.lookup(acc, bundleID);
@@ -873,25 +884,39 @@ static void cmd_list_versions(const Args& args) {
         log_output(j);
     };
 
-    // --purchase: acquire a free license then retry, mirroring `download --purchase`.
+    // --purchase: acquire the entitlement then retry the version lookup.
     auto purchaseAndRetry = [&]() {
         try {
-            store.purchase(acc, app);
+            store.purchase(acc, app, kbsyncB64);
         } catch (const PasswordTokenExpired&) {
             if (!silent_relogin(acc, passphrase)) {
                 print_red_err("Error: session expired. Please log in again.\n");
                 exit(1);
             }
-            try { store.purchase(acc, app); }
+            try { store.purchase(acc, app, kbsyncB64); }
+            catch (const PurchaseUnavailable&) {
+                if (get(args, "debug") == "true")
+                    fprintf(stderr, "[DEBUG] purchase flow unavailable; retrying entitlement lookup\n");
+            }
+            catch (const LicenseRequired&) {
+                if (get(args, "debug") == "true")
+                    fprintf(stderr, "[DEBUG] purchase flow found no direct license; retrying entitlement lookup\n");
+            }
             catch (const std::exception& pe) {
                 print_red_err(std::string("Purchase error: ") + pe.what() + "\n");
                 exit(1);
             }
+        } catch (const PurchaseUnavailable&) {
+            if (get(args, "debug") == "true")
+                fprintf(stderr, "[DEBUG] purchase flow unavailable; retrying entitlement lookup\n");
+        } catch (const LicenseRequired&) {
+            if (get(args, "debug") == "true")
+                fprintf(stderr, "[DEBUG] purchase flow found no direct license; retrying entitlement lookup\n");
         } catch (const std::exception& pe) {
             print_red_err(std::string("Purchase error: ") + pe.what() + "\n");
             exit(1);
         }
-        // Apple may queue the free license asynchronously — brief wait before retry.
+        // Apple may queue the entitlement asynchronously — brief wait before retry.
         std::this_thread::sleep_for(std::chrono::seconds(2));
         try {
             run();
@@ -1312,7 +1337,7 @@ static void cmd_download(const Args& args) {
         if (!bundleID.empty()) {
             app = store.lookup(acc, bundleID);
         } else {
-            app.id = std::stoll(appIDStr);
+            app = store.lookup_by_id(acc, std::stoll(appIDStr));
         }
 
         auto out = store.download(acc, app, outputPath, versionID, progress,
@@ -1339,17 +1364,31 @@ static void cmd_download(const Args& args) {
         // if songList is present we use it directly, otherwise retry volumeStore.
         PlistDict purchaseResult;
         try {
-            purchaseResult = store.purchase(acc, app);
+            purchaseResult = store.purchase(acc, app, kbsyncB64, versionID);
         } catch (const PasswordTokenExpired&) {
             if (!silent_relogin(acc, passphrase)) {
                 print_red_err("Error: session expired. Please log in again.\n");
                 exit(1);
             }
-            try { purchaseResult = store.purchase(acc, app); }
+            try { purchaseResult = store.purchase(acc, app, kbsyncB64, versionID); }
+            catch (const PurchaseUnavailable&) {
+                if (dbg)
+                    fprintf(stderr, "[DEBUG] purchase flow unavailable; trying redownload entitlement\n");
+            }
+            catch (const LicenseRequired&) {
+                if (dbg)
+                    fprintf(stderr, "[DEBUG] purchase flow found no direct license; trying redownload entitlement\n");
+            }
             catch (const std::exception& pe) {
                 print_red_err(std::string("Purchase error: ") + pe.what() + "\n");
                 exit(1);
             }
+        } catch (const PurchaseUnavailable&) {
+            if (dbg)
+                fprintf(stderr, "[DEBUG] purchase flow unavailable; trying redownload entitlement\n");
+        } catch (const LicenseRequired&) {
+            if (dbg)
+                fprintf(stderr, "[DEBUG] purchase flow found no direct license; trying redownload entitlement\n");
         } catch (const std::exception& pe) {
             print_red_err(std::string("Purchase error: ") + pe.what() + "\n");
             exit(1);
@@ -1448,7 +1487,7 @@ Commands:
   auth info             Show saved account info
   auth revoke           Revoke and delete saved credentials
   search                Search for apps
-  purchase              Acquire a free app license
+  purchase              Acquire an App Store entitlement
   download              Download an app IPA
   list-versions         List available versions of an app
   get-version-metadata  Get metadata for a specific app version
