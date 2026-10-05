@@ -24,7 +24,11 @@ inline constexpr const char* PRIVATE_INIT_DOMAIN    = "init.itunes.apple.com";
 inline constexpr const char* PRIVATE_INIT_PATH      = "/bag.xml";
 
 inline constexpr const char* PRIVATE_AS_DOMAIN         = "buy.itunes.apple.com";
-inline constexpr const char* PRIVATE_AS_PATH_PURCHASE  = "/WebObjects/MZFinance.woa/wa/buyProduct";
+// MZBuy is the purchase/redownload endpoint used by the iTunes client. The
+// legacy MZFinance path remains useful for accounts where the modern request
+// cannot be prepared, but paid/family-shared entitlements require MZBuy.
+inline constexpr const char* PRIVATE_AS_PATH_PURCHASE  = "/WebObjects/MZBuy.woa/wa/buyProduct";
+inline constexpr const char* PRIVATE_AS_PATH_PURCHASE_LEGACY = "/WebObjects/MZFinance.woa/wa/buyProduct";
 inline constexpr const char* PRIVATE_AS_PATH_DOWNLOAD  = "/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct";
 
 inline constexpr const char* HTTP_HEADER_STOREFRONT = "X-Set-Apple-Store-Front";
@@ -63,6 +67,7 @@ inline constexpr const char* CUSTOMER_MSG_SIGN_IN             = "Sign In to the 
 
 inline constexpr const char* PRICING_APPSTORE    = "STDQ";
 inline constexpr const char* PRICING_ARCADE      = "GAME";
+inline constexpr const char* PRICING_REDOWNLOAD  = "STDRDL";
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -112,4 +117,6 @@ struct AuthCodeRequired    : IpaError { AuthCodeRequired()    : IpaError("auth c
 struct LicenseRequired     : IpaError { LicenseRequired()     : IpaError("license is required") {} };
 struct PasswordTokenExpired: IpaError { PasswordTokenExpired(): IpaError("password token is expired") {} };
 struct SubscriptionRequired: IpaError { SubscriptionRequired(): IpaError("subscription required") {} };
-struct PaidAppNotSupported : IpaError { PaidAppNotSupported() : IpaError("purchasing paid apps is not supported") {} };
+struct PurchaseUnavailable : IpaError {
+    PurchaseUnavailable() : IpaError("purchase flow is unavailable for this item") {}
+};

@@ -2,6 +2,7 @@
 #include "SapSigner.h"   // SAP signing (v2.4.0+)
 #include "device_mac.h"  // device MAC / GUID
 #include "StoreAgentMachine.h"
+#include "purchase_flow.h"
 #include <thread>
 #include <chrono>
 #include <fstream>
@@ -348,33 +349,10 @@ static constexpr const char* REDOWNLOAD_UNAVAILABLE_EXPLANATION =
     "This redownload is not available for this Apple Account either because it "
     "was bought by a different user or the item was refunded or cancelled.";
 
-// Apple writes "Apple Account" with a no-break space (U+00A0), which looks like
-// a normal space in logs. Map Unicode spaces / tabs / newlines to ' ', collapse
-// runs and trim, so the full phrases still compare exactly.
-static std::string normalize_spaces(const std::string& in) {
-    std::string out;
-    bool pendingSpace = false;
-    for (size_t i = 0; i < in.size(); ) {
-        unsigned char c = (unsigned char)in[i];
-        size_t len = 0;
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')                 len = 1;
-        else if (c == 0xC2 && i + 1 < in.size() && (unsigned char)in[i+1] == 0xA0) len = 2;  // U+00A0
-        else if (c == 0xE2 && i + 2 < in.size() && (unsigned char)in[i+1] == 0x80) {
-            unsigned char c2 = (unsigned char)in[i+2];
-            if ((c2 >= 0x80 && c2 <= 0x8A) || c2 == 0xAF) len = 3;       // U+2000..200A, U+202F
-        }
-        if (len) { pendingSpace = true; i += len; continue; }
-        if (pendingSpace && !out.empty()) out += ' ';
-        pendingSpace = false;
-        out += in[i++];
-    }
-    return out;
-}
-
 static bool is_redownload_unavailable(const PlistDict& d) {
     auto match = [](const PlistDict& m) {
-        return normalize_spaces(dict_str(m, "message"))     == REDOWNLOAD_UNAVAILABLE_MESSAGE &&
-               normalize_spaces(dict_str(m, "explanation")) == REDOWNLOAD_UNAVAILABLE_EXPLANATION;
+        return normalize_apple_text(dict_str(m, "message"))     == REDOWNLOAD_UNAVAILABLE_MESSAGE &&
+               normalize_apple_text(dict_str(m, "explanation")) == REDOWNLOAD_UNAVAILABLE_EXPLANATION;
     };
     if (match(d)) return true;
     auto it = d.find("dialog");   // Apple may nest them in a dialog dict
@@ -510,19 +488,50 @@ App AppStore::lookup_by_id(const Account& acc, int64_t appID) {
 // AppStore — Purchase
 // ─────────────────────────────────────────────────────────────────────────────
 
-PlistDict AppStore::purchase(const Account& acc, const App& app) {
-    if (app.price > 0.0) throw PaidAppNotSupported();
-
+PlistDict AppStore::purchase(const Account& acc, const App& app,
+                             const std::string& kbsyncB64,
+                             const std::string& externalVersionID)
+{
     std::string guid = get_guid();
+    m_purchaseResult.clear();
+    m_purchaseResultAppID = 0;
+
+    auto complete = [&](PlistDict result) {
+        if (has_sinfs(dict_arr(result, "songList"))) {
+            m_purchaseResultAppID = app.id;
+            m_purchaseResult = result;
+        }
+        return result;
+    };
+
+    // STDQ acquires a free entitlement and also lets Apple's MZBuy service
+    // resolve an existing paid or Family Sharing entitlement without charging
+    // because the request price is zero. If Apple refuses that operation,
+    // STDRDL is the no-charge redownload fallback.
     try {
-        return do_purchase(acc, app, guid, PRICING_APPSTORE);
+        PlistDict result = do_purchase(acc, app, guid, PRICING_APPSTORE,
+                                       kbsyncB64, externalVersionID);
+        if (kbsyncB64.empty()
+            || dict_str(result, "failureType") != FAILURE_ALREADY_PURCHASED)
+            return complete(std::move(result));
+    } catch (const PurchaseUnavailable&) {
+        if (kbsyncB64.empty()) throw;
     } catch (const IpaError& e) {
         if (std::string(e.what()).find("temporarily unavailable") != std::string::npos) {
-            return do_purchase(acc, app, guid, PRICING_ARCADE);
-        } else {
-            throw;
+            return complete(do_purchase(acc, app, guid, PRICING_ARCADE,
+                                        kbsyncB64, externalVersionID));
         }
+        throw;
     }
+
+    if (kbsyncB64.empty())
+        throw PurchaseUnavailable();
+
+    PlistDict redownload = do_purchase(acc, app, guid, PRICING_REDOWNLOAD,
+                                       kbsyncB64, externalVersionID);
+    if (dict_str(redownload, "failureType") == FAILURE_ALREADY_PURCHASED)
+        throw LicenseRequired();
+    return complete(std::move(redownload));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -547,7 +556,17 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
     //    Any miss falls through to the proven volumeStore→redownload→update path.
     PlistDict data;
     bool entServed = false;
-    if (!entDownloadEndpoint.empty() && !kbsyncB64.empty()) {
+    if (m_purchaseResultAppID == app.id
+        && has_sinfs(dict_arr(m_purchaseResult, "songList"))) {
+        if (m_debug)
+            fprintf(stderr, "[DEBUG] using download response returned by buyProduct\n");
+        data = std::move(m_purchaseResult);
+        entServed = true;
+    }
+    m_purchaseResult.clear();
+    m_purchaseResultAppID = 0;
+
+    if (!entServed && !entDownloadEndpoint.empty() && !kbsyncB64.empty()) {
         int st = 0;
         PlistDict entData = send_ent_download(acc, app, guid, entDownloadEndpoint,
                                               kbsyncB64, externalVersionID, st);
@@ -1259,6 +1278,31 @@ PlistDict AppStore::send_download_product(const Account& acc, const App& app,
         }
     }
 
+    // A Family Sharing member can have a valid entitlement even though the
+    // volumeStore endpoint reports 9610 (license not found). Probe Apple's
+    // redownload endpoint before asking the caller to run the purchase flow;
+    // an unlicensed account still falls through with the original 9610.
+    if (failureType == FAILURE_LICENSE_NOT_FOUND && !redownloadEndpoint.empty()) {
+        try {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] volumeStore returned 9610 — probing redownload endpoint\n");
+            PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
+                                                  externalVersionID, isMac,
+                                                  "redownload fallback (9610)",
+                                                  /*needSinfs=*/false);
+            if (!dict_arr(rdData, "songList").empty())
+                return rdData;
+            throw_on_store_failure(rdData);
+        } catch (const PasswordTokenExpired&) {
+            throw;
+        } catch (const LicenseRequired&) {
+            // Expected for an account that genuinely has no entitlement.
+        } catch (const std::exception& e) {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] redownload probe after 9610 failed: %s\n", e.what());
+        }
+    }
+
     // 2b. On 5002 (licensed app — e.g. Teams) fall back to redownloadProduct
     if (failureType == FAILURE_ALREADY_PURCHASED && !redownloadEndpoint.empty()) {
         PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
@@ -1360,12 +1404,15 @@ static std::map<std::string, std::string> go_download_headers(const Account& acc
 }
 
 static std::string go_download_payload(const std::string& guid, const App& app,
-                                       const std::string& appExtVrsId) {
+                                       const std::string& appExtVrsId,
+                                       bool purchasedRedownload = false) {
     PlistDict p;
     p["creditDisplay"] = PlistValue::makeString("");
     p["guid"]          = PlistValue::makeString(guid);
     p["salableAdamId"] = PlistValue::makeInt(app.id);
     p["serialNumber"]  = PlistValue::makeString("0");
+    if (purchasedRedownload)
+        p["is-purchased-redownload"] = PlistValue::makeBool(true);
     if (!appExtVrsId.empty())
         p["appExtVrsId"] = PlistValue::makeString(appExtVrsId);
     return encode_plist_xml(p);
@@ -1383,7 +1430,7 @@ PlistDict AppStore::redownload_product(const Account& acc, const App& app,
                             : redownload_version_id(acc, app, externalVersionID);
 
     auto        hdrs = go_download_headers(acc);
-    std::string body = go_download_payload(guid, app, pin);
+    std::string body = go_download_payload(guid, app, pin, /*purchasedRedownload=*/true);
     std::string url  = redownloadEndpoint + "?guid=" + guid;
 
     if (m_debug) debug_dump_request(label, "POST", url, hdrs, body);
@@ -1890,56 +1937,134 @@ Account AppStore::do_login(const std::string& email,
 // ── Purchase implementation ───────────────────────────────────────────────
 
 PlistDict AppStore::do_purchase(const Account& acc, const App& app,
-                     const std::string& guid, const std::string& pricingParam)
+                     const std::string& guid, const std::string& pricingParam,
+                     const std::string& kbsyncB64,
+                     const std::string& externalVersionID)
 {
+    const bool modernRequest = !kbsyncB64.empty();
     std::string pod_prefix;
     if (!acc.pod.empty()) pod_prefix = "p" + acc.pod + "-";
 
+    // The modern MZBuy request is the shape used by iTunes for redownloads and
+    // Family Sharing. The old Finance request remains the no-kbsync fallback
+    // for free apps and older account sessions.
+    const char* purchasePath = modernRequest
+        ? PRIVATE_AS_PATH_PURCHASE
+        : PRIVATE_AS_PATH_PURCHASE_LEGACY;
     std::string url = "https://" + pod_prefix + std::string(PRIVATE_AS_DOMAIN)
-                    + PRIVATE_AS_PATH_PURCHASE;
+                    + purchasePath;
+
+    std::string versionID = externalVersionID;
+    if (modernRequest && versionID.empty()) {
+        try {
+            versionID = lookup_latest_external_version_id(acc, app);
+        } catch (const std::exception& e) {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] purchase version lookup failed (%s) — using appExtVrsId=0\n",
+                        e.what());
+        }
+    }
 
     PlistDict payload;
-    payload["appExtVrsId"]               = PlistValue::makeString("0");
-    payload["hasAskedToFulfillPreorder"] = PlistValue::makeString("true");
-    payload["buyWithoutAuthorization"]   = PlistValue::makeString("true");
-    payload["hasDoneAgeCheck"]           = PlistValue::makeString("true");
-    payload["guid"]                      = PlistValue::makeString(guid);
-    payload["needDiv"]                   = PlistValue::makeString("0");
-    payload["origPage"]                  = PlistValue::makeString("Software-" + std::to_string(app.id));
-    payload["origPageLocation"]          = PlistValue::makeString("Buy");
-    payload["price"]                     = PlistValue::makeString("0");
-    payload["pricingParameters"]         = PlistValue::makeString(pricingParam);
-    payload["productType"]               = PlistValue::makeString("C");
-    payload["salableAdamId"]             = PlistValue::makeInt(app.id);
+    payload["appExtVrsId"] = PlistValue::makeString(versionID.empty() ? "0" : versionID);
+    payload["guid"]        = PlistValue::makeString(guid);
+    payload["price"]       = PlistValue::makeString("0");
+    payload["pricingParameters"] = PlistValue::makeString(pricingParam);
+    payload["productType"]  = PlistValue::makeString("C");
+    payload["salableAdamId"] = modernRequest
+        ? PlistValue::makeString(std::to_string(app.id))
+        : PlistValue::makeInt(app.id);
+
+    if (modernRequest) {
+        payload["ageCheck"]                = PlistValue::makeString("true");
+        payload["hasBeenAuthedForBuy"]     = PlistValue::makeString("true");
+        payload["isInApp"]                 = PlistValue::makeString("false");
+        payload["hasConfirmedPaymentSheet"] = PlistValue::makeString("true");
+        payload["asn"]                     = PlistValue::makeString("1");
+        payload["kbsync"]                  = PlistValue::makeData(SapBase64::Decode(kbsyncB64));
+        // iTunes sends sbsync as the same FairPlay blob when no separate
+        // StoreKit sync blob is available. This is required by some family
+        // accounts even though ordinary accounts accept kbsync alone.
+        payload["sbsync"]                  = PlistValue::makeData(SapBase64::Decode(kbsyncB64));
+    } else {
+        payload["hasAskedToFulfillPreorder"] = PlistValue::makeString("true");
+        payload["buyWithoutAuthorization"]   = PlistValue::makeString("true");
+        payload["hasDoneAgeCheck"]           = PlistValue::makeString("true");
+        payload["hasConfirmedPaymentSheet"]  = PlistValue::makeString("true");
+        payload["needDiv"]                   = PlistValue::makeString("0");
+        payload["origPage"]                  = PlistValue::makeString("Software-" + std::to_string(app.id));
+        payload["origPageLocation"]          = PlistValue::makeString("Buy");
+    }
 
     std::map<std::string, std::string> headers = {
         {"Content-Type",        "application/x-apple-plist"},
+        {"User-Agent",          "Configurator/2.18 (Macintosh; OS X 15.3.2; 24D81) "
+                                 "AppleWebKit/0620.2.4.11.6"},
         {"iCloud-DSID",         acc.directoryServicesID},
         {"X-Dsid",              acc.directoryServicesID},
         {"X-Apple-Store-Front", acc.storeFront},
         {"X-Token",             acc.passwordToken.get()},
     };
 
+    if (m_debug)
+        debug_dump_request(modernRequest ? "buyProduct (modern)" : "buyProduct (legacy)",
+                           "POST", url, headers, encode_plist_xml(payload));
     HttpResponse res  = m_http.post(url, encode_plist_xml(payload), headers);
-    PlistDict    data  = decode_plist(res.body);
+    if (m_debug)
+        debug_dump_response(modernRequest ? "buyProduct (modern)" : "buyProduct (legacy)", res);
+    PlistDict    data = decode_plist(res.body);
 
     std::string failureType     = dict_str(data, "failureType");
     std::string customerMessage = dict_str(data, "customerMessage");
     std::string jingleDocType   = dict_str(data, "jingleDocType");
     int64_t     status          = dict_int(data, "status");
 
-    if (failureType == FAILURE_TEMPORARILY_UNAVAILABLE)   throw IpaError("item is temporarily unavailable");
-    if (failureType == FAILURE_ALREADY_PURCHASED)         throw IpaError("license already exists");
-    if (customerMessage == CUSTOMER_MSG_SUBSCRIPTION_REQ) throw SubscriptionRequired();
-    if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED)    throw PasswordTokenExpired();
-    if (customerMessage == CUSTOMER_MSG_SIGN_IN)          throw PasswordTokenExpired();
-    if (!failureType.empty() && !customerMessage.empty()) throw IpaError(customerMessage);
-    if (!failureType.empty())                             throw IpaError("something went wrong");
-    if (res.statusCode == 500)                            throw IpaError("license already exists");
+    if (failureType == FAILURE_TEMPORARILY_UNAVAILABLE)
+        throw IpaError("item is temporarily unavailable");
+    if (failureType == FAILURE_LICENSE_NOT_FOUND)
+        throw LicenseRequired();
+    if (customerMessage == CUSTOMER_MSG_SUBSCRIPTION_REQ)
+        throw SubscriptionRequired();
+    if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED ||
+        failureType == FAILURE_SIGN_IN_REQUIRED ||
+        failureType == FAILURE_DEVICE_VERIFICATION)
+        throw PasswordTokenExpired();
+    if (customerMessage == CUSTOMER_MSG_SIGN_IN)
+        throw PasswordTokenExpired();
+    auto dialogIt = data.find("dialog");
+    const std::string dialogMessage = dialogIt != data.end() && dialogIt->second.isDict()
+        ? dict_str(dialogIt->second.dictVal, "message") : "";
+    if (is_purchase_unavailable_message(customerMessage)
+        || is_purchase_unavailable_message(dialogMessage))
+        throw PurchaseUnavailable();
+
+    // 5002 and HTTP 500 mean that the account already has an entitlement. In
+    // particular, this is how Apple's buyProduct endpoint reports a family
+    // purchase: there is nothing to charge, so let the download path resolve
+    // the actual redownload entitlement.
+    if (failureType == FAILURE_ALREADY_PURCHASED || res.statusCode == 500) {
+        if (modernRequest) {
+            if (data.empty()) data["failureType"] = PlistValue::makeString(FAILURE_ALREADY_PURCHASED);
+            return data;
+        }
+        throw IpaError("license already exists");
+    }
+
+    if (!failureType.empty() && !customerMessage.empty())
+        throw IpaError(customerMessage);
+    if (!failureType.empty())
+        throw IpaError("something went wrong");
+
+    // Modern STDRDL responses are download responses rather than purchase
+    // receipts, so a successful status or songList is sufficient. Legacy
+    // requests still require the traditional purchaseSuccess marker.
+    if (modernRequest) {
+        if (is_modern_purchase_success(data)) return data;
+        throw IpaError("failed to acquire app entitlement");
+    }
     if (jingleDocType != "purchaseSuccess" || status != 0)
         throw IpaError("failed to purchase app");
 
-    // Return full result — caller can use songList if present (paid apps)
     return data;
 }
 

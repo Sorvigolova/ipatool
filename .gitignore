@@ -1,0 +1,4 @@
+# Local build products and downloaded App Store packages
+build/
+*.ipa
+.DS_Store
