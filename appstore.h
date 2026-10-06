@@ -61,21 +61,22 @@ public:
 
     struct BagOutput {
         std::string authEndpoint;
-        std::string redownloadEndpoint;  // https://downloaddispatch.itunes.apple.com/r/redownload
-        std::string updateEndpoint;      // https://downloaddispatch.itunes.apple.com/up/updateProduct
-        std::string entDownloadEndpoint; // bag key volumeStoreDownloadProduct → .../wa/ent/download
-        std::string songDownloadDoneEndpoint; // bag key songDownloadDone → MZFastFinance .../songDownloadDone
+        std::string redownloadEndpoint;          // bag key redownloadProduct → https://downloaddispatch.itunes.apple.com/r/redownload
+        std::string updateEndpoint;              // bag key updateProduct → https://downloaddispatch.itunes.apple.com/up/updateProduct
+        std::string volumeStoreDownloadEndpoint; // bag key volumeStoreDownloadProduct → https://downloaddispatch.itunes.apple.com/WebObjects/DownloadDispatch.woa/wa/ent/download
+        std::string songDownloadDoneEndpoint;    // bag key songDownloadDone → https://buy.itunes.apple.com/WebObjects/MZFastFinance.woa/wa/songDownloadDone
         // SAP config fields (v2.4.0+ — from bag.xml sign-sap-* keys)
-        std::string          signSapSetup;        // sign-sap-setup URL
-        std::string          signSapSetupCert;    // sign-sap-setup-cert URL
+        std::string          signSapSetup;       // bag key sign-sap-setup → https://fpinit.itunes.apple.com/v1/signSapSetup/legacy
+        std::string          signSapSetupCert;   // bag key sign-sap-setup-cert → https://s.mzstatic.com/sap/setupCert.plist
         uint32_t             sapVersion   = 0;   // sign-sap-version (must be 200)
-        std::vector<uint8_t> hardwareID;          // raw MAC bytes for SapSigner::Config
+        std::vector<uint8_t> hardwareID;         // raw MAC bytes for SapSigner::Config
     };
 
-    // Fetch bag.xml and return both auth and redownload endpoints.
-    // Call this before download / list-versions / get-version-metadata to
-    // obtain the redownloadEndpoint needed for the 5002 fallback.
-    BagOutput fetch_bag();
+    // Fetch and parse bag.xml. Returns every endpoint the download/auth flow needs
+    // — authenticateAccount, volumeStoreDownloadProduct, redownloadProduct,
+    // updateProduct, songDownloadDone — plus the SAP signing config. Call before
+    // download / list-versions / get-version-metadata; login() uses it too.
+    BagOutput fetch_bag(const std::string& guid = "");
 
     // ── Login ────────────────────────────────────────────────────────────────
 
@@ -118,11 +119,11 @@ public:
                             const std::string& externalVersionID = "",
                             ProgressCb progress = nullptr,
                             const std::string& redownloadEndpoint = "",
-                            const std::string& entDownloadEndpoint = "",
+                            const std::string& volumeStoreDownloadEndpoint = "",
                             const std::string& kbsyncB64 = "",
                             const std::string& songDownloadDoneEndpoint = "");
 
-    // True when the last download()'s ent/download stage was rejected in a way
+    // True when the last download()'s volumeStoreDownload stage was rejected in a way
     // that suggests the cached kbsync is stale (HTTP >= 500). The caller uses
     // this to drop the cached blob so the next run regenerates it.
     bool kbsync_rejected() const { return m_kbsyncRejected; }
@@ -145,7 +146,7 @@ public:
     ListVersionsOutput list_versions(const Account& acc,
                                     const App& app,
                                     const std::string& redownloadEndpoint = "",
-                                    const std::string& entDownloadEndpoint = "",
+                                    const std::string& volumeStoreDownloadEndpoint = "",
                                     const std::string& kbsyncB64 = "");
 
     // ── Get Version Metadata ─────────────────────────────────────────────────
@@ -158,28 +159,28 @@ public:
                                                    const App& app,
                                                    const std::string& versionID,
                                                    const std::string& redownloadEndpoint = "",
-                                                   const std::string& entDownloadEndpoint = "",
+                                                   const std::string& volumeStoreDownloadEndpoint = "",
                                                    const std::string& kbsyncB64 = "");
 
 private:
     HttpClient m_http;
     bool       m_debug = false;
-    bool       m_kbsyncRejected = false; // set by the ent/download stage, read by caller
+    bool       m_kbsyncRejected = false; // set by the volumeStoreDownload stage, read by caller
 
-    // ── ent/download first stage (uses kbsync) ───────────────────────────────
-    // POSTs the ent/download request with the given base64 kbsync and returns
-    // the decoded response. httpStatus receives the HTTP status code so the
-    // caller can tell a stale-kbsync rejection (>= 500) from a normal refusal.
-    // Body (all strings): creditDisplay="", guid, kbsync, salableAdamId,
-    // externalVersionId (when set). Matches the reference tool's request shape.
-    PlistDict send_ent_download(const Account& acc, const App& app,
+    // ── volumeStoreDownloadProduct (bag download endpoint, kbsync-signed) ────────
+    // POSTs the bag's volumeStoreDownloadProduct with the base64 kbsync and returns
+    // the decoded response; httpStatus receives the HTTP status so the caller can
+    // tell a stale-kbsync rejection (>= 500) from a normal refusal. With authed, the
+    // payload carries hasBeenAuthedForBuy=true (the 2042 "confirm download" retry).
+    PlistDict volume_store_download_product(const Account& acc, const App& app,
                                 const std::string& guid,
-                                const std::string& entDownloadEndpoint,
+                                const std::string& volumeStoreDownloadEndpoint,
                                 const std::string& kbsyncB64,
                                 const std::string& externalVersionID,
+                                bool authed,
                                 int& httpStatus);
-    // Bag "updateProduct" endpoint, remembered by fetch_bag_impl() so the
-    // redownload fallback can use it without changing public signatures.
+    // Bag "updateProduct" endpoint, remembered by fetch_bag() so resolve_download
+    // can use it without changing public signatures.
     std::string m_updateEndpoint;
 
     // GET the bag's songDownloadDone URL (built with the account pod + songId +
@@ -191,23 +192,21 @@ private:
 
     static std::string get_guid();
 
-    // ── sendDownloadProduct — shared volumeStore->redownload helper ─────────
-    //
-    // Sends to volumeStore first (uses externalVersionId version key).
-    // On failureType "5002" (licensed app), falls back to bag-resolved
-    // redownloadProduct (uses appExtVrsId key):
-    //   - redownload serves the app                    -> use redownload response
-    //   - redownload: empty songList + "No Longer Available"
-    //                                                  -> transient 5002 -> retry volumeStore
-    // Returns the top-level response PlistDict for the caller to inspect.
-    //
-    // isMac: skip the iOS catalog version lookup on the redownload fallback
-    // (the lookup would pin an iOS build for a macOS download).
-    PlistDict send_download_product(const Account& acc, const App& app,
-                                     const std::string& guid,
-                                     const std::string& externalVersionID,
-                                     const std::string& redownloadEndpoint,
-                                     bool isMac = false);
+    // ── resolve_download — stateless 3-endpoint cascade ─────────────────────────
+    // Tries the three bag endpoints in order — volumeStoreDownloadProduct (kbsync),
+    // redownloadProduct, updateProduct — and returns the first response that serves
+    // the app: a songList item, with sinf data when needSinfs (download) or just
+    // metadata when not (list-versions / get-version-metadata). Carries the 2042
+    // auth-dialog retry and surfaces PasswordTokenExpired; when nothing serves and
+    // the account simply has no license it throws LicenseRequired so a --purchase
+    // caller can acquire it.
+    PlistDict resolve_download(const Account& acc, const App& app,
+                               const std::string& guid,
+                               const std::string& externalVersionID,
+                               const std::string& redownloadEndpoint,
+                               const std::string& volumeStoreDownloadEndpoint,
+                               const std::string& kbsyncB64,
+                               bool isMac, bool needSinfs);
 
     // ── Platform version lookup (port of upstream appstore_platform_version_lookup.go)
     //
@@ -219,52 +218,38 @@ private:
     // Throws IpaError when no catalog lists the app or on HTTP failure.
     std::string lookup_latest_external_version_id(const Account& acc, const App& app);
 
-    // ── Redownload + updateProduct fallback (port of upstream sendDownloadProduct)
-    //
+    // ── redownloadProduct (bag) — pure endpoint call ────────────────────────────
     // POSTs redownloadProduct with the Go request shape (headers: Content-Type,
-    // iCloud-DSID, X-Dsid; payload: creditDisplay, guid, salableAdamId,
-    // serialNumber, appExtVrsId). The version is pinned to externalVersionID or,
-    // for iOS, the latest from the platform catalogs.
-    // If redownload answers HTTP 500 with an empty body, or 200 with a
-    // "No Longer Available" message, and the version is pinned, the same request
-    // goes to the bag's updateProduct endpoint. With needSinfs (download only),
-    // a 200 answer whose item carries no sinf data also goes to updateProduct.
-    // Returns the decoded response of the last request sent.
+    // iCloud-DSID, X-Dsid; payload: creditDisplay, guid, salableAdamId, serialNumber,
+    // appExtVrsId=pin) and returns the decoded response plus its HTTP status. The
+    // version pin is computed by the caller; all cascade decisions (falling on to
+    // updateProduct, concluding a missing license) live in resolve_download.
     PlistDict redownload_product(const Account& acc, const App& app,
                                  const std::string& guid,
                                  const std::string& redownloadEndpoint,
-                                 const std::string& externalVersionID,
-                                 bool isMac, const char* label,
-                                 bool needSinfs = false);
+                                 const std::string& pin,
+                                 const char* label,
+                                 int& httpStatus);
 
     // updateProduct request (upstream sendUpdateProduct). Returns the response
     // as-is when it carries a failureType; throws IpaError on a customer
     // message, a non-200 status, or a response that does not match the
     // requested app ID / version / bundle ID.
-    PlistDict send_update_product(const Account& acc, const App& app,
-                                  const std::string& guid,
-                                  const std::string& externalVersionID);
+    PlistDict update_product(const Account& acc, const App& app,
+                             const std::string& guid,
+                             const std::string& externalVersionID);
 
-    // Version to pin on a redownload request: externalVersionID if set,
+    // Version to pin on a redownload/update request: externalVersionID if set,
     // otherwise the result of lookup_latest_external_version_id(). Unpinned
     // redownloads can return the wrong platform's build (e.g. tvOS).
     // Returns "" (unpinned, previous behaviour) if the lookup fails.
     std::string redownload_version_id(const Account& acc, const App& app,
                                       const std::string& externalVersionID);
 
-    // Download (macOS) — decrypts .pkg using StoreAgentMachine
-    DownloadOutput download_mac(const Account& acc, const App& app,
-                                const std::string& outputPath,
-                                ProgressCb progress,
-                                const std::string& redownloadEndpoint);
 
 
 
-
-    // ── Bag (fetch auth + redownload endpoints) ──────────────────────────────
-    BagOutput fetch_bag_impl(const std::string& guid);
-
-    std::string fetch_bag_auth_endpoint(const std::string& guid);
+    // ── Bag (fetch bag.xml: all download/auth endpoints + SAP config) ────────
 
     // ── Login implementation ─────────────────────────────────────────────────
     Account do_login(const std::string& email,
@@ -320,8 +305,12 @@ private:
     // ── Path helpers (C++17 std::filesystem — no POSIX needed) ───────────────
     static std::string resolve_destination(const App& app,
                                            const std::string& version,
-                                           const std::string& outputPath);
-    static std::string make_filename(const App& app, const std::string& version);
+                                           const std::string& outputPath,
+                                           const std::string& displayName = "",
+                                           const std::string& ext = ".ipa");
+    static std::string make_filename(const App& app, const std::string& version,
+                                     const std::string& displayName = "",
+                                     const std::string& ext = ".ipa");
     static int64_t file_size(const std::string& path);
 
     // ── String helpers ────────────────────────────────────────────────────────

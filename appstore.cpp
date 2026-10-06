@@ -339,6 +339,26 @@ static bool has_sinfs(const PlistArray& songList) {
     return false;
 }
 
+// Build the base download filename "<name> <version>" (no extension), matching
+// iTunes, which names the file by the app's bundleDisplayName + a space + version
+// and does NOT put the numeric id in it. The display name is preferred; bundleID
+// is the fallback. Path-breaking characters in the name are replaced with '_'. The
+// id is used only as a last resort when nothing else yields a name. Ext by callers.
+static std::string build_base_filename(const std::string& displayName,
+                                       const App& app, const std::string& version) {
+    std::string front = !displayName.empty() ? displayName : app.bundleID;
+    // Replace characters that are invalid in a Windows filename (and path
+    // separators on any OS) with '_'; spaces are kept, as iTunes does.
+    for (char& c : front)
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<'  || c == '>' || c == '|')
+            c = '_';
+    std::string name = front;
+    if (!version.empty()) { if (!name.empty()) name += " "; name += version; }
+    if (name.empty()) name = std::to_string(app.id);  // degenerate fallback only
+    return name;
+}
+
 // Redownload refusal meaning this account holds no license for the item.
 // Compared in full (Apple always sends these in English): other refusals with
 // different wording have other causes and must not trigger a purchase.
@@ -381,29 +401,9 @@ static bool is_redownload_unavailable(const PlistDict& d) {
     return it != d.end() && it->second.isDict() && match(it->second.dictVal);
 }
 
-// Same failure mapping as the top of download()/list_versions().
-static void throw_on_store_failure(const PlistDict& data) {
-    std::string failureType     = dict_str(data, "failureType");
-    std::string customerMessage = dict_str(data, "customerMessage");
-    if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED ||
-        failureType == FAILURE_SIGN_IN_REQUIRED        ||
-        failureType == FAILURE_DEVICE_VERIFICATION)
-        throw PasswordTokenExpired();
-    if (customerMessage == CUSTOMER_MSG_SIGN_IN)   throw PasswordTokenExpired();
-    if (failureType == FAILURE_LICENSE_NOT_FOUND)  throw LicenseRequired();
-    if (!failureType.empty() && !customerMessage.empty())
-        throw IpaError("received error: " + customerMessage);
-    if (!failureType.empty())
-        throw IpaError("received error: " + failureType);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// AppStore — Bag / Login
+// AppStore — Login
 // ─────────────────────────────────────────────────────────────────────────────
-
-AppStore::BagOutput AppStore::fetch_bag() {
-    return fetch_bag_impl(get_guid());
-}
 
 Account AppStore::login(const std::string& email,
               const std::string& password,
@@ -413,7 +413,7 @@ Account AppStore::login(const std::string& email,
     std::string guid = get_guid();
 
     // Fetch bag for both the auth endpoint and SAP config
-    BagOutput bag = fetch_bag_impl(guid);
+    BagOutput bag = fetch_bag(guid);
     std::string loginEndpoint = endpoint.empty() ? bag.authEndpoint : endpoint;
 
     // Create SAP signer — performs handshake with Apple servers (v2.4.0+).
@@ -535,89 +535,20 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
                         const std::string& externalVersionID,
                         ProgressCb progress,
                         const std::string& redownloadEndpoint,
-                        const std::string& entDownloadEndpoint,
+                        const std::string& volumeStoreDownloadEndpoint,
                         const std::string& kbsyncB64,
                         const std::string& songDownloadDoneEndpoint)
 {
     std::string guid = get_guid();
     m_kbsyncRejected = false;
 
-    // ── Stage 0: ent/download (kbsync). Best-effort first stage — if it serves
-    //    the app (songList with sinf data), use it and skip the legacy chain.
-    //    Any miss falls through to the proven volumeStore→redownload→update path.
-    PlistDict data;
-    bool entServed = false;
-    if (!entDownloadEndpoint.empty() && !kbsyncB64.empty()) {
-        int st = 0;
-        PlistDict entData = send_ent_download(acc, app, guid, entDownloadEndpoint,
-                                              kbsyncB64, externalVersionID, st);
-        if (has_sinfs(dict_arr(entData, "songList"))) {
-            if (m_debug) fprintf(stderr, "[DEBUG] ent/download served the app\n");
-            data      = std::move(entData);
-            entServed = true;
-        } else if (st >= 500) {
-            // Server error → the cached kbsync is likely stale. Flag it so the
-            // caller drops it (next run regenerates), and fall back for now.
-            m_kbsyncRejected = true;
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] ent/download rejected (HTTP %d) — kbsync "
-                                "likely stale, falling back to volumeStore\n", st);
-        } else if (m_debug) {
-            fprintf(stderr, "[DEBUG] ent/download no sinf data (HTTP %d) — "
-                            "falling back to volumeStore\n", st);
-        }
-    }
-
-    if (!entServed)
-        data = send_download_product(acc, app, guid, externalVersionID, redownloadEndpoint);
-
-    std::string failureType     = dict_str(data, "failureType");
-    std::string customerMessage = dict_str(data, "customerMessage");
-
-    if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED ||
-        failureType == FAILURE_SIGN_IN_REQUIRED        ||   // "2042" — v2.4.0
-        failureType == FAILURE_DEVICE_VERIFICATION)         // "1008" — v2.4.0
-        throw PasswordTokenExpired();
-    if (customerMessage == CUSTOMER_MSG_SIGN_IN)        throw PasswordTokenExpired();
-    if (failureType == FAILURE_LICENSE_NOT_FOUND)      throw LicenseRequired();
-    if (!failureType.empty() && !customerMessage.empty())
-        throw IpaError("received error: " + customerMessage);
-    if (!failureType.empty())
-        throw IpaError("received error: " + failureType);
-
+    // Stateless 3-endpoint cascade (volumeStoreDownloadProduct → redownloadProduct
+    // → updateProduct). Returns a served songList with sinf data, or throws
+    // (LicenseRequired lets a --purchase caller acquire the license).
+    PlistDict data = resolve_download(acc, app, guid, externalVersionID,
+                                      redownloadEndpoint, volumeStoreDownloadEndpoint,
+                                      kbsyncB64, /*isMac=*/false, /*needSinfs=*/true);
     auto songList = dict_arr(data, "songList");
-    if (!has_sinfs(songList)) {   // empty songList, or an item without sinf data
-        if (!customerMessage.empty()) throw IpaError(customerMessage);
-
-        // purchaseSuccess + empty songList — try redownload endpoint before giving up.
-        // Apple sometimes serves previously purchased (or just-purchased) apps through
-        // the redownload path even when volumeStore returns empty songList.
-        std::string jingle = dict_str(data, "jingleDocType");
-        if ((jingle == "purchaseSuccess" || jingle.empty()) && !redownloadEndpoint.empty()) {
-            if (m_debug)
-                fprintf(stderr, songList.empty()
-                    ? "[DEBUG] empty songList after purchase — trying redownload endpoint\n"
-                    : "[DEBUG] no sinf data in response — trying redownload endpoint\n");
-            PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
-                                                  externalVersionID, /*isMac=*/false,
-                                                  "redownload", /*needSinfs=*/true);
-            auto rdList = dict_arr(rdData, "songList");
-            if (has_sinfs(rdList)) {
-                data     = std::move(rdData);
-                songList = std::move(rdList);
-                goto process_songlist;
-            }
-            throw_on_store_failure(rdData);
-        }
-
-        if (!songList.empty())
-            throw IpaError("download response does not contain sinf data");
-        if (jingle == "purchaseSuccess")
-            throw IpaError("app is not available for download in your region/storefront"
-                           " (license was granted but download was blocked)");
-        throw IpaError("invalid response: empty songList");
-    }
-    process_songlist:
 
     auto& itemVal = songList[0];
     if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
@@ -641,6 +572,10 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
         if (vIt != metadata.end() && vIt->second.isString())
             version = vIt->second.str();
     }
+    // iTunes names downloads by bundleDisplayName — always present in the response
+    // metadata (iOS and macOS), so numeric-id downloads (no catalog lookup) still
+    // get a name. build_base_filename falls back to bundleID if it were ever empty.
+    std::string displayName = dict_str(metadata, "bundleDisplayName");
 
     std::vector<Sinf> sinfs;
     auto sinfsIt = item.find("sinfs");
@@ -730,16 +665,10 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
             if (!s.dpInfo.empty()) { dpInfo = s.dpInfo; break; }
         }
 
-        // Resolve output path with .pkg extension
-        std::string pkgDest = outputPath;
-        if (pkgDest.empty() || fs::is_directory(pkgDest)) {
-            std::string fname = app.name + "_" + std::to_string(app.id) + "_" + version + ".pkg";
-            // sanitize filename
-            for (char& c : fname) if (c=='/' || c=='\\' || c==':') c='_';
-            pkgDest = pkgDest.empty() ? fname : (pkgDest + "/" + fname);
-        } else if (pkgDest.size() < 4 || pkgDest.substr(pkgDest.size()-4) != ".pkg") {
-            pkgDest += ".pkg";
-        }
+        // Resolve output path exactly like the iOS path: -o as a file is used
+        // verbatim, a directory gets "{name} {version}.pkg", empty defaults to the
+        // current directory. (Unicode-safe; no blind ".pkg" appending.)
+        std::string pkgDest = resolve_destination(app, version, outputPath, displayName, ".pkg");
 
         std::string tmpPkg = pkgDest + ".tmp";
         int64_t rangeStart = file_size(tmpPkg);
@@ -799,7 +728,7 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
     }
 
     // ── iOS IPA path ────────────────────────────────────────────────────────
-    std::string dest    = resolve_destination(app, version, outputPath);
+    std::string dest    = resolve_destination(app, version, outputPath, displayName);
     std::string tmpDest = dest + ".tmp";
 
     int64_t rangeStart = file_size(tmpDest);
@@ -820,85 +749,18 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
 AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc,
                         const App& app,
                         const std::string& redownloadEndpoint,
-                        const std::string& entDownloadEndpoint,
+                        const std::string& volumeStoreDownloadEndpoint,
                         const std::string& kbsyncB64)
 {
     std::string guid = get_guid();
     m_kbsyncRejected = false;
 
-    // ── Stage 0: ent/download (kbsync). Best-effort first stage — if it serves
-    //    the app (songList with sinf data), use it and skip the legacy chain.
-    //    Any miss falls through to the proven volumeStore→redownload→update path.
-    PlistDict data;
-    bool entServed = false;
-    if (!entDownloadEndpoint.empty() && !kbsyncB64.empty()) {
-        int st = 0;
-        PlistDict entData = send_ent_download(acc, app, guid, entDownloadEndpoint,
-            kbsyncB64, "", st);
-        if (has_sinfs(dict_arr(entData, "songList"))) {
-            if (m_debug) fprintf(stderr, "[DEBUG] ent/download served the app\n");
-            data = std::move(entData);
-            entServed = true;
-        }
-        else if (st >= 500) {
-            // Server error → the cached kbsync is likely stale. Flag it so the
-            // caller drops it (next run regenerates), and fall back for now.
-            m_kbsyncRejected = true;
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] ent/download rejected (HTTP %d) — kbsync "
-                    "likely stale, falling back to volumeStore\n", st);
-        }
-        else if (m_debug) {
-            fprintf(stderr, "[DEBUG] ent/download no sinf data (HTTP %d) — "
-                "falling back to volumeStore\n", st);
-        }
-    }
-
-    if (!entServed)
-        data = send_download_product(acc, app, guid, "", redownloadEndpoint);
-
-    std::string failureType     = dict_str(data, "failureType");
-    std::string customerMessage = dict_str(data, "customerMessage");
-    if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED ||
-        failureType == FAILURE_SIGN_IN_REQUIRED        ||   // "2042" — v2.4.0
-        failureType == FAILURE_DEVICE_VERIFICATION)         // "1008" — v2.4.0
-        throw PasswordTokenExpired();
-    if (customerMessage == CUSTOMER_MSG_SIGN_IN)        throw PasswordTokenExpired();
-    if (failureType == FAILURE_LICENSE_NOT_FOUND)      throw LicenseRequired();
-    if (!failureType.empty() && !customerMessage.empty())
-        throw IpaError("received error: " + customerMessage);
-    if (!failureType.empty())
-        throw IpaError("received error: " + failureType);
-
+    // Stateless 3-endpoint cascade; list-versions needs only item metadata, so
+    // sinf data is not required (needSinfs=false).
+    PlistDict data = resolve_download(acc, app, guid, /*externalVersionID=*/"",
+                                      redownloadEndpoint, volumeStoreDownloadEndpoint,
+                                      kbsyncB64, /*isMac=*/false, /*needSinfs=*/false);
     auto songList = dict_arr(data, "songList");
-    if (songList.empty()) {
-        if (!customerMessage.empty()) throw IpaError(customerMessage);
-
-        // Empty songList on list_versions — try redownload endpoint before giving up.
-        // Some apps (e.g. removed from local storefront) return songList via redownload
-        // even when volumeStore returns empty. Matches behaviour of download flow.
-        std::string jingle = dict_str(data, "jingleDocType");
-        if (!redownloadEndpoint.empty()) {
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] list_versions: empty songList — trying redownload endpoint\n");
-            PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
-                                                  "", /*isMac=*/false,
-                                                  "list_versions redownload");
-            auto rdList = dict_arr(rdData, "songList");
-            if (!rdList.empty()) {
-                data     = std::move(rdData);
-                songList = std::move(rdList);
-                goto lv_process_songlist;
-            }
-            throw_on_store_failure(rdData);
-        }
-
-        if (jingle == "purchaseSuccess")
-            throw IpaError("app is not available for download in your region/storefront"
-                           " (license was granted but download was blocked)");
-        throw IpaError("invalid response: empty songList");
-    }
-    lv_process_songlist:
     {
     auto& itemVal = songList[0];
     if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
@@ -926,94 +788,24 @@ AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc,
         ? std::to_string(latIt->second.intVal) : latIt->second.str();
 
     return out;
-    } // lv_process_songlist block
+    } // version-identifier extraction block
 }
 
 AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account& acc,
                                                const App& app,
                                                const std::string& versionID,
                                                const std::string& redownloadEndpoint,
-                                               const std::string& entDownloadEndpoint,
+                                               const std::string& volumeStoreDownloadEndpoint,
                                                const std::string& kbsyncB64)
 {
     std::string guid = get_guid();
     m_kbsyncRejected = false;
 
-    // ── Stage 0: ent/download (kbsync). Best-effort first stage — if it serves
-    //    the app (songList with sinf data), use it and skip the legacy chain.
-    //    Any miss falls through to the proven volumeStore→redownload→update path.
-    PlistDict data;
-    bool entServed = false;
-    if (!entDownloadEndpoint.empty() && !kbsyncB64.empty()) {
-        int st = 0;
-        PlistDict entData = send_ent_download(acc, app, guid, entDownloadEndpoint,
-            kbsyncB64, versionID, st);
-        if (has_sinfs(dict_arr(entData, "songList"))) {
-            if (m_debug) fprintf(stderr, "[DEBUG] ent/download served the app\n");
-            data = std::move(entData);
-            entServed = true;
-        }
-        else if (st >= 500) {
-            // Server error → the cached kbsync is likely stale. Flag it so the
-            // caller drops it (next run regenerates), and fall back for now.
-            m_kbsyncRejected = true;
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] ent/download rejected (HTTP %d) — kbsync "
-                    "likely stale, falling back to volumeStore\n", st);
-        }
-        else if (m_debug) {
-            fprintf(stderr, "[DEBUG] ent/download no sinf data (HTTP %d) — "
-                "falling back to volumeStore\n", st);
-        }
-    }
-
-    if (!entServed)
-        data = send_download_product(acc, app, guid, versionID, redownloadEndpoint);
-
-    std::string failureType     = dict_str(data, "failureType");
-    std::string customerMessage = dict_str(data, "customerMessage");
-    if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED ||
-        failureType == FAILURE_SIGN_IN_REQUIRED        ||   // "2042" — v2.4.0
-        failureType == FAILURE_DEVICE_VERIFICATION)         // "1008" — v2.4.0
-        throw PasswordTokenExpired();
-    if (customerMessage == CUSTOMER_MSG_SIGN_IN)        throw PasswordTokenExpired();
-    if (failureType == FAILURE_LICENSE_NOT_FOUND)      throw LicenseRequired();
-    if (!failureType.empty() && !customerMessage.empty())
-        throw IpaError("received error: " + customerMessage);
-    if (!failureType.empty())
-        throw IpaError("received error: " + failureType);
-
+    // Stateless 3-endpoint cascade; get-version-metadata needs only item metadata.
+    PlistDict data = resolve_download(acc, app, guid, versionID,
+                                      redownloadEndpoint, volumeStoreDownloadEndpoint,
+                                      kbsyncB64, /*isMac=*/false, /*needSinfs=*/false);
     auto songList = dict_arr(data, "songList");
-    if (songList.empty()) {
-        if (!customerMessage.empty()) throw IpaError(customerMessage);
-
-        // Empty songList after purchaseSuccess — retry via redownload (pinned to
-        // the requested version), like download() and list_versions().
-        std::string jingle = dict_str(data, "jingleDocType");
-        if ((jingle == "purchaseSuccess" || jingle.empty()) && !redownloadEndpoint.empty()) {
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] get_version_metadata: empty songList — trying redownload endpoint\n");
-            PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
-                                                  versionID, /*isMac=*/false,
-                                                  "get_version_metadata redownload");
-            auto rdList = dict_arr(rdData, "songList");
-            if (!rdList.empty()) {
-                data     = std::move(rdData);
-                songList = std::move(rdList);
-            } else {
-                throw_on_store_failure(rdData);
-            }
-        }
-
-        // Still empty = app not available in this storefront/region
-        // (e.g. VPN apps removed from Russian App Store by government order)
-        if (songList.empty()) {
-            if (jingle == "purchaseSuccess")
-                throw IpaError("app is not available for download in your region/storefront"
-                               " (license was granted but download was blocked)");
-            throw IpaError("invalid response: empty songList");
-        }
-    }
     auto& itemVal = songList[0];
     if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
     const PlistDict& item = itemVal.dictVal;
@@ -1033,7 +825,7 @@ AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account&
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AppStore — private helpers
+// AppStore — Private: misc / kbsync
 // ─────────────────────────────────────────────────────────────────────────────
 
 // GUID sent with every App Store request: hex of the physical adapter's MAC
@@ -1078,8 +870,12 @@ std::vector<uint8_t> AppStore::generate_kbsync(uint64_t dsid) {
     return kbsync;
 }
 
-// ── sendDownloadProduct — shared volumeStore->redownload helper ─────────
-// Device serial for ent/download: 9 bytes (54 C8 B0 A9 88 + last 4 bytes of the
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Private: download endpoints, cascade & bag
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Device serial (fserial) for volumeStoreDownloadProduct ──────────────────
+// Device serial for volumeStoreDownload: 9 bytes (54 C8 B0 A9 88 + last 4 bytes of the
 // GUID), base64-encoded. Unique per machine. guid is 12 hex chars (6 bytes).
 static std::string make_fserial(const std::string& guid) {
     std::vector<uint8_t> bytes = { 0x54, 0xC8, 0xB0, 0xA9, 0x88 };
@@ -1091,16 +887,17 @@ static std::string make_fserial(const std::string& guid) {
     return SapBase64::Encode(bytes);
 }
 
-// ── ent/download first stage (kbsync) ────────────────────────────────────────
-PlistDict AppStore::send_ent_download(const Account& acc, const App& app,
+// ── volumeStoreDownloadProduct (bag download endpoint, kbsync-signed) ───────
+PlistDict AppStore::volume_store_download_product(const Account& acc, const App& app,
                                       const std::string& guid,
-                                      const std::string& entDownloadEndpoint,
+                                      const std::string& volumeStoreDownloadEndpoint,
                                       const std::string& kbsyncB64,
                                       const std::string& externalVersionID,
+                                      bool authed,
                                       int& httpStatus)
 {
     httpStatus = 0;
-    std::string url = entDownloadEndpoint + "?guid=" + guid;
+    std::string url = volumeStoreDownloadEndpoint + "?guid=" + guid;
 
     // Headers match the reference tool exactly (note: form-urlencoded content
     // type even though the body is a plist, plus an explicit Configurator UA).
@@ -1125,12 +922,15 @@ PlistDict AppStore::send_ent_download(const Account& acc, const App& app,
         acc.fserial.empty() ? make_fserial(guid) : acc.fserial);
     if (!externalVersionID.empty())
         p["externalVersionId"] = PlistValue::makeString(externalVersionID);
+    // 2042 AuthTokenResumeFreeBuy confirmation ("Download" in the dialog).
+    if (authed)
+        p["hasBeenAuthedForBuy"] = PlistValue::makeString("true");
 
     std::string body = encode_plist_xml(p);
-    if (m_debug) debug_dump_request("ent/download", "POST", url, hdrs, body);
+    if (m_debug) debug_dump_request("volumeStoreDownload", "POST", url, hdrs, body);
     HttpResponse res = m_http.post(url, body, hdrs);
     httpStatus = res.statusCode;
-    if (m_debug) debug_dump_response("ent/download", res);
+    if (m_debug) debug_dump_response("volumeStoreDownload", res);
     return decode_plist(res.body);
 }
 
@@ -1158,7 +958,7 @@ bool AppStore::report_download_done(const Account& acc, int64_t songId,
          + "&Pod="          + acc.pod
          + "&guid="         + guid;
 
-    // Same shape as send_ent_download, minus X-Token; GET carries no body.
+    // Same shape as volume_store_download_product, minus X-Token; GET carries no body.
     // Accept-Encoding is intentionally omitted — curl does not auto-decompress
     // a manually requested gzip, and the plist response is tiny anyway.
     std::map<std::string, std::string> hdrs = {
@@ -1180,136 +980,8 @@ bool AppStore::report_download_done(const Account& acc, int64_t songId,
     return res.body.find("<string>success</string>") != std::string::npos;
 }
 
-PlistDict AppStore::send_download_product(const Account& acc, const App& app,
-                                 const std::string& guid,
-                                 const std::string& externalVersionID,
-                                 const std::string& redownloadEndpoint,
-                                 bool isMac)
-{
-    std::string pod_prefix;
-    if (!acc.pod.empty()) pod_prefix = "p" + acc.pod + "-";
-    std::string vsUrl = "https://" + pod_prefix + std::string(PRIVATE_AS_DOMAIN)
-                      + PRIVATE_AS_PATH_DOWNLOAD + "?guid=" + guid;
-
-    std::map<std::string, std::string> hdrs = {
-        {"Content-Type",         "application/x-apple-plist"},
-        {"iCloud-DSID",          acc.directoryServicesID},
-        {"X-Dsid",               acc.directoryServicesID},
-        {"X-Apple-Store-Front",  acc.storeFront},
-        {"X-Token",              acc.passwordToken.get()},
-    };
-
-    // volumeStore payload: version pin key = externalVersionId
-    auto make_vs_payload = [&]() {
-        PlistDict p;
-        p["creditDisplay"] = PlistValue::makeString("");
-        p["guid"]          = PlistValue::makeString(guid);
-        p["salableAdamId"] = PlistValue::makeInt(app.id);
-        p["serialNumber"]  = PlistValue::makeString("0");  // PR #500 fix (v2.4.0)
-        if (!externalVersionID.empty())
-            p["externalVersionId"] = PlistValue::makeString(externalVersionID);
-        return p;
-    };
-
-    // 1. Try volumeStore (primary — every app that works today keeps using this)
-    if (m_debug)
-        fprintf(stderr, "[DEBUG] volumeStore URL: %s\n", vsUrl.c_str());
-    HttpResponse vsRes = m_http.post(vsUrl, encode_plist_xml(make_vs_payload()), hdrs);
-    if (m_debug) {
-        fprintf(stderr, "[DEBUG] volumeStore status: %d\n", vsRes.statusCode);
-        fprintf(stderr, "[DEBUG] volumeStore body:\n%s\n", vsRes.body.c_str());
-    }
-    PlistDict data        = decode_plist(vsRes.body);
-    std::string failureType    = dict_str(data, "failureType");
-    std::string customerMsg    = dict_str(data, "customerMessage");
-    // Also check metrics.messageCode (Apple wraps 2042 there in AuthTokenResumeFreeBuy)
-    if (failureType.empty()) {
-        auto metricsIt = data.find("metrics");
-        if (metricsIt != data.end() && metricsIt->second.isDict())
-            failureType = dict_str(metricsIt->second.dictVal, "messageCode");
-    }
-    if (m_debug && !failureType.empty())
-        fprintf(stderr, "[DEBUG] volumeStore failureType: '%s' customerMsg: '%s'\n",
-                failureType.c_str(), customerMsg.c_str());
-
-    // 2a. On 2042 AuthTokenResumeFreeBuy — Apple wants user to "confirm" the download.
-    //     Retry with hasBeenAuthedForBuy=true (equivalent of clicking "Download" in the dialog).
-    //     Do NOT re-authenticate — the token is fine, Apple just needs this flag.
-    if (failureType == FAILURE_SIGN_IN_REQUIRED) {
-        auto dialogIt = data.find("dialog");
-        bool isAuthDialog = (dialogIt != data.end() && dialogIt->second.isDict() &&
-                             dict_str(dialogIt->second.dictVal, "kind") == "authorization");
-        if (isAuthDialog) {
-            auto auth_payload = make_vs_payload();
-            auth_payload["hasBeenAuthedForBuy"] = PlistValue::makeString("true");
-            HttpResponse authRes = m_http.post(vsUrl, encode_plist_xml(auth_payload), hdrs);
-            if (m_debug) {
-                fprintf(stderr, "[DEBUG] hasBeenAuthedForBuy retry status: %d\n", authRes.statusCode);
-                fprintf(stderr, "[DEBUG] hasBeenAuthedForBuy retry body:\n%s\n", authRes.body.c_str());
-            }
-            data        = decode_plist(authRes.body);
-            failureType = dict_str(data, "failureType");
-            if (failureType.empty()) {
-                auto mit = data.find("metrics");
-                if (mit != data.end() && mit->second.isDict())
-                    failureType = dict_str(mit->second.dictVal, "messageCode");
-            }
-            if (m_debug && !failureType.empty())
-                fprintf(stderr, "[DEBUG] after hasBeenAuthedForBuy failureType: '%s'\n", failureType.c_str());
-        }
-    }
-
-    // 2b. On 5002 (licensed app — e.g. Teams) fall back to redownloadProduct
-    if (failureType == FAILURE_ALREADY_PURCHASED && !redownloadEndpoint.empty()) {
-        PlistDict rdData = redownload_product(acc, app, guid, redownloadEndpoint,
-                                              externalVersionID, isMac,
-                                              "redownload fallback (5002)");
-        auto      rdSongList     = dict_arr(rdData, "songList");
-        std::string rdCustomerMsg = dict_str(rdData, "customerMessage");
-
-        // If redownload can't serve the app (empty songList — for any reason:
-        //   "No Longer Available"               → transient 5002, app not in library
-        //   any other refusal
-        // ) → retry volumeStore.
-        // The retry surfaces the real Apple error (e.g. 9610 → LicenseRequired
-        // so --purchase can kick in, or a clean success if the 5002 was transient).
-        if (rdSongList.empty()) {
-            if (m_debug)
-                fprintf(stderr,
-                    "[DEBUG] redownload empty (msg: '%s') — retrying volumeStore\n",
-                    rdCustomerMsg.c_str());
-            HttpResponse retryRes = m_http.post(vsUrl, encode_plist_xml(make_vs_payload()), hdrs);
-            if (m_debug) {
-                fprintf(stderr, "[DEBUG] volumeStore retry status: %d\n", retryRes.statusCode);
-                fprintf(stderr, "[DEBUG] volumeStore retry body (first 500):\n%.500s\n", retryRes.body.c_str());
-            }
-            PlistDict retryData = decode_plist(retryRes.body);
-
-            // If volumeStore still returns 5002 after the retry, the failure is
-            // not transient — the account has no license for this app.
-            // Throw LicenseRequired so the --purchase flag can acquire it.
-            if (dict_str(retryData, "failureType") == FAILURE_ALREADY_PURCHASED) {
-                if (m_debug)
-                    fprintf(stderr,
-                        "[DEBUG] volumeStore retry still 5002 — no license, "
-                        "throwing LicenseRequired\n");
-                throw LicenseRequired();
-            }
-
-            return retryData;
-        }
-
-        // Redownload has a result (non-empty songList) → use it
-        return rdData;
-    }
-
-    return data;
-}
 
 // ── Redownload / updateProduct (port of upstream appstore_download_product.go)
-
-static constexpr const char* UPDATE_PRODUCT_URL =
-    "https://downloaddispatch.itunes.apple.com/up/updateProduct";
 
 static std::string trim_copy(const std::string& v) {
     size_t b = v.find_first_not_of(" \t\r\n");
@@ -1324,15 +996,10 @@ static std::string plist_scalar_str(const PlistDict& d, const std::string& key) 
     return it->second.isInt() ? std::to_string(it->second.intVal) : it->second.str();
 }
 
-// Upstream isEmptyRedownloadError: HTTP 500 with an empty body.
-static bool is_empty_redownload_error(const HttpResponse& res) {
-    return res.statusCode == 500 && trim_copy(res.body).empty();
-}
-
 // Upstream isUnavailableDownloadProductResponse: 200, no failureType, no items,
 // customerMessage "No Longer Available" (optionally prefixed).
-static bool is_unavailable_response(const HttpResponse& res, const PlistDict& d) {
-    if (res.statusCode != 200 || !dict_str(d, "failureType").empty()
+static bool is_unavailable_response(int statusCode, const PlistDict& d) {
+    if (statusCode != 200 || !dict_str(d, "failureType").empty()
         || !dict_arr(d, "songList").empty())
         return false;
     std::string m = trim_copy(dict_str(d, "customerMessage"));
@@ -1350,8 +1017,9 @@ static PlistDict decode_plist_safe(const std::string& body) {
     try { return decode_plist(body); } catch (...) { return {}; }
 }
 
-// Headers and payload exactly as upstream downloadProductRequest.
-static std::map<std::string, std::string> go_download_headers(const Account& acc) {
+// Headers and payload shared by the downloadProduct-family requests
+// (redownloadProduct, updateProduct).
+static std::map<std::string, std::string> download_request_headers(const Account& acc) {
     return {
         {"Content-Type", "application/x-apple-plist"},
         {"iCloud-DSID",  acc.directoryServicesID},
@@ -1359,8 +1027,8 @@ static std::map<std::string, std::string> go_download_headers(const Account& acc
     };
 }
 
-static std::string go_download_payload(const std::string& guid, const App& app,
-                                       const std::string& appExtVrsId) {
+static std::string download_request_payload(const std::string& guid, const App& app,
+                                            const std::string& appExtVrsId) {
     PlistDict p;
     p["creditDisplay"] = PlistValue::makeString("");
     p["guid"]          = PlistValue::makeString(guid);
@@ -1371,68 +1039,178 @@ static std::string go_download_payload(const std::string& guid, const App& app,
     return encode_plist_xml(p);
 }
 
-PlistDict AppStore::redownload_product(const Account& acc, const App& app,
-                                       const std::string& guid,
-                                       const std::string& redownloadEndpoint,
-                                       const std::string& externalVersionID,
-                                       bool isMac, const char* label,
-                                       bool needSinfs)
+// ── resolve_download — stateless 3-endpoint cascade ─────────────────────────
+// We keep no local library state, so we cannot know up front which endpoint owns
+// the app. We try all three bag endpoints in order and take the first that serves:
+//   1) volumeStoreDownloadProduct (kbsync)  — the modern primary path
+//   2) redownloadProduct                    — re-acquire from purchase history
+//   3) updateProduct                        — library / update dispatch
+// "served" means a songList item is present — with sinf data when the caller must
+// decrypt (download), or just metadata when it need not (list-versions,
+// get-version-metadata). If none serves and the account simply has no license, we
+// throw LicenseRequired so a --purchase caller can acquire it.
+PlistDict AppStore::resolve_download(const Account& acc, const App& app,
+                                     const std::string& guid,
+                                     const std::string& externalVersionID,
+                                     const std::string& redownloadEndpoint,
+                                     const std::string& volumeStoreDownloadEndpoint,
+                                     const std::string& kbsyncB64,
+                                     bool isMac, bool needSinfs)
 {
-    // Unpinned redownloads can fail or return a tvOS package — pin iOS builds.
+    auto served = [&](const PlistDict& d) {
+        auto sl = dict_arr(d, "songList");
+        if (sl.empty()) return false;
+        return needSinfs ? has_sinfs(sl) : true;
+    };
+    // failureType, falling back to metrics.messageCode (Apple wraps 2042 there).
+    auto failure_of = [](const PlistDict& d) {
+        std::string ft = dict_str(d, "failureType");
+        if (ft.empty()) {
+            auto it = d.find("metrics");
+            if (it != d.end() && it->second.isDict())
+                ft = dict_str(it->second.dictVal, "messageCode");
+        }
+        return ft;
+    };
+
+    PlistDict   vsData;          // step-1 response, kept for final error mapping
+    std::string vsFailure;
+    std::string customerMessage; // best-effort message for the final error
+
+    // ── 1) volumeStoreDownloadProduct (bag, kbsync) ─────────────────────────
+    if (!volumeStoreDownloadEndpoint.empty() && !kbsyncB64.empty()) {
+        int st = 0;
+        vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
+                                               kbsyncB64, externalVersionID,
+                                               /*authed=*/false, st);
+        if (served(vsData)) return vsData;
+        if (st >= 500) m_kbsyncRejected = true;   // stale kbsync — caller regenerates
+        vsFailure = failure_of(vsData);
+
+        // 2042 AuthTokenResumeFreeBuy → one retry with hasBeenAuthedForBuy
+        // (equivalent of clicking "Download" in the confirmation dialog).
+        if (vsFailure == FAILURE_SIGN_IN_REQUIRED) {
+            auto dit = vsData.find("dialog");
+            bool authDialog = (dit != vsData.end() && dit->second.isDict() &&
+                               dict_str(dit->second.dictVal, "kind") == "authorization");
+            if (authDialog) {
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] volumeStoreDownload auth dialog — retrying with hasBeenAuthedForBuy\n");
+                int st2 = 0;
+                vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
+                                                       kbsyncB64, externalVersionID,
+                                                       /*authed=*/true, st2);
+                if (served(vsData)) return vsData;
+                vsFailure = failure_of(vsData);
+            }
+        }
+        // A token / sign-in / device-verification failure is a session issue, not a
+        // missing license: surface it so the caller re-logs-in.
+        if (vsFailure == FAILURE_PASSWORD_TOKEN_EXPIRED ||
+            vsFailure == FAILURE_SIGN_IN_REQUIRED       ||
+            vsFailure == FAILURE_DEVICE_VERIFICATION)
+            throw PasswordTokenExpired();
+        if (dict_str(vsData, "customerMessage") == CUSTOMER_MSG_SIGN_IN)
+            throw PasswordTokenExpired();
+        if (!dict_str(vsData, "customerMessage").empty())
+            customerMessage = dict_str(vsData, "customerMessage");
+    }
+
+    // Version pin, shared by redownload and updateProduct (empty = unpinned).
     std::string pin = isMac ? externalVersionID
                             : redownload_version_id(acc, app, externalVersionID);
 
-    auto        hdrs = go_download_headers(acc);
-    std::string body = go_download_payload(guid, app, pin);
+    // ── 2) redownloadProduct, then 3) updateProduct ─────────────────────────
+    bool rdUnavailable = false;
+    if (!redownloadEndpoint.empty()) {
+        int rdStatus = 0;
+        PlistDict rd = redownload_product(acc, app, guid, redownloadEndpoint,
+                                          pin, "redownloadProduct", rdStatus);
+        if (served(rd)) return rd;
+
+        rdUnavailable = (rdStatus != 500 && is_redownload_unavailable(rd));
+        if (!dict_str(rd, "customerMessage").empty())
+            customerMessage = dict_str(rd, "customerMessage");
+
+        // Try updateProduct whenever redownload did not serve: an empty HTTP 500,
+        // a "No Longer Available" message, an "unavailable" dialog, a download
+        // without sinf data, or simply an empty songList. We run the full cascade
+        // regardless, since without library state we cannot know the entitlement.
+        bool wantUpdate = (rdStatus == 500 && rd.empty())
+                       || is_unavailable_response(rdStatus, rd)
+                       || rdUnavailable
+                       || (needSinfs && rdStatus == 200 && dict_str(rd, "failureType").empty()
+                           && !has_sinfs(dict_arr(rd, "songList")))
+                       || (!needSinfs && dict_arr(rd, "songList").empty());
+
+        if (wantUpdate && !pin.empty() && !m_updateEndpoint.empty()) {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] redownloadProduct did not serve — trying updateProduct\n");
+            try {
+                PlistDict up = update_product(acc, app, guid, pin);
+                if (served(up)) return up;
+                if (!dict_str(up, "customerMessage").empty())
+                    customerMessage = dict_str(up, "customerMessage");
+                // updateProduct returned a structured failure without items.
+                if (rdUnavailable) throw LicenseRequired();
+            } catch (const PasswordTokenExpired&) {
+                throw;                       // session issue — must re-login
+            } catch (const LicenseRequired&) {
+                throw;                       // keep the license signal for --purchase
+            } catch (const IpaError& e) {
+                // updateProduct refused/errored. If redownload had already said the
+                // item is unavailable for this account, that is a missing license.
+                if (rdUnavailable) throw LicenseRequired();
+                if (customerMessage.empty()) customerMessage = e.what();
+            }
+        } else if (rdUnavailable) {
+            throw LicenseRequired();
+        }
+    }
+
+    // ── Nothing served: map to the exception the caller expects ─────────────
+    if (vsFailure == FAILURE_LICENSE_NOT_FOUND) throw LicenseRequired();
+    if (!customerMessage.empty())               throw IpaError(customerMessage);
+    if (dict_str(vsData, "jingleDocType") == "purchaseSuccess")
+        throw IpaError("app is not available for download in your region/storefront"
+                       " (license was granted but download was blocked)");
+    if (!vsFailure.empty())                     throw IpaError("received error: " + vsFailure);
+    throw IpaError("invalid response: empty songList");
+}
+
+// ── redownloadProduct (bag) — re-acquire from the account's purchase history.
+// Pure endpoint call: POST, decode, return the response and its HTTP status. The
+// cascade decisions (whether to fall on to updateProduct, when to conclude a
+// missing license) live in resolve_download. `pin` is the version id, computed by
+// the caller (empty = unpinned).
+PlistDict AppStore::redownload_product(const Account& acc, const App& app,
+                                       const std::string& guid,
+                                       const std::string& redownloadEndpoint,
+                                       const std::string& pin,
+                                       const char* label,
+                                       int& httpStatus)
+{
+    httpStatus = 0;
+    auto        hdrs = download_request_headers(acc);
+    std::string body = download_request_payload(guid, app, pin);
     std::string url  = redownloadEndpoint + "?guid=" + guid;
 
     if (m_debug) debug_dump_request(label, "POST", url, hdrs, body);
     HttpResponse res = m_http.post(url, body, hdrs);
+    httpStatus = res.statusCode;
     if (m_debug) debug_dump_response(label, res);
 
-    PlistDict data = decode_plist_safe(res.body);
-
-    // No license for this account (not bought, bought by another user, refunded):
-    // same as volumeStore 9610 — main.cpp purchases with --purchase or tells the
-    // user to buy the app.
-    if (res.statusCode != 500 && is_redownload_unavailable(data)) {
-        if (m_debug)
-            fprintf(stderr, "[DEBUG] redownload unavailable for this Apple Account — license required\n");
-        throw LicenseRequired();
-    }
-
-    // The bag's updateProduct can serve pinned versions when redownload returns
-    // an empty HTTP 500 or a message-only availability error. For downloads a
-    // successful answer without sinf data is no better, so it goes there too.
-    bool noSinfs = needSinfs && res.statusCode == 200
-                && dict_str(data, "failureType").empty()
-                && !has_sinfs(dict_arr(data, "songList"));
-    if ((is_empty_redownload_error(res) || is_unavailable_response(res, data) || noSinfs)
-        && !pin.empty())
-    {
-        if (m_updateEndpoint.empty()) {
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] redownload failed and bag has no updateProduct"
-                                " — no update fallback\n");
-            return data;
-        }
-        if (m_debug)
-            fprintf(stderr, "[DEBUG] redownload failed — trying updateProduct\n");
-        return send_update_product(acc, app, guid, pin);
-    }
-    return data;
+    return decode_plist_safe(res.body);
 }
 
-PlistDict AppStore::send_update_product(const Account& acc, const App& app,
+PlistDict AppStore::update_product(const Account& acc, const App& app,
                                         const std::string& guid,
                                         const std::string& externalVersionID)
 {
-    // Upstream newDownloadEndpoint: only the exact downloaddispatch path is accepted.
-    if (m_updateEndpoint != UPDATE_PRODUCT_URL)
-        throw IpaError("invalid download endpoint in bag: " + m_updateEndpoint);
-
-    auto        hdrs = go_download_headers(acc);
-    std::string body = go_download_payload(guid, app, externalVersionID);
+    // updateProduct endpoint comes straight from the bag (resolve_download only
+    // calls this when it is non-empty) — trusted like every other bag endpoint.
+    auto        hdrs = download_request_headers(acc);
+    std::string body = download_request_payload(guid, app, externalVersionID);
     std::string url  = m_updateEndpoint + "?guid=" + guid;
 
     if (m_debug) debug_dump_request("updateProduct", "POST", url, hdrs, body);
@@ -1596,9 +1374,12 @@ std::string AppStore::redownload_version_id(const Account& acc, const App& app,
     }
 }
 
-// ── Bag (fetch auth + redownload endpoints) ──────────────────────────────
+// ── Bag (fetch bag.xml: all download/auth endpoints + SAP config) ───────────
 
-AppStore::BagOutput AppStore::fetch_bag_impl(const std::string& guid) {
+// Fetch and parse bag.xml. Called with no guid by external callers (uses
+// get_guid()); login() passes its own guid so the whole flow shares one identity.
+AppStore::BagOutput AppStore::fetch_bag(const std::string& guidArg) {
+    std::string guid = guidArg.empty() ? get_guid() : guidArg;
     std::string url = std::string("https://") + PRIVATE_INIT_DOMAIN
                     + PRIVATE_INIT_PATH + "?guid=" + guid;
     HttpResponse res = m_http.get(url, {{"Accept", "application/xml"}});
@@ -1620,7 +1401,7 @@ AppStore::BagOutput AppStore::fetch_bag_impl(const std::string& guid) {
     if (ubIt != d.end() && ubIt->second.isDict()) {
         out.redownloadEndpoint  = dict_str(ubIt->second.dictVal, "redownloadProduct");
         out.updateEndpoint      = dict_str(ubIt->second.dictVal, "updateProduct");
-        out.entDownloadEndpoint = dict_str(ubIt->second.dictVal, "volumeStoreDownloadProduct");
+        out.volumeStoreDownloadEndpoint = dict_str(ubIt->second.dictVal, "volumeStoreDownloadProduct");
         out.songDownloadDoneEndpoint = dict_str(ubIt->second.dictVal, "songDownloadDone");
         m_updateEndpoint        = out.updateEndpoint;
 
@@ -1727,10 +1508,6 @@ AppStore::BagOutput AppStore::fetch_bag_impl(const std::string& guid) {
     return out;
 }
 
-std::string AppStore::fetch_bag_auth_endpoint(const std::string& guid) {
-    return fetch_bag_impl(guid).authEndpoint;
-}
-
 // ── Login implementation ─────────────────────────────────────────────────
 
 // ── Debug helpers for the SAP-signed authenticate request ────────────────
@@ -1763,6 +1540,10 @@ static void debug_dump_auth_response(const HttpResponse& res) {
     masked.body = mask_plist_password(res.body);
     debug_dump_response("authenticate", masked);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Private: login / purchase (implementation)
+// ─────────────────────────────────────────────────────────────────────────────
 
 Account AppStore::do_login(const std::string& email,
                  const std::string& password,
@@ -1883,7 +1664,7 @@ Account AppStore::do_login(const std::string& email,
     acc.storeFront          = sf;
     acc.password.set(       password);
     acc.pod                 = pod;
-    acc.fserial             = make_fserial(guid);  // fictitious device serial for ent/download
+    acc.fserial             = make_fserial(guid);  // fictitious device serial for volumeStoreDownload
     return acc;
 }
 
@@ -1920,7 +1701,10 @@ PlistDict AppStore::do_purchase(const Account& acc, const App& app,
         {"X-Token",             acc.passwordToken.get()},
     };
 
-    HttpResponse res  = m_http.post(url, encode_plist_xml(payload), headers);
+    std::string body = encode_plist_xml(payload);
+    if (m_debug) debug_dump_request("buyProduct", "POST", url, headers, body);
+    HttpResponse res  = m_http.post(url, body, headers);
+    if (m_debug) debug_dump_response("buyProduct", res);
     PlistDict    data  = decode_plist(res.body);
 
     std::string failureType     = dict_str(data, "failureType");
@@ -1942,6 +1726,10 @@ PlistDict AppStore::do_purchase(const Account& acc, const App& app,
     // Return full result — caller can use songList if present (paid apps)
     return data;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Private: IPA patching
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ── ZIP patching ──────────────────────────────────────────────────────────
 // Injects a patched iTunesMetadata.plist into the downloaded IPA.
@@ -2245,6 +2033,10 @@ std::vector<std::string> AppStore::extract_sinf_paths(const std::vector<uint8_t>
 }
 #endif
 
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Private: URL / path / string helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── URL builders ─────────────────────────────────────────────────────────
 
 std::string AppStore::search_url(const std::string& term,
@@ -2279,9 +2071,11 @@ std::string AppStore::lookup_url(const std::string& bundleID,
 
 std::string AppStore::resolve_destination(const App& app,
                                        const std::string& version,
-                                       const std::string& outputPath)
+                                       const std::string& outputPath,
+                                       const std::string& displayName,
+                                       const std::string& ext)
 {
-    std::string fname = make_filename(app, version);
+    std::string fname = make_filename(app, version, displayName, ext);
     if (outputPath.empty()) {
         return ipt::to_utf8(fs::current_path() / fname);
     }
@@ -2295,18 +2089,10 @@ std::string AppStore::resolve_destination(const App& app,
     return outputPath;
 }
 
-std::string AppStore::make_filename(const App& app, const std::string& version) {
-    std::string name;
-    if (!app.bundleID.empty()) name += app.bundleID;
-    if (app.id > 0) {
-        if (!name.empty()) name += "_";
-        name += std::to_string(app.id);
-    }
-    if (!version.empty()) {
-        if (!name.empty()) name += "_";
-        name += version;
-    }
-    return name + ".ipa";
+std::string AppStore::make_filename(const App& app, const std::string& version,
+                                    const std::string& displayName,
+                                    const std::string& ext) {
+    return build_base_filename(displayName, app, version) + ext;
 }
 
 int64_t AppStore::file_size(const std::string& path) {
@@ -2329,150 +2115,3 @@ std::string AppStore::str_lower(const char* s) {
     return out;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  download_mac — macOS .pkg download + StoreAgent decryption (v2.4.0+)
-// ═══════════════════════════════════════════════════════════════════════════
-static std::vector<uint8_t> mac_extract_dpinfo(const std::vector<Sinf>& sinfs) {
-    std::vector<uint8_t> dpInfo;
-    for (const auto& s : sinfs) {
-        if (s.dpInfo.empty()) continue;
-        if (!dpInfo.empty() && dpInfo != s.dpInfo)
-            throw IpaError("download response contains conflicting dpInfo values");
-        dpInfo = s.dpInfo;
-    }
-    if (dpInfo.empty())
-        throw IpaError("download response does not contain dpInfo (not a macOS app?)");
-    return dpInfo;
-}
-
-AppStore::DownloadOutput AppStore::download_mac(const Account& acc, const App& app,
-                                      const std::string& outputPath,
-                                      ProgressCb progress,
-                                      const std::string& redownloadEndpoint)
-{
-    // 1. Get guid / hardware ID
-    std::string guid = get_guid();
-    auto hardwareID  = SapSigner::LocalHardwareID();
-    if (hardwareID.empty())
-        throw IpaError("failed to get hardware ID for macOS download");
-
-    // 2. Download request (same as iOS but pkg extension)
-    PlistDict dlData = send_download_product(acc, app, guid, "", redownloadEndpoint,
-                                             /*isMac=*/true);
-
-    auto songList = dict_arr(dlData, "songList");
-    if (songList.empty()) throw IpaError("invalid response: empty songList");
-    auto& itemVal = songList[0];
-    if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
-    const PlistDict& item = itemVal.dictVal;
-
-    std::string downloadURL = dict_str(item, "URL");
-    if (downloadURL.empty()) throw IpaError("no download URL in response");
-
-    // Parse sinfs to get dpInfo
-    std::vector<Sinf> sinfs;
-    auto sinfsIt = item.find("sinfs");
-    if (sinfsIt != item.end() && sinfsIt->second.isArray()) {
-        for (auto& sv : sinfsIt->second.arrayVal) {
-            if (!sv.isDict()) continue;
-            Sinf s;
-            auto dit  = sv.dictVal.find("sinf");
-            if (dit  != sv.dictVal.end() && dit->second.isData()) s.data   = dit->second.dataVal;
-            auto dpit = sv.dictVal.find("dpInfo");
-            if (dpit != sv.dictVal.end() && dpit->second.isData()) s.dpInfo = dpit->second.dataVal;
-            sinfs.push_back(std::move(s));
-        }
-    }
-
-    auto dpInfo = mac_extract_dpinfo(sinfs);
-    if (m_debug)
-        fprintf(stderr, "[DEBUG] macOS dpInfo: %zu bytes\n", dpInfo.size());
-
-    // 3. Resolve output path (.pkg extension)
-    std::string version = "unknown";
-    {
-        auto meta = item.find("metadata");
-        if (meta != item.end() && meta->second.isDict()) {
-            auto vit = meta->second.dictVal.find("bundleShortVersionString");
-            if (vit != meta->second.dictVal.end() && vit->second.isString())
-                version = vit->second.strVal;
-        }
-    }
-
-    std::string dest = outputPath;
-    {
-        std::error_code _ec;
-        bool isDir = !dest.empty() && std::filesystem::is_directory(dest, _ec);
-        if (dest.empty() || isDir) {
-        std::string fname = app.bundleID + "_" + std::to_string(app.id) + "_" + version + ".pkg";
-        dest = (dest.empty() || isDir) ? (isDir ? dest + "/" + fname : fname) : dest;
-        if (!isDir && dest.find(".pkg") == std::string::npos) dest += ".pkg";
-    }
-    }
-
-    std::string encPath = dest + ".ipatool-encrypted";
-    std::string decPath = dest + ".ipatool-decrypted";
-
-    // Cleanup staging on exit
-    auto cleanup = [&](bool success) {
-        std::error_code ec;
-        std::filesystem::remove(ipt::fs_path(encPath), ec);
-        if (!success) std::filesystem::remove(ipt::fs_path(decPath), ec);
-    };
-
-    // 4. Download encrypted .pkg
-    if (m_debug) fprintf(stderr, "[DEBUG] macOS download → %s\n", encPath.c_str());
-    m_http.download(downloadURL, encPath, 0, progress);
-
-    // 5. Initialize StoreAgentMachine
-    if (m_debug) fprintf(stderr, "[DEBUG] loading StoreAgent assets...\n");
-    auto machine = StoreAgentMachine::Create(
-        load_sap_asset("CoreFP"),
-        load_sap_asset("CommerceCore"),
-        load_sap_asset("CommerceKit"),
-        load_sap_asset("CoreFP.icxs"),
-        load_sap_asset("storeagent")
-    );
-
-    uint32_t globalCtx = machine->InitializeGlobal(hardwareID);
-    uint64_t session   = machine->InitializeSession(globalCtx, dpInfo);
-    if (m_debug) fprintf(stderr, "[DEBUG] StoreAgent session ready, decrypting...\n");
-
-    // 6. Stream-decrypt 32KB chunks
-    {
-        std::ifstream src_f(ipt::fs_path(encPath), std::ios::binary);
-        std::ofstream dst_f(ipt::fs_path(decPath), std::ios::binary | std::ios::trunc);
-        if (!src_f) throw IpaError("failed to open encrypted pkg: " + encPath);
-        if (!dst_f) throw IpaError("failed to open decrypted pkg: " + decPath);
-
-        std::vector<uint8_t> buf(StoreAgentMachine::kChunkSize);
-        while (true) {
-            src_f.read(reinterpret_cast<char*>(buf.data()), buf.size());
-            std::streamsize n = src_f.gcount();
-            if (n == 0) break;
-
-            std::span<uint8_t> chunk(buf.data(), static_cast<size_t>(n));
-            machine->DecryptChunk(session, chunk);
-            dst_f.write(reinterpret_cast<const char*>(chunk.data()), chunk.size());
-        }
-    }
-
-    machine->CloseSession(session);
-
-    // 7. Publish: atomic rename decrypted → final destination
-    {
-        std::error_code ec;
-        std::filesystem::rename(ipt::fs_path(decPath), ipt::fs_path(dest), ec);
-        if (ec) {
-            // Fallback: copy then remove
-            std::filesystem::copy_file(ipt::fs_path(decPath), ipt::fs_path(dest),
-                std::filesystem::copy_options::overwrite_existing, ec);
-            if (ec) throw IpaError("failed to publish pkg: " + ec.message());
-            std::filesystem::remove(ipt::fs_path(decPath), ec);
-        }
-    }
-
-    cleanup(true);
-    if (m_debug) fprintf(stderr, "[DEBUG] macOS pkg saved: %s\n", dest.c_str());
-    return { dest, sinfs };
-}

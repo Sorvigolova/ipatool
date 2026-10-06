@@ -11,7 +11,7 @@ Uses **libcurl** for networking and a small **Unicorn Engine** sandbox to run Ap
 
 - Authenticates with the App Store and downloads apps you own as `.ipa` (iOS) or decrypted `.pkg` (macOS).
 - Signs every authentication request with an Apple **SAP action signature** (`X-Apple-ActionSignature`), required by the modern App Store protocol.
-- Generates a **kbsync** blob locally and uses it for the `ent/download` download stage, falling back to the classic `volumeStore → redownload → updateProduct` chain.
+- Generates a **kbsync** blob locally and uses it to sign the `volumeStoreDownloadProduct` download request, with a `redownloadProduct → updateProduct` fallback cascade.
 - Decrypts encrypted macOS `.pkg` downloads.
 
 SAP signing, kbsync generation and `.pkg` decryption are done by emulating Apple's own obfuscated dylibs (`CoreFP`, `CommerceCore`, `CommerceKit`, `storeagent`) inside a Unicorn x86-64 sandbox — no Apple binaries run natively on the host. Those asset files live in `sap_assets/` and are embedded into the executable at build time.
@@ -317,9 +317,11 @@ Searches the App Store. Default limit is 5.
 
 #### `purchase`
 ```
-ipatool purchase (-b BUNDLE_ID | -i APP_ID) [--keychain-passphrase PASSPHRASE]
+ipatool purchase (-b BUNDLE_ID | -i APP_ID) [-f|--force] [--keychain-passphrase PASSPHRASE]
 ```
 Acquires a free license. Must be run once before downloading any app not already in your library.
+
+- `-f` / `--force` — only with `-i APP_ID`. The app lookup normally runs first and aborts the purchase if it fails. A developer may have pulled the app from the storefront, so the lookup 404s even though the license is still acquirable by its known id. With `--force` the failed lookup is tolerated and `buyProduct` is attempted anyway (it only needs the numeric id). Has no effect with `-b`, where the lookup is the only way to resolve the id.
 
 #### `download`
 ```
@@ -328,11 +330,11 @@ ipatool download (-b BUNDLE_ID | -i APP_ID) [-o OUTPUT] [--external-version-id I
 Downloads an app as an `.ipa` (iOS) or decrypted `.pkg` (macOS).
 
 - `-b` performs an iTunes lookup first; `-i` skips it and uses the numeric App Store ID directly
-- The download first tries the `ent/download` stage using a cached/generated **kbsync**; if that does not serve the app it falls back to `volumeStore → redownload → updateProduct`
+- The download runs a stateless cascade over the bag's endpoints — `volumeStoreDownloadProduct` (with a cached/generated **kbsync**) → `redownloadProduct` → `updateProduct` — and takes the first that serves the app
 - `--external-version-id` downloads a specific older version (get IDs from `list-versions`)
 - `-o` can be a file path or a directory; defaults to the current directory
 - `--purchase` acquires the license if needed, then downloads
-- Output filename format: `{bundleID}_{appID}_{version}.ipa`
+- Output filename format: `{bundleDisplayName} {version}.ipa` (or `.pkg` for macOS) — a space before the version, matching iTunes. The name is the `bundleDisplayName` from the download response (numeric App Store ID is not part of it); with an explicit `-o FILE` the path is used verbatim, no extension added
 - Resumable — re-running the same command continues an interrupted download
 - The finished file is verified against the store's `md5`. A mismatch (only possible on a fully received transfer — partial transfers resume instead) discards the file and re-downloads it once from scratch; if it still fails, the command aborts and leaves no corrupt `.tmp` behind. On a match the download is reported back to Apple (`songDownloadDone`), as iTunes/Configurator does — best-effort, never fails the download
 - iOS IPAs are patched to iTunes format (`iTunesMetadata.plist`, `iTunesArtwork`, sinf DRM token injected into `SC_Info/`); encrypted macOS `.pkg` files are decrypted via the StoreAgent sandbox
@@ -442,7 +444,7 @@ On Windows these are in `%USERPROFILE%\.ipatool\`. The account file is always en
 - `protect.cpp/.h` — `SecureString` in-memory encryption and `secure_zero`
 
 **App Store protocol**
-- `appstore.cpp/.h` — bag fetch, SAP-signed login, search/lookup, purchase, download (`ent/download` + `volumeStore → redownload → updateProduct`), list-versions, version metadata, storefront↔country table, iTunes JSON parsing
+- `appstore.cpp/.h` — bag fetch, SAP-signed login, search/lookup, purchase, download (`volumeStoreDownloadProduct → redownloadProduct → updateProduct` cascade), list-versions, version metadata, storefront↔country table, iTunes JSON parsing
 - `http_client.cpp/.h` — libcurl wrapper (GET/POST, resumable download, custom cookie file I/O via `CURLOPT_COOKIELIST`)
 - `plist.cpp/.h` — Apple plist XML + binary encoder/decoder (no external deps)
 

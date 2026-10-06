@@ -25,7 +25,6 @@ inline constexpr const char* PRIVATE_INIT_PATH      = "/bag.xml";
 
 inline constexpr const char* PRIVATE_AS_DOMAIN         = "buy.itunes.apple.com";
 inline constexpr const char* PRIVATE_AS_PATH_PURCHASE  = "/WebObjects/MZFinance.woa/wa/buyProduct";
-inline constexpr const char* PRIVATE_AS_PATH_DOWNLOAD  = "/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct";
 
 inline constexpr const char* HTTP_HEADER_STOREFRONT = "X-Set-Apple-Store-Front";
 inline constexpr const char* HTTP_HEADER_POD        = "pod";
@@ -38,11 +37,6 @@ inline constexpr const char* HTTP_HEADER_SAP_SIGNATURE = "X-Apple-ActionSignatur
 inline constexpr const char* CONFIGURATOR_UA =
     "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6";
 
-// User-Agent for macOS app downloads — Mac App Store client
-// Apple returns sinfs/dpInfo only when this UA is used for macOS .pkg downloads
-inline constexpr const char* MAC_APP_STORE_UA =
-    "MacAppStore/3.0 MacAppStore/3.0 (Macintosh; OS X 10.15.6; 19G2021) AppleWebKit/5609.3.5.1.3 AMS/1 (dt:1)";
-
 inline constexpr const char* FAILURE_INVALID_CREDENTIALS      = "-5000";
 inline constexpr const char* FAILURE_PASSWORD_TOKEN_EXPIRED   = "2034";
 inline constexpr const char* FAILURE_LICENSE_NOT_FOUND        = "9610";
@@ -50,11 +44,6 @@ inline constexpr const char* FAILURE_TEMPORARILY_UNAVAILABLE  = "2059";
 inline constexpr const char* FAILURE_ALREADY_PURCHASED        = "5002";
 inline constexpr const char* FAILURE_SIGN_IN_REQUIRED         = "2042";  // v2.4.0
 inline constexpr const char* FAILURE_DEVICE_VERIFICATION      = "1008";  // v2.4.0
-// ── Platform (v2.4.0+) ──────────────────────────────────────────────────────
-enum class Platform { iOS, macOS };
-
-inline constexpr const char* PRIVATE_AS_PATH_DOWNLOAD_MAC = "/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct";
-
 
 inline constexpr const char* CUSTOMER_MSG_BAD_LOGIN           = "MZFinance.BadLogin.Configurator_message";
 inline constexpr const char* CUSTOMER_MSG_ACCOUNT_DISABLED    = "Your account is disabled.";
@@ -80,7 +69,7 @@ struct Account {
     // NOT to the session token, so it survives password/xToken refreshes and is
     // only regenerated when the download endpoint rejects it. Empty = none yet.
     std::string   kbsync;
-    // Fictitious-but-valid device serial for the ent/download serialNumber field.
+    // Fictitious-but-valid device serial for the volumeStoreDownload serialNumber field.
     // Derived from the request GUID (device MAC), so it is unique per machine.
     // Generated at login; deterministic, so it survives token refreshes.
     std::string   fserial;

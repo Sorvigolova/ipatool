@@ -364,13 +364,13 @@ static bool load_account(Account& acc, const std::string& passphrase = "") {
 
 // ── kbsync helpers (shared by download / list-versions / get-version-metadata) ─
 
-// Ensure a kbsync blob for the ent/download stage: reuse the cached one, or
+// Ensure a kbsync blob for the volumeStoreDownload stage: reuse the cached one, or
 // generate it once (~20 s+) and cache it in the account file. Returns "" (stage
 // skipped) if there is no ent endpoint / DSID, or generation fails.
 static std::string prepare_kbsync(AppStore& store, Account& acc,
-                                  const std::string& entDownloadEndpoint,
+                                  const std::string& volumeStoreDownloadEndpoint,
                                   const std::string& passphrase, bool debug) {
-    if (entDownloadEndpoint.empty() || acc.directoryServicesID.empty()) return "";
+    if (volumeStoreDownloadEndpoint.empty() || acc.directoryServicesID.empty()) return "";
     if (!acc.kbsync.empty()) return acc.kbsync;
     try {
         uint64_t dsid = std::stoull(acc.directoryServicesID);
@@ -381,7 +381,7 @@ static std::string prepare_kbsync(AppStore& store, Account& acc,
     } catch (const std::exception& e) {
         if (debug)
             fprintf(stderr, "[DEBUG] kbsync generation failed (%s) — "
-                    "skipping ent/download stage\n", e.what());
+                    "skipping volumeStoreDownload stage\n", e.what());
         return "";
     }
 }
@@ -751,9 +751,10 @@ static void cmd_purchase(const Args& args) {
     std::string bundleID   = get(args, "bundle-id",           "b");
     std::string appIDStr   = get(args, "app-id",              "i");
     std::string passphrase = get(args, "keychain-passphrase", "");
+    bool        force      = (get(args, "force", "f") == "true");
 
     if (bundleID.empty() && appIDStr.empty()) {
-        std::cerr << "Usage: ipatool purchase (-b BUNDLE_ID | -i APP_ID)\n";
+        std::cerr << "Usage: ipatool purchase (-b BUNDLE_ID | -i APP_ID) [-f]\n";
         exit(1);
     }
 
@@ -764,17 +765,40 @@ static void cmd_purchase(const Args& args) {
     }
 
     AppStore store(COOKIE_FILE);
+    if (get(args, "debug") == "true") store.set_debug(true);
 
-    // Resolve App — lookup by bundle ID or numeric app ID
+    // Resolve App — lookup by bundle ID or numeric app ID.
+    // By bundle ID the lookup is mandatory (that is how we obtain the id).
+    // By numeric id it is normally mandatory too, but with --force a failed
+    // lookup is tolerated: a developer may have pulled the app from the
+    // storefront (so the lookup 404s) while the license is still acquirable by
+    // its known id. We then proceed with a bare App{ .id } — buyProduct, which
+    // only needs salableAdamId, becomes the judge.
     auto resolve_app = [&]() -> App {
         if (!bundleID.empty())
             return store.lookup(acc, bundleID);
-        return store.lookup_by_id(acc, std::stoll(appIDStr));
+        if (!force)
+            return store.lookup_by_id(acc, std::stoll(appIDStr));
+        App app;
+        app.id = std::stoll(appIDStr);
+        try {
+            app = store.lookup_by_id(acc, app.id);
+        } catch (const std::exception&) {
+            /* --force: keep bare App{ .id } and let buyProduct decide */
+        }
+        return app;
+    };
+
+    auto announce = [](const App& app) {
+        if (!app.name.empty())
+            std::cout << "Purchasing: " << app.name << " (" << app.bundleID << ")\n";
+        else
+            std::cout << "Purchasing: Unknown application with id " << app.id << "\n";
     };
 
     try {
         App app = resolve_app();
-        std::cout << "Purchasing: " << app.name << " (" << app.bundleID << ")\n";
+        announce(app);
         store.purchase(acc, app);
         json purchaseOut;
         purchaseOut["success"] = true;
@@ -789,6 +813,7 @@ static void cmd_purchase(const Args& args) {
         }
         try {
             App app = resolve_app();
+            announce(app);
             store.purchase(acc, app);
             json purchaseOut;
             purchaseOut["success"] = true;
@@ -847,14 +872,14 @@ static void cmd_list_versions(const Args& args) {
     auto run = [&]() {
         // Fetch bag to get redownloadProduct endpoint for 5002 fallback
         std::string redownloadEndpoint;
-        std::string entDownloadEndpoint;
+        std::string volumeStoreDownloadEndpoint;
         try {
             auto bag = store.fetch_bag();
             redownloadEndpoint = bag.redownloadEndpoint;
-            entDownloadEndpoint = bag.entDownloadEndpoint;
+            volumeStoreDownloadEndpoint = bag.volumeStoreDownloadEndpoint;
         } catch (...) { /* non-fatal: fallback disabled if bag fails */ }
 
-        std::string kbsyncB64 = prepare_kbsync(store, acc, entDownloadEndpoint,
+        std::string kbsyncB64 = prepare_kbsync(store, acc, volumeStoreDownloadEndpoint,
                                                passphrase, get(args, "debug") == "true");
 
         if (!bundleID.empty()) {
@@ -863,7 +888,7 @@ static void cmd_list_versions(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.list_versions(acc, app, redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+        auto out = store.list_versions(acc, app, redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64);
         invalidate_kbsync_if_rejected(store, acc, passphrase, get(args, "debug") == "true");
 
         json j;
@@ -953,14 +978,14 @@ static void cmd_get_version_metadata(const Args& args) {
     auto run = [&]() {
         // Fetch bag to get redownloadProduct endpoint for 5002 fallback
         std::string redownloadEndpoint;
-        std::string entDownloadEndpoint;
+        std::string volumeStoreDownloadEndpoint;
         try {
             auto bag = store.fetch_bag();
             redownloadEndpoint = bag.redownloadEndpoint;
-            entDownloadEndpoint = bag.entDownloadEndpoint;
+            volumeStoreDownloadEndpoint = bag.volumeStoreDownloadEndpoint;
         } catch (...) { /* non-fatal */ }
 
-        std::string kbsyncB64 = prepare_kbsync(store, acc, entDownloadEndpoint,
+        std::string kbsyncB64 = prepare_kbsync(store, acc, volumeStoreDownloadEndpoint,
                                                passphrase, get(args, "debug") == "true");
 
         App app;
@@ -970,7 +995,7 @@ static void cmd_get_version_metadata(const Args& args) {
             app.id = std::stoll(appIDStr);
         }
 
-        auto out = store.get_version_metadata(acc, app, versionID, redownloadEndpoint, entDownloadEndpoint, kbsyncB64);
+        auto out = store.get_version_metadata(acc, app, versionID, redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64);
         invalidate_kbsync_if_rejected(store, acc, passphrase, get(args, "debug") == "true");
 
         json j;
@@ -1131,19 +1156,19 @@ static void cmd_download(const Args& args) {
     if (get(args, "debug") == "true") store.set_debug(true);
 
     // Fetch bag for redownloadProduct (5002 fallback for licensed apps like Teams)
-    // and the ent/download endpoint (kbsync first stage).
+    // and the volumeStoreDownload endpoint (kbsync first stage).
     std::string redownloadEndpoint;
-    std::string entDownloadEndpoint;
+    std::string volumeStoreDownloadEndpoint;
     std::string songDownloadDoneEndpoint;
     try {
         auto bag = store.fetch_bag();
         redownloadEndpoint       = bag.redownloadEndpoint;
-        entDownloadEndpoint      = bag.entDownloadEndpoint;
+        volumeStoreDownloadEndpoint      = bag.volumeStoreDownloadEndpoint;
         songDownloadDoneEndpoint = bag.songDownloadDoneEndpoint;
     } catch (...) { /* non-fatal: proceed without fallback */ }
 
     bool dbg = (get(args, "debug") == "true");
-    std::string kbsyncB64 = prepare_kbsync(store, acc, entDownloadEndpoint, passphrase, dbg);
+    std::string kbsyncB64 = prepare_kbsync(store, acc, volumeStoreDownloadEndpoint, passphrase, dbg);
 
     App app;
 
@@ -1316,7 +1341,7 @@ static void cmd_download(const Args& args) {
         }
 
         auto out = store.download(acc, app, outputPath, versionID, progress,
-                                  redownloadEndpoint, entDownloadEndpoint, kbsyncB64,
+                                  redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64,
                                   songDownloadDoneEndpoint);
         invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
         json dlOut;
@@ -1370,7 +1395,7 @@ static void cmd_download(const Args& args) {
         prevDrawnCols = 0;
         try {
             auto out = store.download(acc, app, outputPath, versionID, progress,
-                                      redownloadEndpoint, entDownloadEndpoint, kbsyncB64,
+                                      redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64,
                                   songDownloadDoneEndpoint);
             invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
             json dlOut;
@@ -1388,7 +1413,7 @@ static void cmd_download(const Args& args) {
             prevDrawnCols = 0;
             try {
                 auto out = store.download(acc, app, outputPath, versionID, progress,
-                                          redownloadEndpoint, entDownloadEndpoint, kbsyncB64,
+                                          redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64,
                                   songDownloadDoneEndpoint);
                 invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
                 json dlOut;
@@ -1416,7 +1441,7 @@ static void cmd_download(const Args& args) {
             startTime     = std::chrono::steady_clock::now();
             prevDrawnCols = 0;
             auto out = store.download(acc, app, outputPath, versionID, progress,
-                                      redownloadEndpoint, entDownloadEndpoint, kbsyncB64,
+                                      redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64,
                                   songDownloadDoneEndpoint);
             invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
             json dlOut;
@@ -1469,13 +1494,14 @@ Examples:
   ipatool search "angry birds" -l 5 --keychain-passphrase mysecret
   ipatool purchase -b com.example.app
   ipatool purchase -i 1234567890
+  ipatool purchase -i 1234567890 -f                           (force: try buyProduct even if the app lookup fails, e.g. pulled from the storefront)
   ipatool download -b com.example.app -o ./MyApp.ipa
   ipatool download -i 1234567890 -o ./MyApp.ipa
 
 Flags per command:
   auth login:           -e/--email  -p/--password  -a/--auth-code  --keychain-passphrase
   search:               <term>  -l/--limit  --keychain-passphrase
-  purchase:             -b/--bundle-id | -i/--app-id   --keychain-passphrase
+  purchase:             -b/--bundle-id | -i/--app-id   -f/--force   --keychain-passphrase
   download:             -b/--bundle-id | -i/--app-id   -o/--output  --external-version-id  --purchase  --keychain-passphrase
   list-versions:        -b/--bundle-id | -i/--app-id   --purchase  --keychain-passphrase
   get-version-metadata: -b/--bundle-id | -i/--app-id   --external-version-id  --keychain-passphrase
