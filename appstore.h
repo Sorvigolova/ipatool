@@ -123,10 +123,12 @@ public:
                             const std::string& kbsyncB64 = "",
                             const std::string& songDownloadDoneEndpoint = "");
 
-    // True when the last download()'s volumeStoreDownload stage was rejected in a way
-    // that suggests the cached kbsync is stale (HTTP >= 500). The caller uses
-    // this to drop the cached blob so the next run regenerates it.
-    bool kbsync_rejected() const { return m_kbsyncRejected; }
+    // When resolve_download regenerated a stale kbsync mid-flight (the download
+    // endpoint rejected the cached blob with HTTP >= 500), this holds the fresh
+    // base64 blob so the caller can cache it. Empty when no regeneration happened
+    // this call. A failed regeneration self-heals on the next run, which retries
+    // the endpoint and regenerates again — so no separate "rejected" flag.
+    const std::string& regenerated_kbsync() const { return m_regeneratedKbsync; }
 
 public:
     void set_debug(bool v); // also enables SapSigner HTTP dumps
@@ -180,7 +182,7 @@ public:
 private:
     HttpClient m_http;
     bool       m_debug = false;
-    bool       m_kbsyncRejected = false; // set by the volumeStoreDownload stage, read by caller
+    std::string m_regeneratedKbsync;     // fresh kbsync produced by a mid-resolve retry (for caching)
 
     // ── volumeStoreDownloadProduct (bag download endpoint, kbsync-signed) ────────
     // POSTs the bag's volumeStoreDownloadProduct with the base64 kbsync and returns

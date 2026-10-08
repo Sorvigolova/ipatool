@@ -389,14 +389,18 @@ static std::string prepare_kbsync(AppStore& store, Account& acc,
     }
 }
 
-// Drop a stale cached kbsync (server rejected it) so the next run regenerates it.
-static void invalidate_kbsync_if_rejected(AppStore& store, Account& acc,
-                                          const std::string& passphrase, bool debug) {
-    if (store.kbsync_rejected() && !acc.kbsync.empty()) {
-        acc.kbsync.clear();
+// If resolve_download regenerated a stale kbsync mid-flight, persist the fresh
+// blob to the account file so the next run starts with a working one. (A stale
+// blob that could not be regenerated needs no action: the next run retries the
+// endpoint and regenerates again in-flight.)
+static void cache_regenerated_kbsync(AppStore& store, Account& acc,
+                                     const std::string& passphrase, bool debug) {
+    const std::string& fresh = store.regenerated_kbsync();
+    if (!fresh.empty() && fresh != acc.kbsync) {
+        acc.kbsync = fresh;
         save_account(acc, passphrase);
         if (debug)
-            fprintf(stderr, "[DEBUG] cleared stale kbsync from account cache\n");
+            fprintf(stderr, "[DEBUG] cached regenerated kbsync in account file\n");
     }
 }
 
@@ -892,7 +896,7 @@ static void cmd_list_versions(const Args& args) {
         }
 
         auto out = store.list_versions(acc, app, redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64);
-        invalidate_kbsync_if_rejected(store, acc, passphrase, get(args, "debug") == "true");
+        cache_regenerated_kbsync(store, acc, passphrase, get(args, "debug") == "true");
 
         json j;
         j["externalVersionIdentifiers"] = out.externalVersionIdentifiers;
@@ -999,7 +1003,7 @@ static void cmd_get_version_metadata(const Args& args) {
         }
 
         auto out = store.get_version_metadata(acc, app, versionID, redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64);
-        invalidate_kbsync_if_rejected(store, acc, passphrase, get(args, "debug") == "true");
+        cache_regenerated_kbsync(store, acc, passphrase, get(args, "debug") == "true");
 
         json j;
         j["externalVersionID"] = versionID;
@@ -1480,7 +1484,7 @@ static void cmd_download(const Args& args) {
         auto out = store.download(acc, app, outputPath, versionID, progress,
                                   redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64,
                                   songDownloadDoneEndpoint);
-        invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
+        cache_regenerated_kbsync(store, acc, passphrase, dbg);
         json dlOut;
         dlOut["output"]    = out.destinationPath;
         dlOut["purchased"] = false;
@@ -1534,7 +1538,7 @@ static void cmd_download(const Args& args) {
             auto out = store.download(acc, app, outputPath, versionID, progress,
                                       redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64,
                                   songDownloadDoneEndpoint);
-            invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
+            cache_regenerated_kbsync(store, acc, passphrase, dbg);
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = true;
@@ -1552,7 +1556,7 @@ static void cmd_download(const Args& args) {
                 auto out = store.download(acc, app, outputPath, versionID, progress,
                                           redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64,
                                   songDownloadDoneEndpoint);
-                invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
+                cache_regenerated_kbsync(store, acc, passphrase, dbg);
                 json dlOut;
                 dlOut["output"]    = out.destinationPath;
                 dlOut["purchased"] = true;
@@ -1580,7 +1584,7 @@ static void cmd_download(const Args& args) {
             auto out = store.download(acc, app, outputPath, versionID, progress,
                                       redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64,
                                   songDownloadDoneEndpoint);
-            invalidate_kbsync_if_rejected(store, acc, passphrase, dbg);
+            cache_regenerated_kbsync(store, acc, passphrase, dbg);
             json dlOut;
             dlOut["output"]    = out.destinationPath;
             dlOut["purchased"] = false;

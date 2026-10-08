@@ -583,7 +583,7 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
                         const std::string& songDownloadDoneEndpoint)
 {
     std::string guid = get_guid();
-    m_kbsyncRejected = false;
+    m_regeneratedKbsync.clear();
 
     // Stateless 3-endpoint cascade (volumeStoreDownloadProduct → redownloadProduct
     // → updateProduct). Returns a served songList with sinf data, or throws
@@ -796,7 +796,7 @@ AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc,
                         const std::string& kbsyncB64)
 {
     std::string guid = get_guid();
-    m_kbsyncRejected = false;
+    m_regeneratedKbsync.clear();
 
     // Stateless 3-endpoint cascade; list-versions needs only item metadata, so
     // sinf data is not required (needSinfs=false).
@@ -842,7 +842,7 @@ AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account&
                                                const std::string& kbsyncB64)
 {
     std::string guid = get_guid();
-    m_kbsyncRejected = false;
+    m_regeneratedKbsync.clear();
 
     // Stateless 3-endpoint cascade; get-version-metadata needs only item metadata.
     PlistDict data = resolve_download(acc, app, guid, versionID,
@@ -1122,12 +1122,41 @@ PlistDict AppStore::resolve_download(const Account& acc, const App& app,
 
     // ── 1) volumeStoreDownloadProduct (bag, kbsync) ─────────────────────────
     if (!volumeStoreDownloadEndpoint.empty() && !kbsyncB64.empty()) {
+        std::string kb = kbsyncB64;               // may be swapped for a fresh blob below
         int st = 0;
         vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
-                                               kbsyncB64, externalVersionID,
+                                               kb, externalVersionID,
                                                /*authed=*/false, st);
         if (served(vsData)) return vsData;
-        if (st >= 500) m_kbsyncRejected = true;   // stale kbsync — caller regenerates
+
+        // HTTP >= 500 here means the kbsync blob was rejected (it is bound to
+        // DSID + hardwareID and goes stale). Regenerate it ONCE and retry this
+        // endpoint right away with the fresh blob — a stale kbsync shouldn't cost
+        // a whole second run. The fresh blob is handed to the caller to cache.
+        // If the retry is still >= 500 the kbsync is fresh, so it is not the
+        // problem: we stop retrying here and fall through to the cascade with the
+        // same failure handling as the first attempt.
+        if (st >= 500) {
+            try {
+                uint64_t dsid = std::stoull(acc.directoryServicesID);
+                std::string fresh = SapBase64::Encode(generate_kbsync(dsid));
+                if (!fresh.empty()) {
+                    m_regeneratedKbsync = fresh;   // caller caches this instead of clearing
+                    kb = fresh;
+                    if (m_debug)
+                        fprintf(stderr, "[DEBUG] volumeStoreDownload HTTP %d — regenerated kbsync, retrying\n", st);
+                    int stR = 0;
+                    vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
+                                                           kb, externalVersionID,
+                                                           /*authed=*/false, stR);
+                    if (served(vsData)) return vsData;
+                    st = stR;                      // keep handling errors on the retry response
+                }
+            } catch (const std::exception& e) {
+                if (m_debug) fprintf(stderr, "[DEBUG] kbsync regeneration failed (%s)\n", e.what());
+            }
+        }
+
         vsFailure = failure_of(vsData);
 
         // 2042 AuthTokenResumeFreeBuy → one retry with hasBeenAuthedForBuy
@@ -1141,7 +1170,7 @@ PlistDict AppStore::resolve_download(const Account& acc, const App& app,
                     fprintf(stderr, "[DEBUG] volumeStoreDownload auth dialog — retrying with hasBeenAuthedForBuy\n");
                 int st2 = 0;
                 vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
-                                                       kbsyncB64, externalVersionID,
+                                                       kb, externalVersionID,
                                                        /*authed=*/true, st2);
                 if (served(vsData)) return vsData;
                 vsFailure = failure_of(vsData);
