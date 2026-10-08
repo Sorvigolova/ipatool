@@ -35,9 +35,12 @@
 #include <vector>
 #include <functional>
 #include <cstring>
+#include <cstdio>
 #include <chrono>
 #include <thread>
 #include <csignal>
+#include <ctime>
+#include <unordered_set>
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #ifndef _WIN32
@@ -1133,6 +1136,140 @@ static void cmd_revoke(const Args& args) {
     log_output(out);
 }
 
+static void cmd_list_purchases(const Args& args) {
+    std::string passphrase = get(args, "keychain-passphrase", "");
+
+    Account acc;
+    if (!load_account(acc, passphrase)) { std::cerr << "Not logged in.\n"; exit(1); }
+
+    AppStore store(COOKIE_FILE);
+    if (get(args, "debug") == "true") store.set_debug(true);
+
+    // Window selection. The endpoint has no "everything" range — the iTunes
+    // web view itself iterates per calendar year — so:
+    //   (default)      last 90 days
+    //   --range R      verbatim &range=R (e.g. "2011-all" = that whole year)
+    //   --all          aggregate every year from --since-year (default 2008,
+    //                  the App Store launch year) up to the current year
+    std::string rangeArg  = get(args, "range", "");
+    bool        allYears  = (get(args, "all") == "true");
+    int         sinceYear = 2008;
+    { std::string y = get(args, "since-year", ""); if (!y.empty()) { try { sinceYear = std::stoi(y); } catch (...) {} } }
+
+    // String-field reader: missing / non-string -> "".
+    auto str = [](const json& o, const char* k) -> std::string {
+        auto it = o.find(k);
+        return (it != o.end() && it->is_string()) ? it->get<std::string>() : std::string();
+    };
+
+    // Parse one commerce page (data.attributes.purchases[].items[]), append its
+    // apps to `apps`, and report whether the list is complete (is-complete) plus
+    // how many NEW invoices it contributed (loop-termination signals). Dedup is
+    // by invoice order-id via `seen` — never by App Store id — so repeated
+    // purchases of the same app (distinct invoices) are all kept; only a
+    // replayed page of the same invoices is skipped. false only on an
+    // unexpected body shape.
+    auto parse_page = [&](const std::string& rawBody, json& apps,
+                          std::unordered_set<std::string>& seen,
+                          bool& isComplete, int& added) -> bool {
+        json body;
+        try { body = json::parse(rawBody); } catch (...) { return false; }
+        if (!body.contains("data") || !body["data"].is_object()) return false;
+        if (!body["data"].contains("attributes") || !body["data"]["attributes"].is_object())
+            return false;
+        const json& attr = body["data"]["attributes"];
+        // Pagination here is by page number; is-complete=false means more pages
+        // follow (pagination-token stays empty, so it is not the signal).
+        // Default true so a missing flag ends the loop rather than spinning.
+        isComplete = attr.value("is-complete", true);
+        added = 0;  // number of NEW invoices captured this page
+        for (const auto& inv : attr.value("purchases", json::array())) {
+            std::string orderId = str(inv, "order-id");
+            // Skip an invoice only if we've already captured this exact order-id
+            // (a replayed page). All items of a new invoice are emitted, and the
+            // same app bought in different invoices is kept each time.
+            if (!orderId.empty() && !seen.insert(orderId).second) continue;
+            ++added;
+            std::string invDate = str(inv, "invoice-date");
+            for (const auto& it : inv.value("items", json::array())) {
+                std::string name = str(it, "item-name");
+                if (name.empty()) name = str(it, "item-title");
+                std::string date = str(it, "purchase-date");
+                if (date.empty()) date = invDate;
+                // Fields mirror upstream (Go) where our commerce API provides
+                // them: id, name, price, purchaseDate. We have no bundleID /
+                // version, and `kind` ("iOS App", "Book", …) stands in for
+                // upstream's platforms slot. artist / order-id are dropped.
+                json a;
+                a["id"]           = str(it, "item-id");   // App Store ID
+                a["name"]         = name;
+                a["price"]        = str(it, "price");
+                a["purchaseDate"] = date;
+                a["kind"]         = str(it, "kind");      // in place of upstream's platforms
+                apps.push_back(a);
+            }
+        }
+        return true;
+    };
+
+    // Page through one range, appending into apps/seen. The endpoint paginates
+    // by page number and marks the final page with is-complete=true, so we walk
+    // page 1, 2, 3 … until it reports complete (or a page adds no new invoices,
+    // a safety stop). Returns the HTTP status (200 = ok) or -1 on a parse
+    // failure; failBody keeps the body for diagnosis.
+    std::string failBody;
+    auto collect = [&](const std::string& range, json& apps,
+                       std::unordered_set<std::string>& seen) -> int {
+        for (int page = 1; page <= 1000; ++page) {
+            auto out = store.list_purchases(acc, page, range);
+            if ((out.statusCode == 401 || out.statusCode == 403) && silent_relogin(acc, passphrase))
+                out = store.list_purchases(acc, page, range);
+            if (out.statusCode != 200) { failBody = out.rawBody; return out.statusCode; }
+            bool isComplete = true; int added = 0;
+            if (!parse_page(out.rawBody, apps, seen, isComplete, added)) { failBody = out.rawBody; return -1; }
+            if (isComplete || added == 0) break;  // last page, or no progress
+        }
+        return 200;
+    };
+
+    json apps = json::array();
+    std::unordered_set<std::string> seen;
+
+    if (allYears) {
+        int thisYear = 2008;
+        std::time_t t = std::time(nullptr);
+        std::tm* lt = std::localtime(&t);
+        if (lt) thisYear = lt->tm_year + 1900;
+        if (sinceYear < 2008)     sinceYear = 2008;
+        if (sinceYear > thisYear) sinceYear = thisYear;
+        for (int y = thisYear; y >= sinceYear; --y) {
+            int st = collect(std::to_string(y) + "-all", apps, seen);
+            if (st != 200) {
+                print_red_err("list-purchases failed for " + std::to_string(y)
+                              + ": HTTP " + std::to_string(st) + "\n");
+                if (!failBody.empty()) std::cerr << failBody.substr(0, 1500) << "\n";
+                exit(1);
+            }
+        }
+    } else {
+        int st = collect(rangeArg, apps, seen);
+        if (st != 200) {
+            print_red_err("list-purchases failed: HTTP " + std::to_string(st) + "\n");
+            if (!failBody.empty()) std::cerr << failBody.substr(0, 2000) << "\n";
+            if (st == -1) std::cerr << "(unexpected response shape; run with --debug)\n";
+            exit(1);
+        }
+    }
+
+    // Single structured event, matching the shape upstream (and our own search)
+    // use: count + apps=[...]. Text renders it as one zerolog-style line, json
+    // dumps the same object compactly — a log line for further processing.
+    json jout;
+    jout["count"] = (int)apps.size();
+    jout["apps"]  = apps;
+    log_output(jout);
+}
+
 static void cmd_download(const Args& args) {
     std::string bundleID       = get(args, "bundle-id",           "b");
     std::string appIDStr       = get(args, "app-id",              "i");
@@ -1474,6 +1611,7 @@ Commands:
   auth revoke           Revoke and delete saved credentials
   search                Search for apps
   purchase              Acquire a free app license
+  list-purchases        List purchases on the account (experimental, no anisette)
   download              Download an app IPA
   list-versions         List available versions of an app
   get-version-metadata  Get metadata for a specific app version
@@ -1495,6 +1633,9 @@ Examples:
   ipatool purchase -b com.example.app
   ipatool purchase -i 1234567890
   ipatool purchase -i 1234567890 -f                           (force: try buyProduct even if the app lookup fails, e.g. pulled from the storefront)
+  ipatool list-purchases                                      (last 90 days)
+  ipatool list-purchases --range 2011-all                     (one calendar year)
+  ipatool list-purchases --all                                (full history, iterating years from 2008)
   ipatool download -b com.example.app -o ./MyApp.ipa
   ipatool download -i 1234567890 -o ./MyApp.ipa
 
@@ -1502,6 +1643,7 @@ Flags per command:
   auth login:           -e/--email  -p/--password  -a/--auth-code  --keychain-passphrase
   search:               <term>  -l/--limit  --keychain-passphrase
   purchase:             -b/--bundle-id | -i/--app-id   -f/--force   --keychain-passphrase
+  list-purchases:       [--range YEAR-all] [--all] [--since-year Y]  --keychain-passphrase
   download:             -b/--bundle-id | -i/--app-id   -o/--output  --external-version-id  --purchase  --keychain-passphrase
   list-versions:        -b/--bundle-id | -i/--app-id   --purchase  --keychain-passphrase
   get-version-metadata: -b/--bundle-id | -i/--app-id   --external-version-id  --keychain-passphrase
@@ -1586,6 +1728,8 @@ int main(int argc, char** argv) {
         cmd_get_version_metadata(args);
     } else if (cmd == "purchase") {
         cmd_purchase(args);
+    } else if (cmd == "list-purchases") {
+        cmd_list_purchases(args);
     } else if (cmd == "download") {
         cmd_download(args);
     } else if (cmd == "kbsync") {

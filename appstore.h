@@ -162,6 +162,21 @@ public:
                                                    const std::string& volumeStoreDownloadEndpoint = "",
                                                    const std::string& kbsyncB64 = "");
 
+    // ── List Purchases ────────────────────────────────────────────────────────
+    struct ListPurchasesOutput {
+        int         statusCode = 0;
+        std::string rawBody;   // JSON commerce document (isJsonApiFormat=true)
+    };
+
+    // GET {pod}buy.itunes.apple.com/commerce/account/purchases (the commerce API
+    // the iTunes Purchase History view uses). Auth is the session cookies +
+    // X-Dsid + storefront + the Configurator UA — NO anisette, NO X-Token.
+    // Returns the raw JSON commerce body for the caller to parse; `page` is
+    // 1-based. `range` maps to the &range= query parameter: empty = the default
+    // (last 90 days), "<year>-all" = that calendar year's purchases.
+    ListPurchasesOutput list_purchases(const Account& acc, int page = 1,
+                                       const std::string& range = "");
+
 private:
     HttpClient m_http;
     bool       m_debug = false;

@@ -26,6 +26,13 @@ inline constexpr const char* PRIVATE_INIT_PATH      = "/bag.xml";
 inline constexpr const char* PRIVATE_AS_DOMAIN         = "buy.itunes.apple.com";
 inline constexpr const char* PRIVATE_AS_PATH_PURCHASE  = "/WebObjects/MZFinance.woa/wa/buyProduct";
 
+// Purchase history endpoint (the commerce API the iTunes "Purchase History"
+// web view actually fetches, resolved from the bag key getPurchasesSrv). Hosted
+// on the pod-prefixed buy.itunes.apple.com; with isJsonApiFormat=true it answers
+// JSON:API. Auth is the session cookies + X-Dsid + storefront — no anisette,
+// no X-Token.
+inline constexpr const char* PRIVATE_AS_PATH_PURCHASES = "/commerce/account/purchases";
+
 inline constexpr const char* HTTP_HEADER_STOREFRONT = "X-Set-Apple-Store-Front";
 inline constexpr const char* HTTP_HEADER_POD        = "pod";
 

@@ -265,6 +265,7 @@ Commands:
   auth revoke           Delete saved credentials
   search                Search for apps on the App Store
   purchase              Acquire a free app license
+  list-purchases        List the account's purchase history
   download              Download an app IPA / macOS pkg
   list-versions         List available versions of an app
   get-version-metadata  Get metadata for a specific app version
@@ -322,6 +323,19 @@ ipatool purchase (-b BUNDLE_ID | -i APP_ID) [-f|--force] [--keychain-passphrase 
 Acquires a free license. Must be run once before downloading any app not already in your library.
 
 - `-f` / `--force` — only with `-i APP_ID`. The app lookup normally runs first and aborts the purchase if it fails. A developer may have pulled the app from the storefront, so the lookup 404s even though the license is still acquirable by its known id. With `--force` the failed lookup is tolerated and `buyProduct` is attempted anyway (it only needs the numeric id). Has no effect with `-b`, where the lookup is the only way to resolve the id.
+
+#### `list-purchases`
+```
+ipatool list-purchases [--range YEAR-all] [--all] [--since-year Y] [--keychain-passphrase PASSPHRASE]
+```
+Lists the account's purchase history — every purchase, including apps later pulled from the store (the data comes from the commerce invoice API, `/commerce/account/purchases`, not the owned-apps list, so delisted titles are kept). No anisette headers are needed; the session cookies plus `X-Token` / `X-Dsid` / storefront authorize the request, and pages are fetched until the response reports `is-complete`.
+
+- default (no flags) — the last 90 days.
+- `--range YEAR-all` — one calendar year, e.g. `--range 2011-all`.
+- `--all` — the full history, iterating every year from `--since-year` up to the current year and merging the results (duplicate invoices are de-duplicated by order ID; repeated purchases of the same app are all kept).
+- `--since-year Y` — lower bound for `--all` (default `2008`, the year the App Store launched).
+
+Each entry carries `id` (App Store ID), `name`, `price` (with currency), `purchaseDate`, and `kind` (`iOS App`, `Book`, …). With `--format json` the same `{count, apps:[…]}` object is emitted as one compact JSON line, convenient as a log for further processing.
 
 #### `download`
 ```
@@ -389,7 +403,12 @@ ipatool download -i 1440285423 --purchase -o ~/Downloads
 ipatool list-versions -b com.mojang.minecraft-edu
 ipatool download -b com.mojang.minecraft-edu --external-version-id 123456789 -o ~/Downloads
 
-# 7. Revoke saved credentials
+# 7. List purchase history (last 90 days, one year, or everything)
+ipatool list-purchases
+ipatool list-purchases --range 2011-all
+ipatool list-purchases --all
+
+# 8. Revoke saved credentials
 ipatool auth revoke
 ```
 
@@ -444,7 +463,7 @@ On Windows these are in `%USERPROFILE%\.ipatool\`. The account file is always en
 - `protect.cpp/.h` — `SecureString` in-memory encryption and `secure_zero`
 
 **App Store protocol**
-- `appstore.cpp/.h` — bag fetch, SAP-signed login, search/lookup, purchase, download (`volumeStoreDownloadProduct → redownloadProduct → updateProduct` cascade), list-versions, version metadata, storefront↔country table, iTunes JSON parsing
+- `appstore.cpp/.h` — bag fetch, SAP-signed login, search/lookup, purchase, list-purchases (paginated commerce invoice API), download (`volumeStoreDownloadProduct → redownloadProduct → updateProduct` cascade), list-versions, version metadata, storefront↔country table, iTunes JSON parsing
 - `http_client.cpp/.h` — libcurl wrapper (GET/POST, resumable download, custom cookie file I/O via `CURLOPT_COOKIELIST`)
 - `plist.cpp/.h` — Apple plist XML + binary encoder/decoder (no external deps)
 

@@ -506,6 +506,49 @@ App AppStore::lookup_by_id(const Account& acc, int64_t appID) {
     return sr.results[0];
 }
 
+AppStore::ListPurchasesOutput AppStore::list_purchases(const Account& acc, int page,
+                                                       const std::string& range) {
+    // Pod-prefixed host, same scheme as buyProduct (p<pod>-buy.itunes.apple.com).
+    std::string pod_prefix;
+    if (!acc.pod.empty()) pod_prefix = "p" + acc.pod + "-";
+
+    std::string url = "https://" + pod_prefix + std::string(PRIVATE_AS_DOMAIN)
+                    + PRIVATE_AS_PATH_PURCHASES
+                    + "?isDeepLink=false&isJsonApiFormat=true";
+    // page omitted when <= 0 — the endpoint then tends to return everything in
+    // one response; pass an explicit page only to fetch a specific later page.
+    if (page > 0)
+        url += "&page=" + std::to_string(page);
+    // range selects the time window: default (omitted) = last 90 days,
+    // "<year>-all" = that whole calendar year.
+    if (!range.empty())
+        url += "&range=" + url_encode(range);
+
+    // Mirror the iTunes Purchase History request: session cookies (carried by
+    // the shared jar) + X-Dsid + storefront + the Configurator UA. No anisette,
+    // no X-Token. No Accept-Encoding, so the JSON comes back uncompressed and we
+    // can read it directly.
+    std::map<std::string, std::string> headers = {
+        {"User-Agent",          CONFIGURATOR_UA},
+        {"Accept-Language",     "en-us"},
+        {"X-Apple-Store-Front", acc.storeFront},
+        {"X-Dsid",              acc.directoryServicesID},
+    };
+    // The captured trace didn't carry X-Token (cookies + DSID authorize here),
+    // but sending it too is harmless and covers the case where it's required.
+    if (!acc.passwordToken.get().empty())
+        headers["X-Token"] = acc.passwordToken.get();
+
+    if (m_debug) debug_dump_request("list-purchases", "GET", url, headers, "");
+    HttpResponse res = m_http.get(url, headers);
+    if (m_debug) debug_dump_response("list-purchases", res);
+
+    ListPurchasesOutput out;
+    out.statusCode = res.statusCode;
+    out.rawBody    = res.body;
+    return out;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AppStore — Purchase
 // ─────────────────────────────────────────────────────────────────────────────
