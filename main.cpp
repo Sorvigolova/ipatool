@@ -560,8 +560,8 @@ static void set_color(ColId c) {
         switch (c) {
             case COL_RESET_ID:  SetConsoleTextAttribute(h, s_defaultAttrs); break;
             case COL_DARK_ID:   SetConsoleTextAttribute(h, bg | FOREGROUND_INTENSITY); break;
-            case COL_GREEN_ID:  SetConsoleTextAttribute(h, bg | FOREGROUND_GREEN | FOREGROUND_INTENSITY); break;
-            case COL_CYAN_ID:   SetConsoleTextAttribute(h, bg | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY); break;
+            case COL_GREEN_ID:  SetConsoleTextAttribute(h, bg | FOREGROUND_GREEN); break;
+            case COL_CYAN_ID:   SetConsoleTextAttribute(h, bg | FOREGROUND_GREEN | FOREGROUND_BLUE); break;
             case COL_RED_ID:    SetConsoleTextAttribute(h, bg | FOREGROUND_RED | FOREGROUND_INTENSITY); break;
         }
     }
