@@ -471,19 +471,70 @@ static void restore_cursor() {
 }
 static void signal_handler(int) { restore_cursor(); _exit(1); }
 
+// Streams UTF-8 to a real Windows console via the wide API. Our output is UTF-8
+// internally; we widen it to UTF-16 and call WriteConsoleW, which the console
+// (natively UTF-16) prints correctly on every Windows version — including 7.
+// We deliberately do NOT set the output code page: CP 65001 (UTF-8) breaks CRT
+// writes on Windows 7 with ERROR_WRITE_FAULT ("The system cannot write to the
+// specified device"). Installed only for an actual console; redirected/piped
+// output keeps the default path so files receive raw UTF-8 bytes. Flushes on
+// newline and on sync so ANSI/attribute color changes stay ordered with text.
+class WinConsoleUtf8Buf : public std::streambuf {
+public:
+    explicit WinConsoleUtf8Buf(HANDLE h) : h_(h) {}
+protected:
+    int_type overflow(int_type c) override {
+        if (c != traits_type::eof()) {
+            buf_.push_back(static_cast<char>(c));
+            if (static_cast<char>(c) == '\n') flush_();
+        }
+        return c;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        buf_.append(s, static_cast<size_t>(n));
+        if (traits_type::find(s, static_cast<size_t>(n), '\n')) flush_();
+        return n;
+    }
+    int sync() override { flush_(); return 0; }
+private:
+    void flush_() {
+        if (buf_.empty()) return;
+        std::wstring w = ipt::utf8_to_wide(buf_);
+        if (!w.empty()) {
+            DWORD written = 0;
+            WriteConsoleW(h_, w.data(), static_cast<DWORD>(w.size()), &written, nullptr);
+        }
+        buf_.clear();
+    }
+    HANDLE      h_;
+    std::string buf_;
+};
+
 static void init_color() {
+    // Route real-console stdout/stderr through WriteConsoleW (UTF-16) so UTF-8
+    // text prints correctly without touching the code page (see the buffer above).
+    // Redirected streams are left untouched → raw UTF-8 lands in files/pipes.
+    // The buffers are intentionally leaked: they must outlive std::cout/std::cerr,
+    // which flush during static teardown.
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE && _isatty(_fileno(stdout)))
+        std::cout.rdbuf(new WinConsoleUtf8Buf(hOut));
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    if (hErr != INVALID_HANDLE_VALUE && _isatty(_fileno(stderr)))
+        std::cerr.rdbuf(new WinConsoleUtf8Buf(hErr));
+
+    // Color setup only matters when stdout is a real console.
     if (!_isatty(_fileno(stdout))) return;
-    SetConsoleOutputCP(CP_UTF8);
-    SetConsoleCP(CP_UTF8);
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (h == INVALID_HANDLE_VALUE) return;
-    // Save original attributes (includes background color)
+    if (hOut == INVALID_HANDLE_VALUE) return;
+    // Save original attributes (includes background color).
     CONSOLE_SCREEN_BUFFER_INFO csbi;
-    if (GetConsoleScreenBufferInfo(h, &csbi))
+    if (GetConsoleScreenBufferInfo(hOut, &csbi))
         s_defaultAttrs = csbi.wAttributes;
+    // ENABLE_VIRTUAL_TERMINAL_PROCESSING exists on Windows 10+; on 7 this call
+    // fails and we fall back to SetConsoleTextAttribute in set_color().
     DWORD mode = 0;
-    if (GetConsoleMode(h, &mode) &&
-        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+    if (GetConsoleMode(hOut, &mode) &&
+        SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
         s_ansi_enabled = true;
 }
 
