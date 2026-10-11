@@ -299,6 +299,14 @@ HttpResponse HttpClient::perform(const std::string& method,
         if (!is_retryable_curl(rc) || attempt > API_MAX_RETRIES) break;
     }
 
+    // A name-resolution failure gets its own type so callers (e.g. list_purchases)
+    // can distinguish it from other transport errors and fall back. Not retried
+    // above anyway — is_retryable_curl() only retries timeouts. Message text is
+    // kept identical to the generic case for log continuity.
+    if (rc == CURLE_COULDNT_RESOLVE_HOST || rc == CURLE_COULDNT_RESOLVE_PROXY)
+        throw DnsResolveError(
+            std::string("HTTP request failed: ") + curl_easy_strerror(rc));
+
     throw std::runtime_error(
         std::string("HTTP request failed: ") + curl_easy_strerror(rc));
 }

@@ -508,21 +508,20 @@ App AppStore::lookup_by_id(const Account& acc, int64_t appID) {
 
 AppStore::ListPurchasesOutput AppStore::list_purchases(const Account& acc, int page,
                                                        const std::string& range) {
-    // Pod-prefixed host, same scheme as buyProduct (p<pod>-buy.itunes.apple.com).
-    std::string pod_prefix;
-    if (!acc.pod.empty()) pod_prefix = "p" + acc.pod + "-";
+    m_regeneratedPod.clear();
 
-    std::string url = "https://" + pod_prefix + std::string(PRIVATE_AS_DOMAIN)
-                    + PRIVATE_AS_PATH_PURCHASES
-                    + "?isDeepLink=false&isJsonApiFormat=true";
+    // Path + query are host-independent; only the host carries the pod prefix
+    // (p<pod>-buy.itunes.apple.com), same scheme as buyProduct.
+    std::string query = std::string(PRIVATE_AS_PATH_PURCHASES)
+                      + "?isDeepLink=false&isJsonApiFormat=true";
     // page omitted when <= 0 — the endpoint then tends to return everything in
     // one response; pass an explicit page only to fetch a specific later page.
     if (page > 0)
-        url += "&page=" + std::to_string(page);
+        query += "&page=" + std::to_string(page);
     // range selects the time window: default (omitted) = last 90 days,
     // "<year>-all" = that whole calendar year.
     if (!range.empty())
-        url += "&range=" + url_encode(range);
+        query += "&range=" + url_encode(range);
 
     // Mirror the iTunes Purchase History request: session cookies (carried by
     // the shared jar) + X-Dsid + storefront + the Configurator UA. No anisette,
@@ -539,9 +538,70 @@ AppStore::ListPurchasesOutput AppStore::list_purchases(const Account& acc, int p
     if (!acc.passwordToken.get().empty())
         headers["X-Token"] = acc.passwordToken.get();
 
-    if (m_debug) debug_dump_request("list-purchases", "GET", url, headers, "");
-    HttpResponse res = m_http.get(url, headers);
-    if (m_debug) debug_dump_response("list-purchases", res);
+    auto build_url = [&](const std::string& pod) {
+        std::string prefix = pod.empty() ? "" : ("p" + pod + "-");
+        return "https://" + prefix + std::string(PRIVATE_AS_DOMAIN) + query;
+    };
+    // Extract the pod digits from a pod-prefixed URL (…//p<N>-buy.itunes…).
+    auto pod_from_url = [](const std::string& u) -> std::string {
+        auto p = u.find("://");
+        if (p == std::string::npos) return std::string();
+        p += 3;
+        if (p >= u.size() || u[p] != 'p') return std::string();
+        std::string digits;
+        size_t i = p + 1;
+        while (i < u.size() && u[i] >= '0' && u[i] <= '9') digits.push_back(u[i++]);
+        return (i < u.size() && u[i] == '-' && !digits.empty()) ? digits : std::string();
+    };
+    // Learn the pod Apple hands back: explicit 'pod' response header first, else
+    // parsed from a 302 Location host.
+    auto capture_pod = [&](const HttpResponse& r) {
+        auto it = r.headers.find(str_lower(HTTP_HEADER_POD));
+        if (it != r.headers.end() && !it->second.empty()) { m_regeneratedPod = it->second; return; }
+        if (r.statusCode == 302) {
+            auto loc = r.headers.find("location");
+            if (loc != r.headers.end()) {
+                std::string p = pod_from_url(loc->second);
+                if (!p.empty()) m_regeneratedPod = p;
+            }
+        }
+    };
+
+    std::string url = build_url(acc.pod);
+    HttpResponse res;
+    try {
+        if (m_debug) debug_dump_request("list-purchases", "GET", url, headers, "");
+        res = m_http.get(url, headers);
+        if (m_debug) debug_dump_response("list-purchases", res);
+    } catch (const DnsResolveError&) {
+        // The stored pod's hostname would not resolve. With no pod at all this is
+        // a genuine DNS failure — let it propagate. Otherwise the stored pod is
+        // likely stale: retry on the pod-less host, which routes us to (and tells
+        // us) the correct pod, then follow that redirect for the actual data.
+        if (acc.pod.empty()) throw;
+        std::string base = build_url("");    // https://buy.itunes.apple.com/…
+        if (m_debug) debug_dump_request("list-purchases(fallback)", "GET", base, headers, "");
+        HttpResponse fb = m_http.get(base, headers);
+        if (m_debug) debug_dump_response("list-purchases(fallback)", fb);
+        capture_pod(fb);
+        if (fb.statusCode == 302) {
+            // Prefer rebuilding the URL from the learned pod so our own query
+            // (page/range) is preserved — Apple's Location may drop it. Only if
+            // no pod could be derived do we follow the raw Location as-is.
+            std::string target;
+            if (!m_regeneratedPod.empty()) {
+                target = build_url(m_regeneratedPod);
+            } else {
+                auto loc = fb.headers.find("location");
+                target = (loc != fb.headers.end() && !loc->second.empty()) ? loc->second : base;
+            }
+            if (m_debug) debug_dump_request("list-purchases(redir)", "GET", target, headers, "");
+            res = m_http.get(target, headers);
+            if (m_debug) debug_dump_response("list-purchases(redir)", res);
+        } else {
+            res = fb;    // the pod-less host served the data directly
+        }
+    }
 
     ListPurchasesOutput out;
     out.statusCode = res.statusCode;

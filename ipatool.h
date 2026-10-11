@@ -109,3 +109,7 @@ struct LicenseRequired     : IpaError { LicenseRequired()     : IpaError("licens
 struct PasswordTokenExpired: IpaError { PasswordTokenExpired(): IpaError("password token is expired") {} };
 struct SubscriptionRequired: IpaError { SubscriptionRequired(): IpaError("subscription required") {} };
 struct PaidAppNotSupported : IpaError { PaidAppNotSupported() : IpaError("purchasing paid apps is not supported") {} };
+// A hostname could not be resolved (curl CURLE_COULDNT_RESOLVE_*). Distinct so
+// callers can tell a DNS failure from other transport errors and react — e.g.
+// list_purchases retries on the pod-less host when a stale pod's host won't resolve.
+struct DnsResolveError     : IpaError { explicit DnsResolveError(const std::string& msg) : IpaError(msg) {} };

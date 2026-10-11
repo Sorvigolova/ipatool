@@ -1228,6 +1228,13 @@ static void cmd_list_purchases(const Args& args) {
             auto out = store.list_purchases(acc, page, range);
             if ((out.statusCode == 401 || out.statusCode == 403) && silent_relogin(acc, passphrase))
                 out = store.list_purchases(acc, page, range);
+            // If the stored pod's host failed to resolve, list_purchases fell back
+            // to the pod-less host and learned the correct pod — persist it so the
+            // remaining pages and future runs use it directly (no relogin needed).
+            if (!store.regenerated_pod().empty() && store.regenerated_pod() != acc.pod) {
+                acc.pod = store.regenerated_pod();
+                save_account(acc, passphrase);
+            }
             if (out.statusCode != 200) { failBody = out.rawBody; return out.statusCode; }
             bool isComplete = true; int added = 0;
             if (!parse_page(out.rawBody, apps, seen, isComplete, added)) { failBody = out.rawBody; return -1; }
@@ -1718,6 +1725,11 @@ int main(int argc, char** argv) {
             cmd = "auth " + args.pos[1];
     }
 
+    // Top-level guard: commands normally handle their own errors and exit(), but
+    // any std::exception that escapes (e.g. a transport failure like a DNS
+    // "Couldn't resolve host name") must become a clean message and exit code 1,
+    // never an uncaught exception that std::terminate()s the process.
+    try {
     if (cmd == "auth info" || cmd == "account") {
         cmd_show_account(args);
     } else if (cmd == "auth login" || cmd == "login") {
@@ -1743,6 +1755,13 @@ int main(int argc, char** argv) {
     } else {
         std::cerr << "Unknown command: " << cmd << "\n";
         print_help();
+        return 1;
+    }
+    } catch (const std::exception& e) {
+        print_red_err(std::string("Error: ") + e.what() + "\n");
+        return 1;
+    } catch (...) {
+        print_red_err("Error: unknown fatal error.\n");
         return 1;
     }
 

@@ -130,6 +130,12 @@ public:
     // the endpoint and regenerates again — so no separate "rejected" flag.
     const std::string& regenerated_kbsync() const { return m_regeneratedKbsync; }
 
+    // When list_purchases had to fall back to the pod-less host because the
+    // stored pod's hostname would not resolve, this holds the pod Apple routed
+    // us to, so the caller can save it to the account (no relogin needed).
+    // Empty when no rediscovery happened this call.
+    const std::string& regenerated_pod() const { return m_regeneratedPod; }
+
 public:
     void set_debug(bool v); // also enables SapSigner HTTP dumps
 
@@ -183,6 +189,7 @@ private:
     HttpClient m_http;
     bool       m_debug = false;
     std::string m_regeneratedKbsync;     // fresh kbsync produced by a mid-resolve retry (for caching)
+    std::string m_regeneratedPod;        // pod rediscovered via the pod-less list_purchases fallback
 
     // ── volumeStoreDownloadProduct (bag download endpoint, kbsync-signed) ────────
     // POSTs the bag's volumeStoreDownloadProduct with the base64 kbsync and returns
