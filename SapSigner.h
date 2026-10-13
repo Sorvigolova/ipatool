@@ -20,27 +20,6 @@ struct ISapHttpClient {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SapWinHttpClient  — built-in WinHTTP implementation
-// ─────────────────────────────────────────────────────────────────────────────
-class SapWinHttpClient final : public ISapHttpClient {
-public:
-    explicit SapWinHttpClient(std::wstring userAgent = L"iTunes/12.13");
-    ~SapWinHttpClient() override;
-
-    std::vector<uint8_t> Get(std::string_view url) override;
-    std::vector<uint8_t> Post(std::string_view url,
-                               std::span<const uint8_t> body,
-                               std::string_view contentType) override;
-private:
-    std::vector<uint8_t> Send(std::string_view method,
-                               std::string_view url,
-                               std::span<const uint8_t> body,
-                               std::string_view contentType);
-    std::wstring userAgent_;
-    void* hSession_ = nullptr; // HINTERNET
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  SapSigner  — full port of signer_local.go
 //
 //  Usage:
@@ -69,7 +48,7 @@ public:
     };
 
     // Create and perform the full SAP handshake.
-    // httpClient == nullptr → uses SapWinHttpClient.
+    // httpClient == nullptr → uses SapCurlHttpClient (libcurl, all platforms).
     static std::unique_ptr<SapSigner> Create(
         const Config&        config,
         std::vector<uint8_t> coreFP,

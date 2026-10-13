@@ -4,18 +4,17 @@
 #ifdef _WIN32
 // Windows networking headers — order matters:
 // winsock2.h must precede windows.h to get AF_UNSPEC, IPPROTO_*, etc.
+// These serve the MAC-address code (LocalHardwareID); SAP HTTP now uses libcurl.
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
 #  include <windows.h>
-#  include <winhttp.h>
 #  include <iphlpapi.h>
 #  if defined(_MSC_VER)
 // MSVC auto-links via these pragmas; MinGW/GCC links the same libs through CMake
 // and would otherwise warn "ignoring #pragma comment [-Wunknown-pragmas]".
-#    pragma comment(lib, "winhttp.lib")
 #    pragma comment(lib, "iphlpapi.lib")
 #    pragma comment(lib, "ws2_32.lib")
 #  endif
@@ -28,8 +27,9 @@
 #  else
 #    include <net/if_dl.h>        // struct sockaddr_dl (macOS)
 #  endif
-#  include <curl/curl.h>
 #endif
+
+#include <curl/curl.h>   // SAP HTTP client — all platforms
 
 #include <algorithm>
 #include <cstdio>
@@ -239,197 +239,11 @@ static void SapDebugResponse(long status, const std::string& headers,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SapWinHttpClient (Windows) / SapCurlHttpClient (Linux/macOS)
+//  SapCurlHttpClient (all platforms)
 // ═══════════════════════════════════════════════════════════════════════════
 
-#ifdef _WIN32
 
-SapWinHttpClient::SapWinHttpClient(std::wstring userAgent)
-    : userAgent_(std::move(userAgent))
-{
-    hSession_ = WinHttpOpen(userAgent_.c_str(),
-                            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                            WINHTTP_NO_PROXY_NAME,
-                            WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession_)
-        throw std::runtime_error(ipt::format("WinHttpOpen failed: {}", GetLastError()));
-
-    // 30-second timeout (matches Go: http.Client{Timeout: 30 * time.Second})
-    DWORD timeout = 30000;
-    WinHttpSetOption(hSession_, WINHTTP_OPTION_CONNECT_TIMEOUT,    &timeout, sizeof(timeout));
-    WinHttpSetOption(hSession_, WINHTTP_OPTION_SEND_TIMEOUT,       &timeout, sizeof(timeout));
-    WinHttpSetOption(hSession_, WINHTTP_OPTION_RECEIVE_TIMEOUT,    &timeout, sizeof(timeout));
-
-    // Force TLS 1.2 minimum for Apple SAP servers.
-    // Do NOT include TLS 1.0 / 1.1 — Apple rejects them and WinHTTP
-    // may randomly negotiate the lower version causing intermittent failures.
-    DWORD tlsFlags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-    WinHttpSetOption(hSession_, WINHTTP_OPTION_SECURE_PROTOCOLS, &tlsFlags, sizeof(tlsFlags));
-}
-
-SapWinHttpClient::~SapWinHttpClient() {
-    if (hSession_) WinHttpCloseHandle(hSession_);
-}
-
-// Convert UTF-8 std::string to wide string
-static std::wstring ToWide(std::string_view s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
-    return w;
-}
-
-std::vector<uint8_t> SapWinHttpClient::Get(std::string_view url) {
-    return Send("GET", url, {}, {});
-}
-
-std::vector<uint8_t> SapWinHttpClient::Post(std::string_view url,
-                                              std::span<const uint8_t> body,
-                                              std::string_view contentType) {
-    return Send("POST", url, body, contentType);
-}
-
-std::vector<uint8_t> SapWinHttpClient::Send(std::string_view method,
-                                              std::string_view urlStr,
-                                              std::span<const uint8_t> body,
-                                              std::string_view contentType) {
-    // Parse URL
-    URL_COMPONENTS uc = {};
-    uc.dwStructSize   = sizeof(uc);
-    std::wstring wurl = ToWide(urlStr);
-
-    wchar_t host[256] = {}, path[4096] = {};
-    uc.lpszHostName    = host; uc.dwHostNameLength    = 255;
-    uc.lpszUrlPath     = path; uc.dwUrlPathLength     = 4095;
-    uc.dwSchemeLength  = 1;
-
-    if (!WinHttpCrackUrl(wurl.c_str(), (DWORD)wurl.size(), 0, &uc))
-        throw std::runtime_error(ipt::format("WinHttpCrackUrl: {}", GetLastError()));
-
-    bool isHttps = (uc.nScheme == INTERNET_SCHEME_HTTPS);
-    DWORD port   = uc.nPort ? uc.nPort : (isHttps ? 443 : 80);
-
-    HINTERNET hConn = WinHttpConnect(hSession_, host, (INTERNET_PORT)port, 0);
-    if (!hConn) throw std::runtime_error(ipt::format("WinHttpConnect: {}", GetLastError()));
-
-    DWORD flags = isHttps ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hReq = WinHttpOpenRequest(hConn, ToWide(method).c_str(),
-                                         path, nullptr,
-                                         WINHTTP_NO_REFERER,
-                                         WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hReq) { WinHttpCloseHandle(hConn); throw std::runtime_error(ipt::format("WinHttpOpenRequest: {}", GetLastError())); }
-
-    // Set Content-Type header if present
-    if (!contentType.empty()) {
-        std::wstring ct = L"Content-Type: " + ToWide(contentType);
-        WinHttpAddRequestHeaders(hReq, ct.c_str(), (DWORD)ct.size(), WINHTTP_ADDREQ_FLAG_ADD);
-    }
-
-    // Add User-Agent header (set on session, but also set on request to match iTunes UA)
-    // -1L → header string is null-terminated, let WinHTTP compute its length.
-    // (The old WINHTTP_NO_HEADER_INDEX here is NULL, i.e. length 0 — wrong field.)
-    WinHttpAddRequestHeaders(hReq,
-        (L"User-Agent: " + userAgent_).c_str(),
-        (DWORD)-1L,
-        WINHTTP_ADDREQ_FLAG_REPLACE | WINHTTP_ADDREQ_FLAG_ADD);
-
-    // Windows 7 root certificate store doesn't include newer DigiCert roots
-    // that Apple's SAP servers use. Add the missing root from our embedded bundle
-    // rather than disabling all validation.
-    // We only skip CA chain validation — hostname and date checks remain active,
-    // which still protects against MITM attacks to different servers.
-    {
-        DWORD dwSecFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA;
-        OSVERSIONINFOW osvi{};
-        osvi.dwOSVersionInfoSize = sizeof(osvi);
-#if defined(_MSC_VER)
-#  pragma warning(suppress: 4996)  // GetVersionExW deprecation (MSVC only)
-#endif
-        GetVersionExW(&osvi);
-        bool isWin7 = (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion == 1);
-        if (isWin7) {
-            // Win7 only: skip CA validation (outdated root store).
-            // Hostname + date validation remain active — prevents MITM.
-            WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS,
-                             &dwSecFlags, sizeof(dwSecFlags));
-        }
-    }
-
-    BOOL sent = WinHttpSendRequest(hReq,
-                                    WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                    body.empty() ? nullptr : (LPVOID)body.data(),
-                                    (DWORD)body.size(),
-                                    (DWORD)body.size(), 0);
-    DWORD sendErr = GetLastError();
-    if (!sent) {
-        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
-        throw std::runtime_error(ipt::format("WinHttpSendRequest failed: {}", sendErr));
-    }
-    if (!WinHttpReceiveResponse(hReq, nullptr)) {
-        DWORD recvErr = GetLastError();
-        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
-        throw std::runtime_error(ipt::format("WinHttpReceiveResponse failed: {}", recvErr));
-    }
-
-    // Raw header block (request or response) as UTF-8, for --debug
-    auto rawHeaders = [&](DWORD infoLevel) -> std::string {
-        DWORD size = 0;
-        WinHttpQueryHeaders(hReq, infoLevel, WINHTTP_HEADER_NAME_BY_INDEX,
-                            WINHTTP_NO_OUTPUT_BUFFER, &size, WINHTTP_NO_HEADER_INDEX);
-        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size == 0) return {};
-        std::wstring w(size / sizeof(wchar_t), L'\0');
-        if (!WinHttpQueryHeaders(hReq, infoLevel, WINHTTP_HEADER_NAME_BY_INDEX,
-                                 w.data(), &size, WINHTTP_NO_HEADER_INDEX))
-            return {};
-        w.resize(size / sizeof(wchar_t));
-        int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                                    nullptr, 0, nullptr, nullptr);
-        std::string out(n, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                            out.data(), n, nullptr, nullptr);
-        return out;
-    };
-
-    // Request as actually sent — WinHTTP fills in Host, Content-Length, etc.
-    if (SapSigner::Debug())
-        SapDebugRequest(method, urlStr,
-            rawHeaders(WINHTTP_QUERY_RAW_HEADERS_CRLF | WINHTTP_QUERY_FLAG_REQUEST_HEADERS),
-            body);
-
-    // Check status code
-    DWORD statusCode = 0; DWORD statusSize = sizeof(statusCode);
-    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                         nullptr, &statusCode, &statusSize, nullptr);
-
-    // Read response body (also on error status, so --debug can show it)
-    std::vector<uint8_t> result;
-    DWORD avail = 0;
-    while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
-        size_t off = result.size();
-        result.resize(off + avail);
-        DWORD read = 0;
-        if (!WinHttpReadData(hReq, result.data() + off, avail, &read))
-            break;
-        result.resize(off + read);
-    }
-
-    if (SapSigner::Debug())
-        SapDebugResponse((long)statusCode, rawHeaders(WINHTTP_QUERY_RAW_HEADERS_CRLF), result);
-
-    if (statusCode != 200) {
-        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn);
-        throw std::runtime_error(ipt::format("Apple returned HTTP {}", statusCode));
-    }
-
-    WinHttpCloseHandle(hReq);
-    WinHttpCloseHandle(hConn);
-    return result;
-}
-
-#else // !_WIN32
-
-// ── libcurl-based HTTP client for Linux / macOS ───────────────────────────
+// ── libcurl-based HTTP client (all platforms) ──────────────────────────────
 
 namespace {
 
@@ -474,6 +288,9 @@ static std::vector<uint8_t> curl_request(
     curl_easy_setopt(curl, CURLOPT_USERAGENT, userAgent.c_str());
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    // Apple SAP servers require TLS 1.2+. Pin the floor explicitly — on Windows
+    // (Schannel) old systems could otherwise negotiate TLS 1.0, which Apple rejects.
+    curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
 
     struct curl_slist* hdrs = nullptr;
     if (!contentType.empty()) {
@@ -538,7 +355,6 @@ private:
         "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6";
 };
 
-#endif // _WIN32
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  SAP protocol helpers  (port of protocol.go)
@@ -590,20 +406,12 @@ std::unique_ptr<SapSigner> SapSigner::Create(
     if (config.certificateURL.empty() || config.certificateURL.substr(0, 8) != "https://")
         throw std::runtime_error("SAP certificate URL must be HTTPS");
 
-    // Owned HTTP client if none provided
-#ifdef _WIN32
-    std::unique_ptr<SapWinHttpClient> ownedHttp;
-    if (!httpClient) {
-        ownedHttp  = std::make_unique<SapWinHttpClient>();
-        httpClient = ownedHttp.get();
-    }
-#else
+    // Owned HTTP client if none provided (libcurl on every platform).
     std::unique_ptr<SapCurlHttpClient> ownedHttp;
     if (!httpClient) {
         ownedHttp  = std::make_unique<SapCurlHttpClient>();
         httpClient = ownedHttp.get();
     }
-#endif
 
     // 1. Start the emulated Apple SAP runtime
     auto machine = SapMachine::Create(std::move(coreFP), std::move(commerceCore),

@@ -804,7 +804,7 @@ if(STATIC_BUILD AND MINGW)
         ${CRYPTO_STATIC_MINGW}
         -Wl,--start-group -lminizip -lz -lbz2 -Wl,--end-group
         # Schannel + Windows system deps
-        ws2_32 crypt32 bcrypt secur32 wldap32 normaliz winhttp iphlpapi shell32)
+        ws2_32 crypt32 bcrypt secur32 wldap32 normaliz iphlpapi shell32)
     target_include_directories(ipatool PRIVATE "${STATIC_CURL_INCLUDE}")
     add_dependencies(ipatool curl_static_mingw)
     # -static → pull libgcc/libstdc++/libwinpthread in too; unicorn bundles its
@@ -879,7 +879,7 @@ if(WIN32)
   if(MSVC)
     # iphlpapi  = GetAdaptersInfo (MAC address)
     # ws2_32    = Winsock (used by curl internally too)
-    target_link_libraries(ipatool PRIVATE iphlpapi ws2_32 winhttp crypt32 wldap32 normaliz shell32)
+    target_link_libraries(ipatool PRIVATE iphlpapi ws2_32 crypt32 wldap32 normaliz shell32)
 
     # ── Release build: strip debug info from EXE, keep PDB separate ─────────────
     # /DEBUG:NONE  — no debug directory embedded in EXE (no PDB reference)
@@ -951,9 +951,8 @@ if(WIN32)
         # Dynamic MinGW: the generic block already linked curl/openssl/unicorn;
         # add the Windows system deps + minizip here. (Static is fully handled by
         # the MinGW single-file branch above.)
-        # winhttp: SapWinHttpClient (the MSVC #pragma comment is ignored by GCC).
         target_link_libraries(ipatool PRIVATE
-            iphlpapi ws2_32 crypt32 bcrypt secur32 wldap32 normaliz winhttp shell32
+            iphlpapi ws2_32 crypt32 bcrypt secur32 wldap32 normaliz shell32
             -Wl,--start-group -lminizip -lz -lbz2 -Wl,--end-group)
         target_link_options(ipatool PRIVATE -static-libgcc -static-libstdc++)
     endif()
