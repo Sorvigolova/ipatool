@@ -61,9 +61,8 @@
 #  include <shellapi.h>   // CommandLineToArgvW — UTF-8 argv rebuild
 #endif
 
-// OpenSSL for AES-256-GCM encryption of the account file
-#include <openssl/evp.h>
-#include <openssl/rand.h>
+// Account-file crypto (AES-256-GCM, PBKDF2) is provided by aes.h/sha2.h (mbedTLS
+// under the hood); random salt/IV come from secure_random() in protect.h.
 
 // Platform-specific TTY detection and hidden input
 #ifdef _WIN32
@@ -199,9 +198,9 @@ static std::vector<unsigned char> aes_gcm_encrypt(const std::string& plaintext,
                                                     const std::string& machine_id,
                                                     const std::string& passphrase) {
     unsigned char salt[SALT_LEN], key[KEY_LEN];
-    RAND_bytes(salt, SALT_LEN);
+    secure_random(salt, SALT_LEN);
     Bytes iv(IV_LEN);
-    RAND_bytes(iv.data(), IV_LEN);
+    secure_random(iv.data(), IV_LEN);
     if (!derive_file_key(machine_id, passphrase, salt, SALT_LEN, key))
         throw std::runtime_error("key derivation failed");
 

@@ -18,6 +18,12 @@
 #include <string>
 #include <vector>
 #include <cstddef>
+#include <cstdint>
+
+// Cryptographically-secure random bytes (mbedTLS CTR_DRBG seeded from the
+// platform entropy source). Throws std::runtime_error if the RNG cannot seed or
+// draw. Replaces OpenSSL's RAND_bytes across the project.
+void secure_random(uint8_t* buf, size_t len);
 
 // Cross-platform secure memory wipe.
 // explicit_bzero is glibc-only (missing on macOS); Windows has SecureZeroMemory.

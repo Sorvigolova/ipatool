@@ -36,61 +36,52 @@ if(STATIC_BUILD AND NOT WIN32)
         set(_ep_timestamp_opt "")
     endif()
 
-    # curl's configure gets --with-openssl. On Linux, bare --with-openssl
-    # auto-detects the system -dev package fine. On macOS we build OpenSSL from
-    # source (below) and point curl at that same build.
-    set(_curl_openssl_flag --with-openssl)
+    # TLS backend for the static curl is mbedTLS (tiny, trivial to build from
+    # source — no OpenSSL). Built here for BOTH Linux and macOS so the dependency
+    # is identical everywhere, then fed to curl's configure. The app's own crypto
+    # (AES-GCM / SHA-256 / MD5 / PBKDF2 / RNG) uses the same libmbedcrypto, so
+    # OpenSSL is gone entirely. Override the version with -DMBEDTLS_VERSION=<x.y.z>.
+    set(MBEDTLS_VERSION "3.6.2" CACHE STRING
+        "mbedTLS version to build from source for the static build")
+    set(_mbedtls_cmake_args
+        -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
+        -DCMAKE_BUILD_TYPE=Release
+        -DENABLE_TESTING=OFF
+        -DENABLE_PROGRAMS=OFF
+        -DUSE_SHARED_MBEDTLS_LIBRARY=OFF
+        -DUSE_STATIC_MBEDTLS_LIBRARY=ON
+        # mbedTLS builds with -Werror by default; GCC 15 added
+        # -Wunterminated-string-initialization which trips its TLS1.3 label tables.
+        # Don't treat warnings as errors for the dependency build.
+        -DMBEDTLS_FATAL_WARNINGS=OFF
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON)
+    if(APPLE)
+        if(CMAKE_OSX_ARCHITECTURES)
+            list(APPEND _mbedtls_cmake_args -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES})
+        endif()
+        if(DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET)
+            list(APPEND _mbedtls_cmake_args -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
+        endif()
+    endif()
+    message(STATUS "Static build will compile mbedTLS ${MBEDTLS_VERSION} from source")
+    ExternalProject_Add(mbedtls_static
+        URL https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2
+        ${_ep_timestamp_opt}
+        CMAKE_ARGS ${_mbedtls_cmake_args}
+        BUILD_BYPRODUCTS
+            <INSTALL_DIR>/lib/libmbedtls.a
+            <INSTALL_DIR>/lib/libmbedx509.a
+            <INSTALL_DIR>/lib/libmbedcrypto.a
+    )
+    ExternalProject_Get_Property(mbedtls_static INSTALL_DIR)
+    set(MBEDTLS_INSTALL_DIR "${INSTALL_DIR}")
+    set(_curl_tls_flag  --with-mbedtls=${MBEDTLS_INSTALL_DIR})
+    set(MBEDTLS_LIB_TLS    "${MBEDTLS_INSTALL_DIR}/lib/libmbedtls.a")
+    set(MBEDTLS_LIB_X509   "${MBEDTLS_INSTALL_DIR}/lib/libmbedx509.a")
+    set(MBEDTLS_LIB_CRYPTO "${MBEDTLS_INSTALL_DIR}/lib/libmbedcrypto.a")
+    message(STATUS "Static curl build will use mbedTLS at: ${MBEDTLS_INSTALL_DIR}")
 
     if(APPLE)
-        # ── OpenSSL from source (macOS static) ───────────────────────────────
-        # Homebrew's openssl@3 bottle is compiled for the build machine's macOS,
-        # so linking it into an older -mmacosx-version-min target yields
-        # "object file was built for newer macOS version" warnings and an
-        # unclean minos. Build OpenSSL ourselves for the exact arch + deployment
-        # target, then feed that build to curl's configure AND to the final link
-        # — self-contained, no Homebrew openssl needed. Override the version with
-        # -DOPENSSL_VERSION=<x.y.z> if the default 404s or you want a newer one.
-        set(OPENSSL_VERSION "3.5.7" CACHE STRING
-            "OpenSSL version to build from source for the macOS static build")
-
-        if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
-            set(_ossl_target darwin64-arm64-cc)
-        elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
-            set(_ossl_target darwin64-x86_64-cc)
-        elseif(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
-            set(_ossl_target darwin64-arm64-cc)
-        else()
-            set(_ossl_target darwin64-x86_64-cc)
-        endif()
-
-        # OpenSSL's Configure appends trailing tokens as extra compiler flags, so
-        # -mmacosx-version-min lands on every .o exactly like it does for curl.
-        set(_ossl_extra_flags "")
-        if(DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET)
-            set(_ossl_extra_flags -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET})
-        endif()
-
-        message(STATUS "Static build will compile OpenSSL ${OPENSSL_VERSION} (${_ossl_target}) from source")
-        ExternalProject_Add(openssl_static
-            URL https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz
-            ${_ep_timestamp_opt}
-            CONFIGURE_COMMAND
-                <SOURCE_DIR>/Configure ${_ossl_target}
-                    no-shared no-tests
-                    --prefix=<INSTALL_DIR>
-                    --openssldir=<INSTALL_DIR>/ssl
-                    --libdir=lib
-                    ${_ossl_extra_flags}
-            BUILD_COMMAND   $(MAKE)
-            INSTALL_COMMAND $(MAKE) install_sw
-            BUILD_IN_SOURCE 1
-        )
-        ExternalProject_Get_Property(openssl_static INSTALL_DIR)
-        set(OSSL_INSTALL_DIR   "${INSTALL_DIR}")
-        set(_openssl_prefix    "${OSSL_INSTALL_DIR}")
-        set(_curl_openssl_flag --with-openssl=${_openssl_prefix})
-        message(STATUS "Static curl build will use our OpenSSL at: ${_openssl_prefix}")
-
         # ── minizip from source (macOS static) ───────────────────────────────
         # Same story as OpenSSL: Homebrew's libminizip.a is built for the build
         # machine's macOS. The project uses the *classic* minizip API
@@ -130,9 +121,6 @@ if(STATIC_BUILD AND NOT WIN32)
         )
         ExternalProject_Get_Property(minizip_static INSTALL_DIR)
         set(MZIP_INSTALL_DIR "${INSTALL_DIR}")
-    else()
-        # Linux: system OpenSSL -dev package (its libs already match the target).
-        find_package(OpenSSL REQUIRED)
     endif()
 
     # curl's configure is a separate autotools build invoked via
@@ -156,14 +144,19 @@ if(STATIC_BUILD AND NOT WIN32)
         set(_curl_timestamp_opt "")
     endif()
     ExternalProject_Add(curl_static
-        URL          https://curl.se/download/curl-8.7.1.tar.gz
+        # curl >= 8.8.0 is required with mbedTLS 3.6 LTS: 3.6 enables TLS 1.3 by
+        # default, whose handshake needs PSA crypto initialised, and the mbedTLS
+        # backend only began calling psa_crypto_init() in 8.8.0. Older curl (e.g.
+        # 8.7.1) fails at mbedtls_ssl_setup() with "ssl_init failed" before any
+        # connection. 8.11.1 is a stable release well past that fix.
+        URL          https://curl.se/download/curl-8.11.1.tar.gz
         ${_curl_timestamp_opt}
         CONFIGURE_COMMAND
             <SOURCE_DIR>/configure
                 --prefix=<INSTALL_DIR>
                 --disable-shared
                 --enable-static
-                ${_curl_openssl_flag}
+                ${_curl_tls_flag}
                 --disable-ldap
                 --disable-ldaps
                 --disable-rtsp
@@ -189,16 +182,22 @@ if(STATIC_BUILD AND NOT WIN32)
                 --without-krb4
                 --disable-versioned-symbols
                 "CFLAGS=${_curl_cflags}"
+                # Force curl to compile against OUR from-source mbedTLS 3.6.2,
+                # not a system mbedTLS. A system 2.x (common via Homebrew/MacPorts
+                # on macOS) would make curl emit the old *_ret symbol names and the
+                # 2.x struct layouts, which then fail to link against (or silently
+                # mismatch) our 3.6.2 libs. A command-line -I is searched before
+                # any compiler default / CPATH, so our headers always win.
+                "CPPFLAGS=-I${MBEDTLS_INSTALL_DIR}/include"
+                "LDFLAGS=-L${MBEDTLS_INSTALL_DIR}/lib"
         BUILD_COMMAND   $(MAKE)
         INSTALL_COMMAND $(MAKE) install
         BUILD_IN_SOURCE 0
     )
 
-    # On macOS curl must configure/link against the OpenSSL we just built, so
-    # openssl_static has to finish (build + install) before curl starts.
-    if(APPLE)
-        add_dependencies(curl_static openssl_static)
-    endif()
+    # curl must configure/link against the mbedTLS we just built, so
+    # mbedtls_static has to finish (build + install) before curl starts.
+    add_dependencies(curl_static mbedtls_static)
 
     ExternalProject_Get_Property(curl_static INSTALL_DIR)
     set(STATIC_CURL_INCLUDE "${INSTALL_DIR}/include")
@@ -232,7 +231,10 @@ if(STATIC_BUILD AND MINGW)
     endif()
     set(_CURL_INSTALL "${CMAKE_BINARY_DIR}/curl_install")
     ExternalProject_Add(curl_static_mingw
-        URL https://curl.se/download/curl-8.7.1.tar.gz
+        # Kept in lockstep with the *nix static curl above (8.11.1). This build
+        # uses Schannel, not mbedTLS, so the TLS 1.3/PSA issue doesn't apply here,
+        # but staying on one curl version avoids drift.
+        URL https://curl.se/download/curl-8.11.1.tar.gz
         ${_curl_ts}
         CMAKE_ARGS
             -DCMAKE_BUILD_TYPE=Release
@@ -263,6 +265,28 @@ if(STATIC_BUILD AND MINGW)
     # Linking curl statically on Windows: consumers must define CURL_STATICLIB so
     # curl.h does not mark the API as __declspec(dllimport).
     add_compile_definitions(CURL_STATICLIB)
+
+    # mbedTLS from source for the app's own crypto (curl itself uses Schannel, so
+    # only libmbedcrypto is needed here). Built with the same MinGW toolchain so
+    # it links cleanly into the single-file static exe.
+    set(MBEDTLS_VERSION "3.6.2" CACHE STRING "mbedTLS version (MinGW static)")
+    set(_MBEDTLS_INSTALL "${CMAKE_BINARY_DIR}/mbedtls_install")
+    ExternalProject_Add(mbedtls_static_mingw
+        URL https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2
+        ${_curl_ts}
+        CMAKE_ARGS
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX=${_MBEDTLS_INSTALL}
+            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DENABLE_TESTING=OFF
+            -DENABLE_PROGRAMS=OFF
+            -DUSE_SHARED_MBEDTLS_LIBRARY=OFF
+            -DUSE_STATIC_MBEDTLS_LIBRARY=ON
+            -DMBEDTLS_FATAL_WARNINGS=OFF   # GCC 15 -Wunterminated-string-initialization vs mbedTLS -Werror
+        BUILD_BYPRODUCTS "${_MBEDTLS_INSTALL}/lib/libmbedcrypto.a"
+    )
+    set(MBEDTLS_MINGW_INCLUDE "${_MBEDTLS_INSTALL}/include")
+    set(MBEDTLS_LIB_CRYPTO_MINGW "${_MBEDTLS_INSTALL}/lib/libmbedcrypto.a")
 endif()
 
 # ── Hint: if you didn't pass -DCMAKE_TOOLCHAIN_FILE, try to auto-detect vcpkg ─
@@ -377,23 +401,46 @@ endif()
 
 find_package(ZLIB QUIET)
 
-# ── OpenSSL (needed for --keychain-passphrase AES-256-GCM encryption) ─────────
-if(STATIC_BUILD AND WIN32)
-    set(OPENSSL_USE_STATIC_LIBS TRUE)
-    set(OPENSSL_MSVC_STATIC_RT TRUE)
+# ── mbedTLS (app crypto: AES-256-GCM / SHA-256 / MD5 / PBKDF2 / RNG) ──────────
+# Static *nix builds (Linux/macOS) compile mbedTLS from source at the top of this
+# file; MinGW static builds it from source in the MinGW block above. Every other
+# case (dynamic builds; MSVC static via vcpkg) discovers an installed mbedTLS here
+# and links MbedTLS::mbedcrypto. (On Windows curl keeps using Schannel, so only
+# mbedcrypto — the app-crypto part — is needed there; libssl/libmbedtls is not.)
+set(_mbedtls_from_source FALSE)
+if(STATIC_BUILD AND (NOT WIN32 OR MINGW))
+    set(_mbedtls_from_source TRUE)
 endif()
-# macOS static builds OpenSSL from source (see top of file) and links its .a
-# directly, so it needs neither a system/brew OpenSSL nor the CMake targets.
-if(NOT (STATIC_BUILD AND APPLE))
-    find_package(OpenSSL REQUIRED)
-endif()
-
-# MinGW static: link libcrypto.a directly (our AES/SHA only; curl uses Schannel,
-# so libssl is not needed). find_package may hand back the .dll.a import lib, so
-# resolve the static archive explicitly.
-if(STATIC_BUILD AND MINGW)
-    find_library(CRYPTO_STATIC_MINGW NAMES libcrypto.a crypto REQUIRED)
-    message(STATUS "MinGW static libcrypto: ${CRYPTO_STATIC_MINGW}")
+# MSVC static links mbedcrypto.lib by explicit vcpkg path below, so it doesn't
+# need the CMake target — only the dynamic / non-Windows-static builds do.
+if(NOT _mbedtls_from_source AND NOT (STATIC_BUILD AND WIN32))
+    find_package(MbedTLS CONFIG QUIET)   # vcpkg / distros shipping MbedTLSConfig.cmake
+    if(MbedTLS_FOUND)
+        message(STATUS "mbedTLS found via CMake config package")
+    else()
+        # Older distros (notably Debian/Ubuntu with mbedTLS 2.x) install the
+        # library and headers but NO MbedTLSConfig.cmake, so find_package(CONFIG)
+        # comes up empty even though mbedTLS is present. Locate libmbedcrypto and
+        # the headers by hand and wrap them in the same MbedTLS::mbedcrypto target
+        # the rest of this file links. Only mbedcrypto is needed: curl supplies
+        # its own TLS, and our app crypto (AES-GCM / SHA-256 / MD5 / PBKDF2 / RNG)
+        # lives entirely in mbedcrypto — independent of mbedx509 / mbedtls.
+        find_path(MBEDTLS_INCLUDE_DIR NAMES mbedtls/version.h)
+        find_library(MBEDCRYPTO_LIBRARY NAMES mbedcrypto)
+        if(NOT MBEDTLS_INCLUDE_DIR OR NOT MBEDCRYPTO_LIBRARY)
+            message(FATAL_ERROR
+                "mbedTLS not found. Install it:\n"
+                "  Windows (vcpkg): vcpkg install mbedtls:x64-windows[-static]\n"
+                "  macOS (brew):    brew install mbedtls\n"
+                "  Debian/Ubuntu:   sudo apt install libmbedtls-dev\n"
+                "(or point CMAKE_PREFIX_PATH at a custom install prefix)")
+        endif()
+        add_library(MbedTLS::mbedcrypto UNKNOWN IMPORTED)
+        set_target_properties(MbedTLS::mbedcrypto PROPERTIES
+            IMPORTED_LOCATION "${MBEDCRYPTO_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${MBEDTLS_INCLUDE_DIR}")
+        message(STATUS "mbedTLS found manually (no CMake config): ${MBEDCRYPTO_LIBRARY}")
+    endif()
 endif()
 
 
@@ -693,24 +740,27 @@ __binary_${_SYM}_end:
 endif()
 
 if(STATIC_BUILD AND NOT WIN32 AND NOT APPLE)
-    # Force static versions of OpenSSL, zlib, minizip by using full paths
-    find_library(OPENSSL_SSL_STATIC    NAMES libssl.a    PATHS /usr/lib/x86_64-linux-gnu REQUIRED NO_DEFAULT_PATH)
-    find_library(OPENSSL_CRYPTO_STATIC NAMES libcrypto.a PATHS /usr/lib/x86_64-linux-gnu REQUIRED NO_DEFAULT_PATH)
+    # mbedTLS is built from source at the top of this file; link its static .a
+    # directly (curl was configured --with-mbedtls, so libcurl.a references its
+    # symbols, and the app crypto uses libmbedcrypto). zlib/minizip by full path.
     find_library(ZLIB_STATIC           NAMES libz.a      PATHS /usr/lib/x86_64-linux-gnu REQUIRED NO_DEFAULT_PATH)
     find_library(MINIZIP_STATIC        NAMES libminizip.a
                  PATHS /usr/lib/x86_64-linux-gnu /usr/lib/gcc/x86_64-linux-gnu/11
                        /usr/lib/gcc/x86_64-linux-gnu/12 /usr/lib/gcc/x86_64-linux-gnu/13)
 
-    message(STATUS "Static OpenSSL SSL:    ${OPENSSL_SSL_STATIC}")
-    message(STATUS "Static OpenSSL Crypto: ${OPENSSL_CRYPTO_STATIC}")
+    message(STATUS "Static mbedTLS:        ${MBEDTLS_INSTALL_DIR}")
     message(STATUS "Static zlib:           ${ZLIB_STATIC}")
     message(STATUS "Static minizip:        ${MINIZIP_STATIC}")
+
+    add_dependencies(ipatool mbedtls_static)
+    target_include_directories(ipatool PRIVATE "${MBEDTLS_INSTALL_DIR}/include")
 
     set(STATIC_LINK_LIBS
         curl_static_lib
         nlohmann_json::nlohmann_json
-        ${OPENSSL_SSL_STATIC}
-        ${OPENSSL_CRYPTO_STATIC}
+        ${MBEDTLS_LIB_TLS}
+        ${MBEDTLS_LIB_X509}
+        ${MBEDTLS_LIB_CRYPTO}
         ${UNICORN_LIBRARY}
         dl pthread
     )
@@ -749,18 +799,14 @@ if(STATIC_BUILD AND APPLE AND NOT UNICORN_NEEDS_EXTERNAL_BUILD)
 endif() # if(STATIC_BUILD AND APPLE AND NOT UNICORN_NEEDS_EXTERNAL_BUILD)
 
 if(STATIC_BUILD AND APPLE)
-    # OpenSSL was built from source at the top of this file. Its static libs are
+    # mbedTLS was built from source at the top of this file. Its static libs are
     # produced at BUILD time, so we can't find_library() them now (they don't
     # exist yet at configure time) — reference the install paths directly and
-    # make ipatool depend on openssl_static so it's compiled/installed first.
-    # Its headers also come from there (no brew openssl on the include path).
-    # zlib is left dynamic — it's a system library on every Mac (/usr/lib/libz.1.dylib),
-    # not a Homebrew dependency, so there's no portability reason to statically link it,
-    # and Homebrew doesn't ship a zlib formula by default (it'd require a separate install).
-    set(OPENSSL_SSL_STATIC    "${OSSL_INSTALL_DIR}/lib/libssl.a")
-    set(OPENSSL_CRYPTO_STATIC "${OSSL_INSTALL_DIR}/lib/libcrypto.a")
-    add_dependencies(ipatool openssl_static)
-    target_include_directories(ipatool PRIVATE "${OSSL_INSTALL_DIR}/include")
+    # make ipatool depend on mbedtls_static so it's compiled/installed first.
+    # Its headers also come from there. zlib is left dynamic — it's a system
+    # library on every Mac (/usr/lib/libz.1.dylib), not a Homebrew dependency.
+    add_dependencies(ipatool mbedtls_static)
+    target_include_directories(ipatool PRIVATE "${MBEDTLS_INSTALL_DIR}/include")
 
     # minizip was also built from source (see top of file); reference its install
     # paths directly and depend on the target. HAVE_MINIZIP is normally set at
@@ -772,15 +818,15 @@ if(STATIC_BUILD AND APPLE)
     target_include_directories(ipatool PRIVATE "${MZIP_INSTALL_DIR}/include")
     target_compile_definitions(ipatool PRIVATE HAVE_MINIZIP)
 
-    message(STATUS "Static OpenSSL SSL:    ${OPENSSL_SSL_STATIC}")
-    message(STATUS "Static OpenSSL Crypto: ${OPENSSL_CRYPTO_STATIC}")
+    message(STATUS "Static mbedTLS:        ${MBEDTLS_INSTALL_DIR}")
     message(STATUS "Static minizip:        ${MINIZIP_STATIC}")
 
     set(STATIC_LINK_LIBS
         curl_static_lib
         nlohmann_json::nlohmann_json
-        ${OPENSSL_SSL_STATIC}
-        ${OPENSSL_CRYPTO_STATIC}
+        ${MBEDTLS_LIB_TLS}
+        ${MBEDTLS_LIB_X509}
+        ${MBEDTLS_LIB_CRYPTO}
         z
         "-framework IOKit"
         "-framework CoreFoundation"
@@ -795,18 +841,18 @@ endif()
 
 if(STATIC_BUILD AND MINGW)
     # ── MinGW single-file static ────────────────────────────────────────────────
-    # Our minimal Schannel curl + static libcrypto/unicorn/minizip; no third-party
+    # Our minimal Schannel curl + static libmbedcrypto/unicorn/minizip; no third-party
     # DLLs. minizip.a needs zlib+bzip2 → --start-group resolves archive ordering.
     target_link_libraries(ipatool PRIVATE
         curl_static_lib
         nlohmann_json::nlohmann_json
         ${UNICORN_LIBRARY}
-        ${CRYPTO_STATIC_MINGW}
+        ${MBEDTLS_LIB_CRYPTO_MINGW}
         -Wl,--start-group -lminizip -lz -lbz2 -Wl,--end-group
         # Schannel + Windows system deps
         ws2_32 crypt32 bcrypt secur32 wldap32 normaliz iphlpapi shell32)
-    target_include_directories(ipatool PRIVATE "${STATIC_CURL_INCLUDE}")
-    add_dependencies(ipatool curl_static_mingw)
+    target_include_directories(ipatool PRIVATE "${STATIC_CURL_INCLUDE}" "${MBEDTLS_MINGW_INCLUDE}")
+    add_dependencies(ipatool curl_static_mingw mbedtls_static_mingw)
     # -static → pull libgcc/libstdc++/libwinpthread in too; unicorn bundles its
     # own zlib (crc32c.c) → allow the duplicate.
     target_link_options(ipatool PRIVATE
@@ -864,8 +910,9 @@ else()
             ${UNICORN_LIBRARY}
     )
     if(NOT (STATIC_BUILD AND WIN32))
-        # Dynamic build or non-Windows: use CMake OpenSSL targets normally
-        target_link_libraries(ipatool PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        # Dynamic build or non-Windows: link mbedTLS (app crypto). curl brings its
+        # own TLS backend; only libmbedcrypto is needed for our AES/SHA/MD5/PBKDF2.
+        target_link_libraries(ipatool PRIVATE MbedTLS::mbedcrypto)
     endif()
 endif()
 if(minizip_FOUND AND NOT MINGW)
@@ -930,16 +977,17 @@ if(WIN32)
         get_filename_component(_TC "${_TC}" DIRECTORY)   # scripts
         get_filename_component(_VCPKG_ROOT "${_TC}" DIRECTORY)  # vcpkg root
         set(_SSL_STATIC_DIR "${_VCPKG_ROOT}/installed/x64-windows-static")
-        message(STATUS "Static OpenSSL dir: ${_SSL_STATIC_DIR}")
-        if(NOT EXISTS "${_SSL_STATIC_DIR}/lib/libssl.lib")
+        message(STATUS "Static mbedTLS dir: ${_SSL_STATIC_DIR}")
+        if(NOT EXISTS "${_SSL_STATIC_DIR}/lib/mbedcrypto.lib")
             message(FATAL_ERROR
-                "libssl.lib not found at ${_SSL_STATIC_DIR}/lib/\n"
-                "Run: vcpkg install openssl:x64-windows-static")
+                "mbedcrypto.lib not found at ${_SSL_STATIC_DIR}/lib/\n"
+                "Run: vcpkg install mbedtls:x64-windows-static")
         endif()
         target_include_directories(ipatool PRIVATE "${_SSL_STATIC_DIR}/include")
+        # curl uses Schannel on Windows, so only mbedcrypto (the app-crypto part)
+        # is linked here — no libssl/mbedtls/mbedx509 needed.
         target_link_libraries(ipatool PRIVATE
-            "${_SSL_STATIC_DIR}/lib/libssl.lib"
-            "${_SSL_STATIC_DIR}/lib/libcrypto.lib"
+            "${_SSL_STATIC_DIR}/lib/mbedcrypto.lib"
         )
     endif()
   else()
@@ -948,7 +996,7 @@ if(WIN32)
     target_compile_definitions(ipatool PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_options(ipatool PRIVATE -Wl,--allow-multiple-definition)
     if(NOT STATIC_BUILD)
-        # Dynamic MinGW: the generic block already linked curl/openssl/unicorn;
+        # Dynamic MinGW: the generic block already linked curl/mbedtls/unicorn;
         # add the Windows system deps + minizip here. (Static is fully handled by
         # the MinGW single-file branch above.)
         target_link_libraries(ipatool PRIVATE
@@ -998,39 +1046,41 @@ message(STATUS "  static    : ${STATIC_BUILD}")
 message(STATUS "")
 if(MINGW)
     message(STATUS "  Quick-start (Windows / MSYS2 MinGW-w64, single-file static):")
-    message(STATUS "    pacman -S mingw-w64-x86_64-{gcc,cmake,ninja,openssl,minizip,zlib,bzip2,nlohmann-json} perl")
+    message(STATUS "    pacman -S mingw-w64-x86_64-{gcc,cmake,ninja,minizip,zlib,bzip2,nlohmann-json}")
     message(STATUS "    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON")
     message(STATUS "    cmake --build build")
     message(STATUS "    (curl [Schannel] and unicorn [x86] are built from source → no third-party DLLs)")
 elseif(WIN32)
     if(STATIC_BUILD)
         message(STATUS "  Quick-start (Windows static):")
-        message(STATUS "    vcpkg install curl nlohmann-json minizip openssl unicorn --triplet x64-windows-static")
+        message(STATUS "    vcpkg install curl nlohmann-json minizip mbedtls unicorn --triplet x64-windows-static")
         message(STATUS "    cmake -B build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake -DSTATIC_BUILD=ON -DVCPKG_TARGET_TRIPLET=x64-windows-static")
         message(STATUS "    cmake --build build --config Release")
     else()
         message(STATUS "  Quick-start with vcpkg:")
-        message(STATUS "    vcpkg install curl nlohmann-json minizip openssl unicorn --triplet x64-windows")
+        message(STATUS "    vcpkg install curl nlohmann-json minizip mbedtls unicorn --triplet x64-windows")
         message(STATUS "    cmake -B build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake")
         message(STATUS "    cmake --build build --config Release")
     endif()
 elseif(APPLE)
     if(STATIC_BUILD)
         message(STATUS "  Quick-start (macOS, fully static single-file binary):")
-        message(STATUS "    brew install nlohmann-json unicorn pkg-config")
+        message(STATUS "    brew install nlohmann-json pkg-config")
+        message(STATUS "    # older macOS (MacPorts): sudo port install nlohmann-json pkgconfig")
         message(STATUS "    cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \\")
         message(STATUS "          -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0")
         message(STATUS "    cmake --build build")
-        message(STATUS "    (curl, OpenSSL, minizip and unicorn are built from source → no brew runtime deps)")
+        message(STATUS "    (curl, mbedTLS, minizip and unicorn are built from source → no brew runtime deps)")
     else()
         message(STATUS "  Quick-start (macOS):")
-        message(STATUS "    brew install curl nlohmann-json minizip openssl@3 unicorn")
-        message(STATUS "    cmake -B build -DCMAKE_BUILD_TYPE=Release \\")
-        message(STATUS "          -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) && cmake --build build")
+        message(STATUS "    brew install curl nlohmann-json minizip mbedtls unicorn")
+        message(STATUS "    # older macOS (MacPorts): sudo port install curl nlohmann-json minizip mbedtls3 unicorn  (+ -DCMAKE_PREFIX_PATH=/opt/local)")
+        message(STATUS "    cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build")
     endif()
 else()
     message(STATUS "  Quick-start (Linux):")
-    message(STATUS "    sudo apt install libcurl4-openssl-dev nlohmann-json3-dev libminizip-dev")
+    message(STATUS "    sudo apt install libcurl4-openssl-dev libmbedtls-dev nlohmann-json3-dev libminizip-dev libunicorn-dev")
     message(STATUS "    cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build")
+    message(STATUS "    (libunicorn-dev is optional / often unpackaged on Ubuntu — if apt can't find it, drop it; unicorn is built from source)")
 endif()
 message(STATUS "")

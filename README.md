@@ -54,11 +54,17 @@ ipatool-cpp protects your Apple ID credentials using machine-bound encryption �
 
 | Dependency | Purpose |
 |------------|---------|
-| libcurl | HTTPS networking (Schannel on Windows, OpenSSL elsewhere) |
-| OpenSSL | AES-256-GCM, SHA-256, PBKDF2, HMAC |
+| libcurl | HTTPS networking (Schannel on Windows, mbedTLS elsewhere) |
+| mbedTLS (`libmbedcrypto`) | AES-256-GCM, SHA-256, MD5, PBKDF2, HMAC, secure RNG |
 | nlohmann-json | iTunes Search/Lookup JSON parsing |
 | Unicorn Engine | x86-64 sandbox for SAP signing / kbsync / .pkg decryption |
 | minizip *(optional)* | IPA repacking (falls back to a plain copy if absent) |
+
+> The app's own crypto (account-file and in-memory encryption) uses mbedTLS's
+> `libmbedcrypto`. On Windows curl uses the system **Schannel** TLS, so only
+> `mbedcrypto` is linked there (not `libmbedtls` / `libmbedx509`); on Linux/macOS
+> curl uses **mbedTLS** as its TLS backend too. mbedTLS ships pre-generated
+> sources, so **neither Perl nor Python** is needed to build it.
 
 The SAP asset dylibs are not a package — they ship in `sap_assets/` in the repo and are embedded at build time (objcopy on Linux, RC resources on Windows, or loaded from the folder in development builds).
 
@@ -79,7 +85,7 @@ Restart your terminal after setting the variable.
 ### Step 2a — Dynamic build (default)
 
 ```cmd
-C:\vcpkg\vcpkg install curl:x64-windows nlohmann-json:x64-windows minizip:x64-windows openssl:x64-windows unicorn:x64-windows
+C:\vcpkg\vcpkg install curl:x64-windows nlohmann-json:x64-windows minizip:x64-windows mbedtls:x64-windows unicorn:x64-windows
 
 cmake -B build -G "Visual Studio 17 2022" -A x64 ^
       -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
@@ -92,7 +98,7 @@ Requires `MSVCP140.dll` / `VCRUNTIME140.dll` on the target machine (included wit
 ### Step 2b — Fully static build (no DLL dependencies)
 
 ```cmd
-C:\vcpkg\vcpkg install curl:x64-windows-static nlohmann-json:x64-windows-static minizip:x64-windows-static openssl:x64-windows-static unicorn:x64-windows-static
+C:\vcpkg\vcpkg install curl:x64-windows-static nlohmann-json:x64-windows-static minizip:x64-windows-static mbedtls:x64-windows-static unicorn:x64-windows-static
 
 rmdir /s /q build
 
@@ -127,7 +133,7 @@ FairPlay emulation (kbsync) is much faster than an MSVC-built Unicorn.
 From an **MSYS2 MINGW64** shell:
 
 ```sh
-pacman -S mingw-w64-x86_64-{gcc,cmake,ninja,openssl,minizip,zlib,bzip2,nlohmann-json} perl
+pacman -S mingw-w64-x86_64-{gcc,cmake,ninja,minizip,zlib,bzip2,nlohmann-json}
 
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON
 cmake --build build
@@ -136,13 +142,16 @@ cmake --build build
 
 What the build does automatically:
 - Builds a **minimal curl from source** using Windows' native **Schannel** TLS
-  (`HTTP_ONLY`), so curl needs no OpenSSL and none of brotli/zstd/idn2/psl/libssh2/
-  nghttp2/3/ngtcp2.
+  (`HTTP_ONLY`), so curl needs no separate TLS library and none of
+  brotli/zstd/idn2/psl/libssh2/nghttp2/3/ngtcp2.
+- Builds **mbedTLS from source** and statically links `libmbedcrypto` for the
+  app's own crypto (AES-256-GCM / SHA-256 / MD5 / PBKDF2 / RNG).
 - Builds **Unicorn (x86-only) from source** with GCC → fast, static.
-- Statically links `libcrypto` (for AES/SHA), minizip, zlib and bzip2, plus
+- Statically links minizip, zlib and bzip2, plus
   `-static -static-libgcc -static-libstdc++`.
 
-`perl` is required only by curl's build. Verify the result is self-contained:
+No Perl or Python is needed — curl uses Schannel, and mbedTLS ships
+pre-generated sources. Verify the result is self-contained:
 
 ```sh
 ldd build/ipatool.exe | grep -iv 'windows\|system32'   # should print nothing
@@ -155,17 +164,26 @@ ldd build/ipatool.exe | grep -iv 'windows\|system32'   # should print nothing
 ### Dynamic build
 
 ```sh
-sudo apt install libcurl4-openssl-dev nlohmann-json3-dev libminizip-dev libssl-dev libunicorn-dev
+sudo apt install libcurl4-openssl-dev nlohmann-json3-dev libminizip-dev libmbedtls-dev libunicorn-dev
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 # Output: build/ipatool
 ```
 
+> `libunicorn-dev` is optional and not reliably packaged on Ubuntu — on 22.04
+> (jammy) it is **not published** even with the **universe** component enabled
+> (`apt-cache policy libunicorn-dev` shows no candidate). If `apt` can't find it,
+> just drop it from the `apt install` line: the build then compiles Unicorn 2.x
+> from source automatically (~30 s). Debian and newer Ubuntu releases that do
+> ship `libunicorn-dev` are picked up when present. On older distros whose
+> `libmbedtls-dev` predates the CMake config package, mbedTLS is still found by
+> hand — no action needed.
+
 ### Fully static build
 
 ```sh
-sudo apt install libssl-dev libminizip-dev zlib1g-dev libunicorn-dev
+sudo apt install libminizip-dev zlib1g-dev libunicorn-dev
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON
 cmake --build build
@@ -173,19 +191,31 @@ strip build/ipatool
 # Output: build/ipatool
 ```
 
-The static build compiles curl from source (HTTPS-only) via CMake `ExternalProject_Add`.
-Verify with `ldd build/ipatool` — should show only `linux-vdso.so.1`, `libc.so.6`, `ld-linux-x86-64.so.2` (plus libunicorn if a static one wasn't found).
+The static build compiles **curl (HTTPS-only) and mbedTLS from source** via CMake
+`ExternalProject_Add` — curl uses mbedTLS as its TLS backend and the app crypto links
+the same `libmbedcrypto`, so no system `libmbedtls-dev` is needed. Verify with
+`ldd build/ipatool` — should show only `linux-vdso.so.1`, `libc.so.6`,
+`ld-linux-x86-64.so.2` (plus libunicorn if a static one wasn't found).
 
 ---
 
 ## Building on macOS
 
-```sh
-brew install curl nlohmann-json minizip openssl@3 unicorn
+> **Package manager:** the examples below use Homebrew. On older macOS releases
+> that current Homebrew no longer supports, use **MacPorts** instead — every
+> `brew install X` has a `sudo port install X` equivalent, shown under each
+> block. Two names differ: `pkg-config` → `pkgconfig`, and mbedTLS → `mbedtls3`
+> (the 3.x port; the 2.x `mbedtls` port also builds, thanks to the 2.x/3.x
+> compatibility shim). For a **dynamic** build with MacPorts add
+> `-DCMAKE_PREFIX_PATH=/opt/local` so CMake finds `/opt/local` libraries. For a
+> **static** build you only need `nlohmann-json` and `pkgconfig` — curl, mbedTLS,
+> minizip and Unicorn are all compiled from source.
 
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
-      -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
-      -DOPENSSL_USE_STATIC_LIBS=TRUE
+```sh
+brew install curl nlohmann-json minizip mbedtls unicorn
+# MacPorts: sudo port install curl nlohmann-json minizip mbedtls3 unicorn
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
@@ -194,10 +224,10 @@ IOKit and CoreFoundation are built into macOS — no extra dependencies needed f
 ### Native arm64 build (Apple silicon)
 
 ```sh
-brew install openssl@3 minizip nlohmann-json unicorn pkg-config
+brew install mbedtls minizip nlohmann-json unicorn pkg-config
+# MacPorts: sudo port install mbedtls3 minizip nlohmann-json unicorn pkgconfig
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
-      -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) \
       -DCMAKE_OSX_ARCHITECTURES=arm64
 cmake --build build
 ```
@@ -217,7 +247,8 @@ cmake --build build
 ### Static build (Apple silicon, arm64)
 
 ```sh
-brew install nlohmann-json unicorn pkg-config
+brew install nlohmann-json pkg-config
+# MacPorts: sudo port install nlohmann-json pkgconfig
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
       -DCMAKE_OSX_ARCHITECTURES=arm64 \
@@ -230,19 +261,22 @@ every Apple silicon Mac. The deployment target no longer affects text
 formatting (the project uses its own `ipt::format()`, not `std::format`), so
 you may raise or lower it freely within Apple silicon's supported range.
 
-> **OpenSSL and minizip are built from source** for the static build, targeting
-> the same arch and deployment target, so Homebrew's `openssl@3` and `minizip`
-> are *not* needed (nor is `-DOPENSSL_ROOT_DIR`). This avoids Homebrew's
-> bottles — compiled for the build machine's macOS — producing "built for newer
-> macOS version" linker warnings and an unclean `minos`. The first configure
-> downloads and compiles them (a few minutes, cached afterwards); override the
-> versions with `-DOPENSSL_VERSION=<x.y.z>` / `-DZLIB_VERSION=<x.y.z>` if
-> desired. minizip links against the system `libz` (present on every Mac).
+> **curl, mbedTLS, minizip and Unicorn are built from source** for the static
+> build, targeting the same arch and deployment target, so Homebrew's `mbedtls`,
+> `minizip` and `unicorn` are *not* needed (a Homebrew `unicorn` is a `.dylib`,
+> which can't go into a fully static binary, so the build always recompiles it as
+> a `.a`). This also avoids Homebrew's bottles — compiled for the build machine's
+> macOS — producing "built for newer macOS version" linker warnings and an
+> unclean `minos`. The first configure downloads and compiles them (a few
+> minutes, cached afterwards); override the versions with
+> `-DMBEDTLS_VERSION=<x.y.z>` / `-DZLIB_VERSION=<x.y.z>` if desired. minizip
+> links against the system `libz` (present on every Mac).
 
 ### Static build on macOS Catalina (Intel)
 
 ```sh
-brew install nlohmann-json unicorn pkg-config
+brew install nlohmann-json pkg-config
+# MacPorts: sudo port install nlohmann-json pkgconfig
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
       -DCMAKE_OSX_ARCHITECTURES=x86_64 \
@@ -250,7 +284,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
 cmake --build build
 ```
 
-CMake downloads and builds a minimal curl from source (HTTPS only) and statically links it with OpenSSL and minizip. System frameworks (`IOKit`, `CoreFoundation`, `SystemConfiguration`, `CoreServices`) and `libz` remain dynamic — they ship with every Mac. Run `otool -L build/ipatool` to confirm.
+CMake downloads and builds a minimal curl from source (HTTPS only, mbedTLS backend) and statically links it with mbedTLS, minizip and Unicorn (all compiled from source — `unicorn` from Homebrew is a `.dylib` and isn't used). System frameworks (`IOKit`, `CoreFoundation`, `SystemConfiguration`, `CoreServices`) and `libz` remain dynamic — they ship with every Mac. Run `otool -L build/ipatool` to confirm.
 
 ---
 
@@ -460,7 +494,7 @@ On Windows these are in `%USERPROFILE%\.ipatool\`. The account file is always en
 **CLI & shared types**
 - `main.cpp` — CLI entry point, argument parsing, all commands, account-file AES-GCM encryption, kbsync cache
 - `ipatool.h` — shared types (`Account` incl. cached `kbsync`, `App`, `Sinf`), endpoints, error types
-- `protect.cpp/.h` — `SecureString` in-memory encryption and `secure_zero`
+- `protect.cpp/.h` — `SecureString` in-memory encryption, `secure_zero`, and `secure_random` (mbedTLS CTR_DRBG + entropy)
 
 **App Store protocol**
 - `appstore.cpp/.h` — bag fetch, SAP-signed login, search/lookup, purchase, list-purchases (paginated commerce invoice API), download (`volumeStoreDownloadProduct → redownloadProduct → updateProduct` cascade), list-versions, version metadata, storefront↔country table, iTunes JSON parsing
@@ -470,8 +504,8 @@ On Windows these are in `%USERPROFILE%\.ipatool\`. The account file is always en
 **Device identity & crypto**
 - `device_mac.cpp/.h` — stable physical MAC / GUID / hardware ID (IOKit `en0` on macOS, `GetIfTable2` on Windows, sysfs on Linux) with placeholder-MAC rejection
 - `hwid.cpp/.h` — machine-ID derivation and PBKDF2 file-key derivation
-- `aes.cpp/.h` — AES-256-GCM (OpenSSL)
-- `sha2.cpp/.h` — SHA-256, HMAC, PBKDF2 (OpenSSL EVP)
+- `aes.cpp/.h` — AES-256-GCM (mbedTLS `mbedtls_gcm_*`)
+- `sha2.cpp/.h` — SHA-256, HMAC, PBKDF2 (mbedTLS `mbedtls_sha256` / `mbedtls_md_hmac` / `mbedtls_pkcs5_pbkdf2_hmac_ext`)
 
 **FairPlay emulation (Unicorn x86-64)**
 - `SapSigner.cpp/.h` — SAP action-signature signer (init/exchange/sign), `SapBase64`, `LocalHardwareID`

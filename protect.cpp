@@ -1,11 +1,12 @@
 #include "protect.h"
 #include "aes.h"
+#include "sha2.h"
 #include <cstring>
 #include <string.h>  // memset_s on macOS (Darwin declares it unconditionally)
 #include <functional>
 #include <stdexcept>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -24,6 +25,26 @@ std::string g_passphrase;
 
 static const int MEM_IV_LEN  = 12;
 static const int MEM_TAG_LEN = 16;
+
+void secure_random(uint8_t* buf, size_t len) {
+    if (len == 0) return;
+    // Lazily seed one process-wide CTR_DRBG from the platform entropy source.
+    static mbedtls_entropy_context  entropy;
+    static mbedtls_ctr_drbg_context ctr;
+    static const bool seeded = [] {
+        mbedtls_entropy_init(&entropy);
+        mbedtls_ctr_drbg_init(&ctr);
+        static const char pers[] = "ipatool-rng";
+        if (mbedtls_ctr_drbg_seed(&ctr, mbedtls_entropy_func, &entropy,
+                                  reinterpret_cast<const unsigned char*>(pers),
+                                  sizeof(pers) - 1) != 0)
+            throw std::runtime_error("secure_random: RNG seed failed");
+        return true;
+    }();
+    (void)seeded;
+    if (mbedtls_ctr_drbg_random(&ctr, buf, len) != 0)
+        throw std::runtime_error("secure_random: RNG draw failed");
+}
 
 void secure_zero(void* ptr, size_t len) {
     if (!ptr || len == 0) return;
@@ -54,8 +75,9 @@ static void with_mem_key(const std::function<void(const unsigned char*)>& fn) {
     std::string input = machine_id + MEM_KEY_SALT + g_passphrase;
     secure_zero(machine_id.data(), machine_id.size());
     unsigned char key[32];
-    unsigned int  key_len = 32;
-    EVP_Digest(input.data(), input.size(), key, &key_len, EVP_sha256(), nullptr);
+    Bytes k = sha2::digest(input);           // SHA-256 → 32-byte key
+    memcpy(key, k.data(), sizeof(key));
+    secure_zero(k.data(), k.size());
     secure_zero(input.data(), input.size());
     fn(key);
     secure_zero(key, sizeof(key));
@@ -63,7 +85,7 @@ static void with_mem_key(const std::function<void(const unsigned char*)>& fn) {
 
 static std::vector<unsigned char> mem_encrypt(const std::string& plaintext) {
     Bytes iv(MEM_IV_LEN);
-    RAND_bytes(iv.data(), MEM_IV_LEN);
+    secure_random(iv.data(), MEM_IV_LEN);
     Bytes pt(plaintext.begin(), plaintext.end());
 
     aes::GcmOutput result;

@@ -16,7 +16,16 @@
 #include <filesystem>   // C++17 — replaces getcwd / stat / S_ISDIR
 #include <regex>
 #include <ctime>
-#include <openssl/evp.h>   // MD5 (EVP) for whole-image download verification
+#include <mbedtls/version.h> // MBEDTLS_VERSION_MAJOR (2.x vs 3.x API shim)
+#include <mbedtls/md5.h>   // MD5 for whole-image download verification
+// mbedTLS 2.x spelled the int-returning MD5 steps with a "_ret" suffix; 3.x
+// dropped it. Retarget our 3.x calls onto the 2.x names when building on 2.x.
+// (init/free return void in both and need no shim.)
+#if MBEDTLS_VERSION_MAJOR < 3
+#  define mbedtls_md5_starts mbedtls_md5_starts_ret
+#  define mbedtls_md5_update mbedtls_md5_update_ret
+#  define mbedtls_md5_finish mbedtls_md5_finish_ret
+#endif
 
 // ── Platform headers ──────────────────────────────────────────────────────────
 
@@ -57,6 +66,9 @@
 #endif
 
 #include "path_utf8.h"   // ipt::fs_path / ipt::utf8_to_wide — Unicode paths on Windows
+#ifdef _WIN32
+#  include <io.h>        // _isatty / _fileno — for routing --debug output to WriteConsoleW
+#endif
 
 namespace fs = std::filesystem;
 
@@ -95,24 +107,24 @@ static zipFile ipt_zipOpen(const std::string& path, int append) {
 static std::string md5_file_hex(const std::string& path) {
     FILE* f = ipt::fopen_utf8(path, "rb");
     if (!f) return "";
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) { fclose(f); return ""; }
-    if (EVP_DigestInit_ex(ctx, EVP_md5(), nullptr) != 1) {
-        EVP_MD_CTX_free(ctx); fclose(f); return "";
-    }
+    mbedtls_md5_context ctx;
+    mbedtls_md5_init(&ctx);
+    if (mbedtls_md5_starts(&ctx) != 0) { mbedtls_md5_free(&ctx); fclose(f); return ""; }
     std::vector<uint8_t> buf(1u << 20);  // 1 MiB chunks
     size_t n;
-    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0)
-        EVP_DigestUpdate(ctx, buf.data(), n);
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        if (mbedtls_md5_update(&ctx, buf.data(), n) != 0) {
+            mbedtls_md5_free(&ctx); fclose(f); return "";
+        }
+    }
     fclose(f);
-    unsigned char md[EVP_MAX_MD_SIZE];
-    unsigned int mdLen = 0;
-    EVP_DigestFinal_ex(ctx, md, &mdLen);
-    EVP_MD_CTX_free(ctx);
+    unsigned char md[16];
+    mbedtls_md5_finish(&ctx, md);
+    mbedtls_md5_free(&ctx);
     static const char* hexd = "0123456789abcdef";
     std::string out;
-    out.reserve(mdLen * 2);
-    for (unsigned i = 0; i < mdLen; ++i) {
+    out.reserve(sizeof(md) * 2);
+    for (unsigned i = 0; i < sizeof(md); ++i) {
         out.push_back(hexd[md[i] >> 4]);
         out.push_back(hexd[md[i] & 0xF]);
     }
@@ -299,26 +311,50 @@ static std::string debug_mask_header(const std::string& name, const std::string&
     return value;
 }
 
+// Write a UTF-8 string to stderr. On a real Windows console we go through
+// WriteConsoleW (UTF-16) so non-ASCII in --debug dumps (e.g. Cyrillic app names
+// and addresses in the list-purchases body) renders correctly instead of the
+// mojibake fprintf/fputs produce when the legacy console reads raw UTF-8 bytes
+// as its OEM code page. Redirected stderr (file/pipe) keeps raw UTF-8 bytes.
+static void debug_err(const std::string& s) {
+#ifdef _WIN32
+    if (_isatty(_fileno(stderr))) {
+        std::wstring w = ipt::utf8_to_wide(s);
+        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+        if (h != INVALID_HANDLE_VALUE && !w.empty()) {
+            DWORD written = 0;
+            WriteConsoleW(h, w.data(), static_cast<DWORD>(w.size()), &written, nullptr);
+        }
+        return;
+    }
+#endif
+    fwrite(s.data(), 1, s.size(), stderr);
+}
+
 static void debug_dump_request(const char* label, const char* method,
                                const std::string& url,
                                const std::map<std::string, std::string>& headers,
                                const std::string& body) {
-    fprintf(stderr, "[DEBUG] ── %s request ──\n", label);
-    fprintf(stderr, "[DEBUG] %s %s\n", method, url.c_str());
-    fprintf(stderr, "[DEBUG] request headers:\n");
+    std::ostringstream o;
+    o << "[DEBUG] ── " << label << " request ──\n"
+      << "[DEBUG] " << method << " " << url << "\n"
+      << "[DEBUG] request headers:\n";
     for (auto& [k, v] : headers)
-        fprintf(stderr, "  %s: %s\n", k.c_str(), debug_mask_header(k, v).c_str());
-    fprintf(stderr, "[DEBUG] request body (%zu bytes):\n%s\n", body.size(), body.c_str());
+        o << "  " << k << ": " << debug_mask_header(k, v) << "\n";
+    o << "[DEBUG] request body (" << body.size() << " bytes):\n" << body << "\n";
+    debug_err(o.str());
 }
 
 static void debug_dump_response(const char* label, const HttpResponse& res) {
-    fprintf(stderr, "[DEBUG] ── %s response ──\n", label);
-    fprintf(stderr, "[DEBUG] status: %d\n", res.statusCode);
-    fprintf(stderr, "[DEBUG] response headers:\n");
+    std::ostringstream o;
+    o << "[DEBUG] ── " << label << " response ──\n"
+      << "[DEBUG] status: " << res.statusCode << "\n"
+      << "[DEBUG] response headers:\n";
     for (auto& [k, v] : res.headers)
-        fprintf(stderr, "  %s: %s\n", k.c_str(), v.c_str());
-    fprintf(stderr, "[DEBUG] response body (%zu bytes):\n%s\n",
-            res.body.size(), res.body.empty() ? "<empty>" : res.body.c_str());
+        o << "  " << k << ": " << v << "\n";
+    o << "[DEBUG] response body (" << res.body.size() << " bytes):\n"
+      << (res.body.empty() ? "<empty>" : res.body) << "\n";
+    debug_err(o.str());
 }
 
 // A songList item is usable as a download source only if it carries sinf data
@@ -576,31 +612,33 @@ AppStore::ListPurchasesOutput AppStore::list_purchases(const Account& acc, int p
     } catch (const DnsResolveError&) {
         // The stored pod's hostname would not resolve. With no pod at all this is
         // a genuine DNS failure — let it propagate. Otherwise the stored pod is
-        // likely stale: retry on the pod-less host, which routes us to (and tells
-        // us) the correct pod, then follow that redirect for the actual data.
+        // likely stale: retry on the pod-less host; the 302 it returns is followed
+        // by the redirect loop below, which routes us to the correct pod.
         if (acc.pod.empty()) throw;
         std::string base = build_url("");    // https://buy.itunes.apple.com/…
         if (m_debug) debug_dump_request("list-purchases(fallback)", "GET", base, headers, "");
-        HttpResponse fb = m_http.get(base, headers);
-        if (m_debug) debug_dump_response("list-purchases(fallback)", fb);
-        capture_pod(fb);
-        if (fb.statusCode == 302) {
-            // Prefer rebuilding the URL from the learned pod so our own query
-            // (page/range) is preserved — Apple's Location may drop it. Only if
-            // no pod could be derived do we follow the raw Location as-is.
-            std::string target;
-            if (!m_regeneratedPod.empty()) {
-                target = build_url(m_regeneratedPod);
-            } else {
-                auto loc = fb.headers.find("location");
-                target = (loc != fb.headers.end() && !loc->second.empty()) ? loc->second : base;
-            }
-            if (m_debug) debug_dump_request("list-purchases(redir)", "GET", target, headers, "");
-            res = m_http.get(target, headers);
-            if (m_debug) debug_dump_response("list-purchases(redir)", res);
-        } else {
-            res = fb;    // the pod-less host served the data directly
-        }
+        res = m_http.get(base, headers);
+        if (m_debug) debug_dump_response("list-purchases(fallback)", res);
+    }
+
+    // Follow 302 redirects. FOLLOWLOCATION is off in the HTTP client, so we do it
+    // here. Apple uses two flavours, both handled by following the Location
+    // VERBATIM (it preserves our page/range query and carries Apple's own params):
+    //   • pod/cookie handshake — same host, adds &mzcprh=1 and Set-Cookie itspod=N,
+    //     then serves the data on retry (the cookie rides along via the shared
+    //     cookie jar, which captures Set-Cookie even on a 302);
+    //   • pod routing — Location points at the correct p<N>-buy host.
+    // We capture the pod from each hop (header or Location host) so the caller can
+    // persist it, and bound the loop so a misbehaving redirect can't spin forever.
+    // NOTE: do NOT rebuild the URL from the pod here — that drops Apple's extra
+    // query (e.g. mzcprh) and makes the handshake 302 loop endlessly.
+    for (int hop = 0; res.statusCode == 302 && hop < 4; ++hop) {
+        capture_pod(res);
+        auto loc = res.headers.find("location");
+        if (loc == res.headers.end() || loc->second.empty()) break;
+        if (m_debug) debug_dump_request("list-purchases(redir)", "GET", loc->second, headers, "");
+        res = m_http.get(loc->second, headers);
+        if (m_debug) debug_dump_response("list-purchases(redir)", res);
     }
 
     ListPurchasesOutput out;
