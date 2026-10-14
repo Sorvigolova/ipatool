@@ -187,9 +187,14 @@ sudo apt install libminizip-dev zlib1g-dev libunicorn-dev
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON
 cmake --build build
-strip build/ipatool
 # Output: build/ipatool
 ```
+
+> **Stripping is automatic.** Every `Release` build strips the final binary after
+> linking (on macOS it is also re-signed ad-hoc, since stripping invalidates the
+> signature — required on Apple silicon). No manual `strip` step is needed; pass
+> `-DSTRIP_BINARY=OFF` to keep symbols. MSVC is unaffected — its debug info goes
+> to a separate PDB.
 
 The static build compiles **curl (HTTPS-only) and mbedTLS from source** via CMake
 `ExternalProject_Add` — curl uses mbedTLS as its TLS backend and the app crypto links

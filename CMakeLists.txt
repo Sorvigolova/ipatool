@@ -1029,6 +1029,33 @@ else()
     endif()
 endif()
 
+# ── Strip the release binary (GCC/Clang toolchains) ─────────────────────────────
+# Removes the symbol/debug tables from the final executable to shrink it. MSVC is
+# excluded — its debug info already goes to a separate PDB (handled above), and it
+# has no `strip`. Only Release is stripped, so Debug/RelWithDebInfo keep symbols.
+# On macOS, stripping invalidates the linker's ad-hoc code signature — mandatory
+# on Apple silicon, where a modified unsigned binary is killed on launch — so the
+# strip is followed by an ad-hoc re-sign (`codesign --sign -`). The embedded SAP
+# asset sections are resolved at static-link time, so dropping the symbol table
+# afterwards is safe. Disable with -DSTRIP_BINARY=OFF.
+option(STRIP_BINARY "Strip the release executable after linking" ON)
+if(STRIP_BINARY AND NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(NOT CMAKE_STRIP)
+        message(STATUS "STRIP_BINARY requested but no 'strip' tool found — skipping")
+    elseif(APPLE)
+        add_custom_command(TARGET ipatool POST_BUILD
+            COMMAND "${CMAKE_STRIP}" -x "$<TARGET_FILE:ipatool>"
+            COMMAND codesign --force --sign - "$<TARGET_FILE:ipatool>"
+            VERBATIM
+            COMMENT "Stripping and ad-hoc re-signing ipatool")
+    else()
+        add_custom_command(TARGET ipatool POST_BUILD
+            COMMAND "${CMAKE_STRIP}" "$<TARGET_FILE:ipatool>"
+            VERBATIM
+            COMMENT "Stripping ipatool")
+    endif()
+endif()
+
 # ── Install ───────────────────────────────────────────────────────────────────
 
 install(TARGETS ipatool DESTINATION bin)
