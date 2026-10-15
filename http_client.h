@@ -38,6 +38,18 @@ public:
     HttpResponse get(const std::string& url,
                      const std::map<std::string, std::string>& reqHeaders = {}) const;
 
+    // Range GET into memory, FOLLOWING redirects (the .ipa download URL may 302,
+    // unlike the API endpoints). `rangeSpec` is a curl range string, e.g. "0-0",
+    // "100-199", "500-". `maxBytes` (0 = unlimited) caps the buffered body and
+    // aborts the transfer if exceeded — a guard in case a host ignores Range and
+    // tries to send the whole (potentially multi-GB) file. Returns the 200/206
+    // response (body = the bytes; headers include content-range). No retry loop;
+    // callers treat any failure as best-effort.
+    HttpResponse get_range(const std::string& url,
+                           const std::string& rangeSpec,
+                           size_t maxBytes = 0,
+                           const std::map<std::string, std::string>& reqHeaders = {}) const;
+
     // Resumable file download with automatic retry.
     // rangeStart==0 means start fresh; >0 resumes from that byte offset.
     // On transient failure each retry continues from where the last left off,

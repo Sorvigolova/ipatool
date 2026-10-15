@@ -17,6 +17,18 @@ static size_t body_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata
     return size * nmemb;
 }
 
+// Capped body sink for get_range: appends to `buf` but aborts (returns a short
+// count → CURLE_WRITE_ERROR) once `cap` bytes would be exceeded. cap==0 means
+// no limit.
+struct CappedBuf { std::string* buf; size_t cap; };
+static size_t capped_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto*  cb = reinterpret_cast<CappedBuf*>(userdata);
+    size_t n  = size * nmemb;
+    if (cb->cap && cb->buf->size() + n > cb->cap) return 0;  // over cap → abort
+    cb->buf->append(ptr, n);
+    return n;
+}
+
 struct DownloadState {
     FILE*    fp        = nullptr;
     int64_t  total     = 0;
@@ -140,6 +152,56 @@ HttpResponse HttpClient::get(const std::string& url,
                  const std::map<std::string, std::string>& reqHeaders) const
 {
     return perform("GET", url, "", reqHeaders);
+}
+
+HttpResponse HttpClient::get_range(const std::string& url,
+                                   const std::string& rangeSpec,
+                                   size_t             maxBytes,
+                                   const std::map<std::string, std::string>& reqHeaders) const
+{
+    CURL* curl = curl_easy_init();
+    if (!curl) throw std::runtime_error("curl_easy_init failed");
+
+    HttpResponse resp;
+    std::string  respBody;
+    CappedBuf    sink{ &respBody, maxBytes };
+
+    curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
+    curl_easy_setopt(curl, CURLOPT_USERAGENT,      USER_AGENT);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);   // the .ipa URL may redirect
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,        60L);
+    curl_easy_setopt(curl, CURLOPT_RANGE,          rangeSpec.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  capped_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &sink);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA,     &resp.headers);
+    load_cookies(curl, m_cookieFile);
+
+    struct curl_slist* hdrs = nullptr;
+    for (auto& [k, v] : reqHeaders) {
+        std::string h = k + ": " + v;
+        hdrs = curl_slist_append(hdrs, h.c_str());
+    }
+    if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+
+    CURLcode rc = curl_easy_perform(curl);
+    if (hdrs) curl_slist_free_all(hdrs);
+
+    if (rc != CURLE_OK) {
+        save_cookies(curl, m_cookieFile);
+        curl_easy_cleanup(curl);
+        throw std::runtime_error(std::string("range GET failed: ") + curl_easy_strerror(rc));
+    }
+
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    save_cookies(curl, m_cookieFile);
+    curl_easy_cleanup(curl);
+    resp.statusCode = static_cast<int>(code);
+    resp.body       = std::move(respBody);
+    return resp;
 }
 
 void HttpClient::download(const std::string& url,

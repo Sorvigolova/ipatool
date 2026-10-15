@@ -1029,6 +1029,17 @@ else()
     endif()
 endif()
 
+# ── zlib for the app itself (raw inflate of the range-read Info.plist) ──────────
+# get_version_metadata now decompresses one ZIP entry from the remote IPA, so the
+# ipatool binary calls inflate() directly. Static builds already link libz (it is
+# in STATIC_LINK_LIBS / -lz above). For dynamic builds, link ZLIB::ZLIB so the
+# symbols and <zlib.h> resolve even when minizip (which would otherwise pull zlib)
+# is absent. Linking a shared libz into a fully static binary is wrong, so this is
+# gated to non-static builds.
+if(NOT STATIC_BUILD AND TARGET ZLIB::ZLIB)
+    target_link_libraries(ipatool PRIVATE ZLIB::ZLIB)
+endif()
+
 # ── Strip the release binary (GCC/Clang toolchains) ─────────────────────────────
 # Removes the symbol/debug tables from the final executable to shrink it. MSVC is
 # excluded — its debug info already goes to a separate PDB (handled above), and it

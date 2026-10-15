@@ -161,6 +161,7 @@ public:
     struct GetVersionMetadataOutput {
         std::string displayVersion;
         std::string releaseDate;
+        std::string minimumOSVersion;   // best-effort, read from the IPA's Info.plist
     };
 
     GetVersionMetadataOutput get_version_metadata(const Account& acc,

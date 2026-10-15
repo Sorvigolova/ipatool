@@ -403,7 +403,12 @@ Returns all available external version IDs for an app.
 ```
 ipatool get-version-metadata (-b BUNDLE_ID | -i APP_ID) --external-version-id ID [--keychain-passphrase PASSPHRASE]
 ```
-Returns the display version string and release date for a specific version ID.
+Returns the display version string, release date and, when it can be determined, the minimum OS version for a specific version ID.
+
+- `minimumOSVersion` is read directly from the app package, since the store metadata does not carry it:
+  - **iOS (`.ipa`)** — `Payload/<App>.app/Info.plist` → `MinimumOSVersion`. The field is pulled with a few HTTP range requests against the download URL (reading only the ZIP central directory and that one entry), so the whole IPA is **not** downloaded.
+  - **macOS (preflight package)** — the small `preflightPackageURL` (a XAR) is fetched whole; its `Distribution` XML gives `<allowed-os-versions><os-version min="…"/>`.
+- It is **best-effort**: on any problem (range unsupported, unexpected container, parse failure) the field is simply omitted — `displayVersion` and `releaseDate` are always returned. In `--format json` the key `minimumOSVersion` appears only when a value was found.
 
 #### `kbsync`
 ```

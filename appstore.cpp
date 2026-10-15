@@ -16,6 +16,8 @@
 #include <filesystem>   // C++17 — replaces getcwd / stat / S_ISDIR
 #include <regex>
 #include <ctime>
+#include <cstdint>
+#include <zlib.h>        // raw inflate for the range-read Info.plist (min-OS)
 #include <mbedtls/version.h> // MBEDTLS_VERSION_MAJOR (2.x vs 3.x API shim)
 #include <mbedtls/md5.h>   // MD5 for whole-image download verification
 // mbedTLS 2.x spelled the int-returning MD5 steps with a "_ret" suffix; 3.x
@@ -932,6 +934,253 @@ AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc,
     } // version-identifier extraction block
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Minimum-OS extraction
+//
+// The App Store metadata does not carry the app's minimum iOS version — Xcode
+// bakes it into the bundle's Info.plist (MinimumOSVersion) at build time. To
+// read it without downloading the whole (often multi-GB) IPA, we treat the
+// signed download URL as a remote ZIP and pull out just Payload/<App>.app/
+// Info.plist via HTTP range requests + the ZIP central directory. The IPA's
+// container is a plain ZIP and Info.plist is NOT FairPlay-encrypted (only the
+// Mach-O __TEXT is), so it decompresses directly. Everything here is
+// best-effort: any failure just leaves the field empty.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+inline uint16_t rd_u16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+inline uint32_t rd_u32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+inline uint64_t rd_u64(const uint8_t* p) {
+    return (uint64_t)rd_u32(p) | ((uint64_t)rd_u32(p + 4) << 32);
+}
+
+// Raw DEFLATE (ZIP method 8) → `out` (expected uncompressed size `outSize`).
+bool zip_inflate_raw(const uint8_t* in, size_t inLen, size_t outSize, std::string& out) {
+    out.assign(outSize, '\0');
+    z_stream zs{};
+    if (inflateInit2(&zs, -15) != Z_OK) return false;   // -15 = raw deflate, no zlib header
+    zs.next_in   = const_cast<Bytef*>(in);
+    zs.avail_in  = static_cast<uInt>(inLen);
+    zs.next_out  = reinterpret_cast<Bytef*>(outSize ? &out[0] : nullptr);
+    zs.avail_out = static_cast<uInt>(outSize);
+    int rc = inflate(&zs, Z_FINISH);
+    size_t produced = zs.total_out;
+    inflateEnd(&zs);
+    if (rc != Z_STREAM_END) return false;
+    out.resize(produced);
+    return true;
+}
+
+// Total size of the resource behind `url` via a 0-0 range probe
+// (Content-Range: bytes 0-0/TOTAL). -1 if the server doesn't honour the range.
+int64_t http_total_size(const HttpClient& http, const std::string& url) {
+    try {
+        HttpResponse r = http.get_range(url, "0-0", 64 * 1024);
+        if (r.statusCode != 206) return -1;   // 200 ⇒ range ignored — don't trust/stream
+        auto it = r.headers.find("content-range");
+        if (it == r.headers.end()) return -1;
+        auto slash = it->second.rfind('/');
+        if (slash == std::string::npos) return -1;
+        std::string tot = it->second.substr(slash + 1);
+        if (tot.empty() || tot == "*") return -1;
+        return std::stoll(tot);
+    } catch (const std::exception&) { return -1; }
+}
+
+// Fetch byte range [start, start+len-1]; caps the sink a little above `len`.
+std::vector<uint8_t> http_range(const HttpClient& http, const std::string& url,
+                                int64_t start, int64_t len) {
+    std::string spec = std::to_string(start) + "-" + std::to_string(start + len - 1);
+    HttpResponse r = http.get_range(url, spec, static_cast<size_t>(len) + 1024);
+    return std::vector<uint8_t>(r.body.begin(), r.body.end());
+}
+
+// Pull Payload/<App>.app/Info.plist out of the remote .ipa. false on any issue.
+bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url,
+                          std::string& outPlist) {
+    int64_t size = http_total_size(http, url);
+    if (size <= 0) return false;
+
+    // 1. Locate the End-Of-Central-Directory record in the file tail.
+    const int64_t tailWant = 65557;    // 22-byte EOCD + up to 65535-byte comment
+    int64_t tailLen  = std::min<int64_t>(size, tailWant);
+    int64_t tailBase = size - tailLen;
+    std::vector<uint8_t> tail = http_range(http, url, tailBase, tailLen);
+    if ((int64_t)tail.size() != tailLen) return false;
+
+    int64_t eocd = -1;
+    for (int64_t i = (int64_t)tail.size() - 22; i >= 0; --i) {
+        if (tail[i]==0x50 && tail[i+1]==0x4b && tail[i+2]==0x05 && tail[i+3]==0x06) {
+            eocd = i; break;
+        }
+    }
+    if (eocd < 0) return false;
+
+    uint32_t cdSize32 = rd_u32(&tail[eocd + 12]);
+    uint32_t cdOff32  = rd_u32(&tail[eocd + 16]);
+    int64_t  cdOffset = cdOff32;
+    int64_t  cdSize   = cdSize32;
+
+    // 2. ZIP64 when the 32-bit fields are maxed out (large apps).
+    if (cdOff32 == 0xFFFFFFFFu || cdSize32 == 0xFFFFFFFFu) {
+        int64_t loc = eocd - 20;   // ZIP64 EOCD locator "PK\x06\x07" precedes EOCD
+        if (loc < 0 || !(tail[loc]==0x50 && tail[loc+1]==0x4b &&
+                         tail[loc+2]==0x06 && tail[loc+3]==0x07))
+            return false;
+        uint64_t z64off = rd_u64(&tail[loc + 8]);
+        std::vector<uint8_t> z = http_range(http, url, (int64_t)z64off, 56);
+        if (z.size() < 56 || !(z[0]==0x50 && z[1]==0x4b && z[2]==0x06 && z[3]==0x06))
+            return false;
+        cdSize   = (int64_t)rd_u64(&z[40]);
+        cdOffset = (int64_t)rd_u64(&z[48]);
+    }
+    if (cdOffset < 0 || cdSize <= 0 || cdOffset + cdSize > size) return false;
+
+    // 3. Scan the central directory for the MAIN app's Info.plist.
+    std::vector<uint8_t> cd = http_range(http, url, cdOffset, cdSize);
+    if ((int64_t)cd.size() != cdSize) return false;
+
+    static const std::regex mainInfo(R"(^Payload/[^/]+\.app/Info\.plist$)");
+    int64_t  localOff = -1, compSize = -1, uncompSize = -1;
+    uint16_t method = 0;
+
+    size_t p = 0;
+    while (p + 46 <= cd.size()) {
+        if (!(cd[p]==0x50 && cd[p+1]==0x4b && cd[p+2]==0x01 && cd[p+3]==0x02)) break;
+        uint16_t m  = rd_u16(&cd[p + 10]);
+        uint32_t cs = rd_u32(&cd[p + 20]);
+        uint32_t us = rd_u32(&cd[p + 24]);
+        uint16_t nl = rd_u16(&cd[p + 28]);
+        uint16_t el = rd_u16(&cd[p + 30]);
+        uint16_t cl = rd_u16(&cd[p + 32]);
+        uint32_t lo = rd_u32(&cd[p + 42]);
+        if (p + 46 + nl > cd.size()) break;
+        std::string name(reinterpret_cast<const char*>(&cd[p + 46]), nl);
+
+        if (std::regex_match(name, mainInfo)) {
+            int64_t cs64 = cs, us64 = us, lo64 = lo;
+            // ZIP64 extra (id 0x0001) supplies 64-bit values for whichever
+            // 32-bit fields read 0xFFFFFFFF, in order: uncomp, comp, localoff.
+            if (cs == 0xFFFFFFFFu || us == 0xFFFFFFFFu || lo == 0xFFFFFFFFu) {
+                size_t ep = p + 46 + nl, eend = ep + el, q = ep;
+                while (q + 4 <= eend && q + 4 <= cd.size()) {
+                    uint16_t id  = rd_u16(&cd[q]);
+                    uint16_t len = rd_u16(&cd[q + 2]);
+                    size_t   dp  = q + 4;
+                    if (id == 0x0001) {
+                        if (us == 0xFFFFFFFFu && dp + 8 <= eend) { us64 = (int64_t)rd_u64(&cd[dp]); dp += 8; }
+                        if (cs == 0xFFFFFFFFu && dp + 8 <= eend) { cs64 = (int64_t)rd_u64(&cd[dp]); dp += 8; }
+                        if (lo == 0xFFFFFFFFu && dp + 8 <= eend) { lo64 = (int64_t)rd_u64(&cd[dp]); dp += 8; }
+                        break;
+                    }
+                    q += 4 + len;
+                }
+            }
+            method = m; compSize = cs64; uncompSize = us64; localOff = lo64;
+            break;
+        }
+        p += 46 + nl + el + cl;
+    }
+    if (localOff < 0 || compSize < 0 || (method != 0 && method != 8)) return false;
+    if (localOff + 30 > size) return false;
+
+    // 4. Read the local file header for the true data offset, then the bytes.
+    std::vector<uint8_t> lh = http_range(http, url, localOff, 30);
+    if (lh.size() < 30 || !(lh[0]==0x50 && lh[1]==0x4b && lh[2]==0x03 && lh[3]==0x04))
+        return false;
+    uint16_t lnl = rd_u16(&lh[26]);
+    uint16_t lel = rd_u16(&lh[28]);
+    int64_t  dataStart = localOff + 30 + lnl + lel;
+    if (dataStart + compSize > size) return false;
+    std::vector<uint8_t> data = http_range(http, url, dataStart, compSize);
+    if ((int64_t)data.size() != compSize) return false;
+
+    // 5. Stored (0) or raw-deflate (8).
+    if (method == 0) {
+        outPlist.assign(reinterpret_cast<const char*>(data.data()), data.size());
+        return true;
+    }
+    return zip_inflate_raw(data.data(), data.size(), (size_t)uncompSize, outPlist);
+}
+
+// Read MinimumOSVersion out of an Info.plist blob (binary or XML). "" if absent.
+std::string min_os_from_info_plist(const std::string& plistBytes) {
+    try {
+        PlistDict info = decode_plist(plistBytes);
+        std::string v = dict_str(info, "MinimumOSVersion");
+        if (v.empty()) v = dict_str(info, "minimumOSVersion");   // tolerate casing
+        return v;
+    } catch (const std::exception&) { return ""; }
+}
+
+// ── macOS: minimum OS from the preflight package (.pfpkg) ────────────────────
+// A macOS app has no iOS-style Info.plist; the store instead exposes a tiny
+// "preflightPackageURL". That resource is a XAR archive (magic "xar!") whose
+// member "Distribution" (a compiler-/installer-gui XML) carries
+//   <allowed-os-versions><os-version min="15.7"/></allowed-os-versions>
+// Both the XAR table-of-contents and the Distribution member are zlib/gzip
+// compressed, so the value is NOT present as plaintext in the raw bytes. The
+// file is small (tens of KB), so rather than parse the XAR TOC we download it
+// whole and scan for compressed streams, inflate each, and read the os-version
+// min out of whichever one is the Distribution XML. Best-effort throughout.
+
+// Inflate a zlib- or gzip-wrapped stream at `in` (auto-detect header), growing
+// the output. true if a complete stream decoded.
+bool inflate_grow(const uint8_t* in, size_t inLen, std::string& out) {
+    out.clear();
+    z_stream zs{};
+    if (inflateInit2(&zs, 15 + 32) != Z_OK) return false;   // 32 = auto zlib/gzip
+    zs.next_in  = const_cast<Bytef*>(in);
+    zs.avail_in = static_cast<uInt>(inLen);
+    char buf[16384];
+    int rc;
+    do {
+        zs.next_out  = reinterpret_cast<Bytef*>(buf);
+        zs.avail_out = sizeof(buf);
+        rc = inflate(&zs, Z_NO_FLUSH);
+        if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) break;
+        out.append(buf, sizeof(buf) - zs.avail_out);
+        if (rc == Z_BUF_ERROR) break;   // stalled (no progress) → give up
+        if (out.size() > 8u * 1024 * 1024) break;   // sanity cap on a preflight XML
+    } while (rc != Z_STREAM_END);
+    inflateEnd(&zs);
+    return rc == Z_STREAM_END;
+}
+
+// Valid zlib header start? (CM=deflate, CINFO<=7, FCHECK passes)
+bool looks_zlib(const uint8_t* p, size_t n) {
+    if (n < 2) return false;
+    if ((p[0] & 0x0f) != 8)  return false;
+    if ((p[0] & 0xf0) > 0x70) return false;
+    return (((unsigned)p[0] << 8) | p[1]) % 31 == 0;
+}
+bool looks_gzip(const uint8_t* p, size_t n) {
+    return n >= 3 && p[0] == 0x1f && p[1] == 0x8b && p[2] == 0x08;
+}
+
+// Scan a (small) preflight package for compressed streams; return the
+// os-version min= from whichever inflates to the Distribution XML. "" if none.
+std::string min_os_from_pfpkg(const std::string& fileBytes) {
+    const uint8_t* d = reinterpret_cast<const uint8_t*>(fileBytes.data());
+    size_t n = fileBytes.size();
+    // Custom raw-string delimiter: the pattern itself contains )" .
+    static const std::regex re(R"RX(os-version[^>]*\bmin="([^"]+)")RX");
+    for (size_t i = 0; i + 2 < n; ++i) {
+        if (!looks_zlib(d + i, n - i) && !looks_gzip(d + i, n - i)) continue;
+        std::string out;
+        if (!inflate_grow(d + i, n - i, out)) continue;
+        if (out.find("os-version") == std::string::npos) continue;
+        std::smatch m;
+        if (std::regex_search(out, m, re)) return m[1].str();
+    }
+    return "";
+}
+
+} // namespace
+
 AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account& acc,
                                                const App& app,
                                                const std::string& versionID,
@@ -961,6 +1210,49 @@ AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account&
     if (dvIt != metadata.end()) out.displayVersion = dvIt->second.str();
     auto rdIt = metadata.find("releaseDate");
     if (rdIt != metadata.end()) out.releaseDate = rdIt->second.str();
+
+    // Minimum iOS version isn't in the store metadata — read it from the IPA's
+    // Info.plist via HTTP range requests (no full download). Best-effort: on any
+    // failure the field stays empty and the command still returns version+date.
+    // Guarded to genuine .ipa assets only: the signed download URL carries the
+    // extension on the path before the query string, e.g.
+    //   https://iosapps.itunes.apple.com/.../Foo.signed.dpkg.ipa?accessKey=…
+    // (note the literal "dpkg" inside the name — we match the real ".ipa" suffix,
+    // not a substring). Anything else — a macOS .pkg (xar, not a ZIP) or any
+    // other asset — is left untouched.
+    std::string ipaURL  = dict_str(item, "URL");
+    std::string ipaPath = ipaURL.substr(0, ipaURL.find('?'));   // strip ?accessKey=…
+    auto ends_with_ci = [](const std::string& s, const char* suf) {
+        size_t n = std::strlen(suf);
+        if (s.size() < n) return false;
+        for (size_t i = 0; i < n; ++i)
+            if (std::tolower((unsigned char)s[s.size() - n + i]) != (unsigned char)suf[i])
+                return false;
+        return true;
+    };
+    if (ends_with_ci(ipaPath, ".ipa")) {
+        // iOS: Payload/<App>.app/Info.plist → MinimumOSVersion (range-ZIP).
+        try {
+            std::string infoPlist;
+            if (fetch_ipa_info_plist(m_http, ipaURL, infoPlist))
+                out.minimumOSVersion = min_os_from_info_plist(infoPlist);
+        } catch (const std::exception&) { /* best-effort — leave empty */ }
+    } else {
+        // macOS: there's no .ipa; the store exposes a small preflight package
+        // (XAR) whose Distribution XML carries <allowed-os-versions><os-version
+        // min="…"/>. Download it whole (tens of KB) and scan its compressed
+        // streams. Key lives in metadata (fall back to item just in case).
+        std::string pfURL = dict_str(metadata, "preflightPackageURL");
+        if (pfURL.empty()) pfURL = dict_str(item, "preflightPackageURL");
+        if (!pfURL.empty()) {
+            try {
+                // whole file, following redirects; cap guards a surprise large asset
+                HttpResponse pf = m_http.get_range(pfURL, "0-", 64u * 1024 * 1024);
+                if (!pf.body.empty())
+                    out.minimumOSVersion = min_os_from_pfpkg(pf.body);
+            } catch (const std::exception&) { /* best-effort — leave empty */ }
+        }
+    }
 
     return out;
 }

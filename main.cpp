@@ -647,7 +647,11 @@ static bool silent_relogin(Account& acc, const std::string& passphrase) {
 // Emits output matching zerolog ConsoleWriter (text) or raw JSON (json).
 // text:  <HH:MM:SS> INF key=value key=value ...   (colorized on TTY)
 // json:  {"key":"value",...}
-static void log_output(const json& j) {
+// Templated so callers can pass either nlohmann::json (keys sorted) or
+// nlohmann::ordered_json (keys kept in insertion order) — used where field
+// order matters in the printed/JSON output.
+template <class J>
+static void log_output(const J& j) {
     if (g_format == "json") {
         std::cout << j.dump() << "\n";
         return;
@@ -671,8 +675,8 @@ static void log_output(const json& j) {
         std::cout << k;
         set_color(COL_RESET_ID);
         std::cout << "=";
-        if (v.is_string())       std::cout << v.get<std::string>();
-        else if (v.is_boolean()) std::cout << (v.get<bool>() ? "true" : "false");
+        if (v.is_string())       std::cout << v.template get<std::string>();
+        else if (v.is_boolean()) std::cout << (v.template get<bool>() ? "true" : "false");
         else                     std::cout << v.dump();
     }
     std::cout << "\n";
@@ -1055,10 +1059,16 @@ static void cmd_get_version_metadata(const Args& args) {
         auto out = store.get_version_metadata(acc, app, versionID, redownloadEndpoint, volumeStoreDownloadEndpoint, kbsyncB64);
         cache_regenerated_kbsync(store, acc, passphrase, get(args, "debug") == "true");
 
-        json j;
+        // ordered_json so the keys print in this exact order (minimumOSVersion
+        // right after releaseDate), not alphabetically.
+        nlohmann::ordered_json j;
         j["externalVersionID"] = versionID;
         j["displayVersion"]    = out.displayVersion;
         j["releaseDate"]       = out.releaseDate;
+        // Only present for a real .ipa whose Info.plist we could read (best-effort);
+        // omitted entirely otherwise.
+        if (!out.minimumOSVersion.empty())
+            j["minimumOSVersion"] = out.minimumOSVersion;
         j["success"]           = true;
         log_output(j);
     };
