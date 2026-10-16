@@ -18,15 +18,19 @@
 #include <ctime>
 #include <cstdint>
 #include <zlib.h>        // raw inflate for the range-read Info.plist (min-OS)
-#include <mbedtls/version.h> // MBEDTLS_VERSION_MAJOR (2.x vs 3.x API shim)
-#include <mbedtls/md5.h>   // MD5 for whole-image download verification
-// mbedTLS 2.x spelled the int-returning MD5 steps with a "_ret" suffix; 3.x
-// dropped it. Retarget our 3.x calls onto the 2.x names when building on 2.x.
-// (init/free return void in both and need no shim.)
-#if MBEDTLS_VERSION_MAJOR < 3
-#  define mbedtls_md5_starts mbedtls_md5_starts_ret
-#  define mbedtls_md5_update mbedtls_md5_update_ret
-#  define mbedtls_md5_finish mbedtls_md5_finish_ret
+#include <mbedtls/version.h> // MBEDTLS_VERSION_MAJOR (TLS-version backend select)
+// MD5 for whole-image download verification. 4.x removed the legacy mbedtls_md5
+// module (crypto moved to PSA), so there we go through psa_hash_*; 2.x/3.x keep
+// the low-level API, with a shim for the 2.x "_ret" suffix.
+#if MBEDTLS_VERSION_MAJOR >= 4
+#  include <psa/crypto.h>
+#else
+#  include <mbedtls/md5.h>
+#  if MBEDTLS_VERSION_MAJOR < 3
+#    define mbedtls_md5_starts mbedtls_md5_starts_ret
+#    define mbedtls_md5_update mbedtls_md5_update_ret
+#    define mbedtls_md5_finish mbedtls_md5_finish_ret
+#  endif
 #endif
 
 // ── Platform headers ──────────────────────────────────────────────────────────
@@ -109,20 +113,35 @@ static zipFile ipt_zipOpen(const std::string& path, int append) {
 static std::string md5_file_hex(const std::string& path) {
     FILE* f = ipt::fopen_utf8(path, "rb");
     if (!f) return "";
+    std::vector<uint8_t> buf(1u << 20);  // 1 MiB chunks
+    size_t n;
+    unsigned char md[16];
+#if MBEDTLS_VERSION_MAJOR >= 4
+    static const psa_status_t initrc = psa_crypto_init(); (void)initrc;  // idempotent
+    psa_hash_operation_t ctx = PSA_HASH_OPERATION_INIT;
+    if (psa_hash_setup(&ctx, PSA_ALG_MD5) != PSA_SUCCESS) { fclose(f); return ""; }
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        if (psa_hash_update(&ctx, buf.data(), n) != PSA_SUCCESS) {
+            psa_hash_abort(&ctx); fclose(f); return "";
+        }
+    }
+    fclose(f);
+    size_t mdlen = 0;
+    if (psa_hash_finish(&ctx, md, sizeof(md), &mdlen) != PSA_SUCCESS || mdlen != sizeof(md))
+        return "";
+#else
     mbedtls_md5_context ctx;
     mbedtls_md5_init(&ctx);
     if (mbedtls_md5_starts(&ctx) != 0) { mbedtls_md5_free(&ctx); fclose(f); return ""; }
-    std::vector<uint8_t> buf(1u << 20);  // 1 MiB chunks
-    size_t n;
     while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
         if (mbedtls_md5_update(&ctx, buf.data(), n) != 0) {
             mbedtls_md5_free(&ctx); fclose(f); return "";
         }
     }
     fclose(f);
-    unsigned char md[16];
     mbedtls_md5_finish(&ctx, md);
     mbedtls_md5_free(&ctx);
+#endif
     static const char* hexd = "0123456789abcdef";
     std::string out;
     out.reserve(sizeof(md) * 2);

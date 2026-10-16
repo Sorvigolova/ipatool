@@ -41,7 +41,13 @@ if(STATIC_BUILD AND NOT WIN32)
     # is identical everywhere, then fed to curl's configure. The app's own crypto
     # (AES-GCM / SHA-256 / MD5 / PBKDF2 / RNG) uses the same libmbedcrypto, so
     # OpenSSL is gone entirely. Override the version with -DMBEDTLS_VERSION=<x.y.z>.
-    set(MBEDTLS_VERSION "3.6.2" CACHE STRING
+    # 4.2.0: crypto moved to TF-PSA-Crypto and legacy APIs went PSA-only (our
+    # aes/sha2/protect use the PSA backend under MBEDTLS_VERSION_MAJOR>=4). 4.x
+    # still installs compat-named static libs (libmbedtls/libmbedx509/
+    # libmbedcrypto), so curl's --with-mbedtls and the byproducts below are
+    # unchanged. 4.2.0 specifically — 4.1.0 had a TLS 1.2 regression vs curl
+    # (mbedtls#10668). Needs the curl bump below (>= 8.17 understands 4.x).
+    set(MBEDTLS_VERSION "4.2.0" CACHE STRING
         "mbedTLS version to build from source for the static build")
     set(_mbedtls_cmake_args
         -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
@@ -144,12 +150,13 @@ if(STATIC_BUILD AND NOT WIN32)
         set(_curl_timestamp_opt "")
     endif()
     ExternalProject_Add(curl_static
-        # curl >= 8.8.0 is required with mbedTLS 3.6 LTS: 3.6 enables TLS 1.3 by
-        # default, whose handshake needs PSA crypto initialised, and the mbedTLS
-        # backend only began calling psa_crypto_init() in 8.8.0. Older curl (e.g.
-        # 8.7.1) fails at mbedtls_ssl_setup() with "ssl_init failed" before any
-        # connection. 8.11.1 is a stable release well past that fix.
-        URL          https://curl.se/download/curl-8.11.1.tar.gz
+        # curl's mbedTLS backend only learned to build against mbedTLS 4.x in
+        # 8.17.0 (#if MBEDTLS_VERSION_NUMBER >= 0x04000000: entropy/ctr_drbg out,
+        # key parsing + RNG via PSA). 8.16.0 and older don't compile against 4.x.
+        # 8.23.0 is a stable release well past that; it also covers the earlier
+        # 8.8.0 psa_crypto_init() fix that TLS 1.3 needs. Verified end-to-end:
+        # curl 8.23.0 + mbedTLS 4.2.0, live TLS 1.2 and TLS 1.3 handshakes OK.
+        URL          https://curl.se/download/curl-8.23.0.tar.gz
         ${_curl_timestamp_opt}
         CONFIGURE_COMMAND
             <SOURCE_DIR>/configure
@@ -182,11 +189,11 @@ if(STATIC_BUILD AND NOT WIN32)
                 --without-krb4
                 --disable-versioned-symbols
                 "CFLAGS=${_curl_cflags}"
-                # Force curl to compile against OUR from-source mbedTLS 3.6.2,
-                # not a system mbedTLS. A system 2.x (common via Homebrew/MacPorts
-                # on macOS) would make curl emit the old *_ret symbol names and the
-                # 2.x struct layouts, which then fail to link against (or silently
-                # mismatch) our 3.6.2 libs. A command-line -I is searched before
+                # Force curl to compile against OUR from-source mbedTLS, not a
+                # system one. A system 2.x (common via Homebrew/MacPorts on macOS)
+                # would make curl emit the old *_ret symbol names and 2.x struct
+                # layouts, which then fail to link against (or silently mismatch)
+                # our ${MBEDTLS_VERSION} libs. A command-line -I is searched before
                 # any compiler default / CPATH, so our headers always win.
                 "CPPFLAGS=-I${MBEDTLS_INSTALL_DIR}/include"
                 "LDFLAGS=-L${MBEDTLS_INSTALL_DIR}/lib"
@@ -231,10 +238,10 @@ if(STATIC_BUILD AND MINGW)
     endif()
     set(_CURL_INSTALL "${CMAKE_BINARY_DIR}/curl_install")
     ExternalProject_Add(curl_static_mingw
-        # Kept in lockstep with the *nix static curl above (8.11.1). This build
-        # uses Schannel, not mbedTLS, so the TLS 1.3/PSA issue doesn't apply here,
-        # but staying on one curl version avoids drift.
-        URL https://curl.se/download/curl-8.11.1.tar.gz
+        # Kept in lockstep with the *nix static curl above (8.23.0). This build
+        # uses Schannel, not mbedTLS, so the mbedTLS-4.x/TLS issues don't apply
+        # here, but staying on one curl version avoids drift.
+        URL https://curl.se/download/curl-8.23.0.tar.gz
         ${_curl_ts}
         CMAKE_ARGS
             -DCMAKE_BUILD_TYPE=Release
@@ -269,7 +276,10 @@ if(STATIC_BUILD AND MINGW)
     # mbedTLS from source for the app's own crypto (curl itself uses Schannel, so
     # only libmbedcrypto is needed here). Built with the same MinGW toolchain so
     # it links cleanly into the single-file static exe.
-    set(MBEDTLS_VERSION "3.6.2" CACHE STRING "mbedTLS version (MinGW static)")
+    # 4.2.0 (PSA backend). curl here uses Schannel, so only the crypto lib is
+    # linked; 4.x still emits a compat-named libmbedcrypto.a, so the byproduct
+    # path below is unchanged.
+    set(MBEDTLS_VERSION "4.2.0" CACHE STRING "mbedTLS version (MinGW static)")
     set(_MBEDTLS_INSTALL "${CMAKE_BINARY_DIR}/mbedtls_install")
     ExternalProject_Add(mbedtls_static_mingw
         URL https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2
@@ -411,22 +421,34 @@ set(_mbedtls_from_source FALSE)
 if(STATIC_BUILD AND (NOT WIN32 OR MINGW))
     set(_mbedtls_from_source TRUE)
 endif()
-# MSVC static links mbedcrypto.lib by explicit vcpkg path below, so it doesn't
+# MSVC static links the crypto .lib by explicit vcpkg path below, so it doesn't
 # need the CMake target — only the dynamic / non-Windows-static builds do.
+# MBED_CRYPTO_LIB holds the crypto target the final link will use; the name
+# differs by major version (2.x/3.x: mbedcrypto; 4.x: tfpsacrypto, since crypto
+# moved to the TF-PSA-Crypto project).
+set(MBED_CRYPTO_LIB "")
 if(NOT _mbedtls_from_source AND NOT (STATIC_BUILD AND WIN32))
     find_package(MbedTLS CONFIG QUIET)   # vcpkg / distros shipping MbedTLSConfig.cmake
     if(MbedTLS_FOUND)
-        message(STATUS "mbedTLS found via CMake config package")
+        if(TARGET MbedTLS::mbedcrypto)
+            set(MBED_CRYPTO_LIB MbedTLS::mbedcrypto)      # 2.x / 3.x (or 4.x compat alias)
+        elseif(TARGET MbedTLS::tfpsacrypto)
+            set(MBED_CRYPTO_LIB MbedTLS::tfpsacrypto)     # 4.x
+        else()
+            message(FATAL_ERROR "MbedTLS CMake package found but no crypto target "
+                "(MbedTLS::mbedcrypto / MbedTLS::tfpsacrypto)")
+        endif()
+        message(STATUS "mbedTLS found via CMake config package (crypto: ${MBED_CRYPTO_LIB})")
     else()
         # Older distros (notably Debian/Ubuntu with mbedTLS 2.x) install the
         # library and headers but NO MbedTLSConfig.cmake, so find_package(CONFIG)
-        # comes up empty even though mbedTLS is present. Locate libmbedcrypto and
-        # the headers by hand and wrap them in the same MbedTLS::mbedcrypto target
-        # the rest of this file links. Only mbedcrypto is needed: curl supplies
-        # its own TLS, and our app crypto (AES-GCM / SHA-256 / MD5 / PBKDF2 / RNG)
-        # lives entirely in mbedcrypto — independent of mbedx509 / mbedtls.
+        # comes up empty even though mbedTLS is present. Locate the crypto lib
+        # (3.x: libmbedcrypto; 4.x: libtfpsacrypto) and the headers by hand and
+        # wrap them in a MbedTLS::mbedcrypto target. Only the crypto part is
+        # needed: curl supplies its own TLS, and our app crypto lives entirely in
+        # it — independent of mbedx509 / mbedtls.
         find_path(MBEDTLS_INCLUDE_DIR NAMES mbedtls/version.h)
-        find_library(MBEDCRYPTO_LIBRARY NAMES mbedcrypto)
+        find_library(MBEDCRYPTO_LIBRARY NAMES mbedcrypto tfpsacrypto)
         if(NOT MBEDTLS_INCLUDE_DIR OR NOT MBEDCRYPTO_LIBRARY)
             message(FATAL_ERROR
                 "mbedTLS not found. Install it:\n"
@@ -439,6 +461,7 @@ if(NOT _mbedtls_from_source AND NOT (STATIC_BUILD AND WIN32))
         set_target_properties(MbedTLS::mbedcrypto PROPERTIES
             IMPORTED_LOCATION "${MBEDCRYPTO_LIBRARY}"
             INTERFACE_INCLUDE_DIRECTORIES "${MBEDTLS_INCLUDE_DIR}")
+        set(MBED_CRYPTO_LIB MbedTLS::mbedcrypto)
         message(STATUS "mbedTLS found manually (no CMake config): ${MBEDCRYPTO_LIBRARY}")
     endif()
 endif()
@@ -911,8 +934,9 @@ else()
     )
     if(NOT (STATIC_BUILD AND WIN32))
         # Dynamic build or non-Windows: link mbedTLS (app crypto). curl brings its
-        # own TLS backend; only libmbedcrypto is needed for our AES/SHA/MD5/PBKDF2.
-        target_link_libraries(ipatool PRIVATE MbedTLS::mbedcrypto)
+        # own TLS backend; only the crypto part is needed for our AES/SHA/MD5/
+        # PBKDF2. MBED_CRYPTO_LIB is mbedcrypto on 2.x/3.x, tfpsacrypto on 4.x.
+        target_link_libraries(ipatool PRIVATE ${MBED_CRYPTO_LIB})
     endif()
 endif()
 if(minizip_FOUND AND NOT MINGW)
@@ -978,17 +1002,22 @@ if(WIN32)
         get_filename_component(_VCPKG_ROOT "${_TC}" DIRECTORY)  # vcpkg root
         set(_SSL_STATIC_DIR "${_VCPKG_ROOT}/installed/x64-windows-static")
         message(STATUS "Static mbedTLS dir: ${_SSL_STATIC_DIR}")
-        if(NOT EXISTS "${_SSL_STATIC_DIR}/lib/mbedcrypto.lib")
+        # 4.x renamed the crypto lib mbedcrypto → tfpsacrypto; 2.x/3.x ship
+        # mbedcrypto.lib. Pick whichever vcpkg installed.
+        if(EXISTS "${_SSL_STATIC_DIR}/lib/tfpsacrypto.lib")
+            set(_MBED_CRYPTO_LIB "${_SSL_STATIC_DIR}/lib/tfpsacrypto.lib")  # mbedTLS 4.x
+        elseif(EXISTS "${_SSL_STATIC_DIR}/lib/mbedcrypto.lib")
+            set(_MBED_CRYPTO_LIB "${_SSL_STATIC_DIR}/lib/mbedcrypto.lib")   # mbedTLS 2.x/3.x
+        else()
             message(FATAL_ERROR
-                "mbedcrypto.lib not found at ${_SSL_STATIC_DIR}/lib/\n"
+                "Neither tfpsacrypto.lib (4.x) nor mbedcrypto.lib (2.x/3.x) found at "
+                "${_SSL_STATIC_DIR}/lib/\n"
                 "Run: vcpkg install mbedtls:x64-windows-static")
         endif()
         target_include_directories(ipatool PRIVATE "${_SSL_STATIC_DIR}/include")
-        # curl uses Schannel on Windows, so only mbedcrypto (the app-crypto part)
-        # is linked here — no libssl/mbedtls/mbedx509 needed.
-        target_link_libraries(ipatool PRIVATE
-            "${_SSL_STATIC_DIR}/lib/mbedcrypto.lib"
-        )
+        # curl uses Schannel on Windows, so only the crypto lib (the app-crypto
+        # part) is linked here — no libssl/mbedtls/mbedx509 needed.
+        target_link_libraries(ipatool PRIVATE "${_MBED_CRYPTO_LIB}")
     endif()
   else()
     # ── MinGW-w64 (GCC) ─────────────────────────────────────────────────────────

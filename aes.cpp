@@ -1,12 +1,94 @@
 #include "aes.h"
-#include <mbedtls/gcm.h>
+#include <mbedtls/version.h>   // MBEDTLS_VERSION_MAJOR
+
+// AES-GCM. Output is byte-identical to the previous OpenSSL EVP implementation
+// for the same key/iv/aad/plaintext, so existing account files stay decryptable.
+//
+// Two backends, chosen by mbedTLS major version:
+//   • 2.x / 3.x — the legacy low-level mbedtls_gcm_* API.
+//   • 4.x       — those APIs were removed; crypto moved to PSA (TF-PSA-Crypto),
+//                 so we go through psa_aead_*. PSA appends the tag to the
+//                 ciphertext, which we split/join to keep our (ct, tag) shape.
+// The algorithm and parameters are the same either way → identical bytes.
+
+#if MBEDTLS_VERSION_MAJOR >= 4
+#  include <psa/crypto.h>
+
+namespace {
+// psa_crypto_init() is idempotent; run it once per process on first use.
+void ensure_psa() {
+    static const psa_status_t s = psa_crypto_init();
+    (void)s;
+}
+} // namespace
 
 namespace aes {
 
-// AES-GCM via mbedTLS. Key length selects the cipher: 16 bytes → AES-128-GCM,
-// 32 bytes → AES-256-GCM (keybits = key.size() * 8). Output is byte-identical to
-// the previous OpenSSL EVP implementation for the same key/iv/aad/plaintext, so
-// existing account files stay decryptable.
+GcmOutput gcm_encrypt(const Bytes& key, const Bytes& iv,
+                      const Bytes& plaintext, const Bytes& aad) {
+    ensure_psa();
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attr, PSA_ALG_GCM);
+    psa_set_key_type(&attr, PSA_KEY_TYPE_AES);
+    psa_key_id_t k = 0;
+    if (psa_import_key(&attr, key.data(), key.size(), &k) != PSA_SUCCESS)
+        throw std::runtime_error("aes::gcm_encrypt: key import failed");
+
+    Bytes  out(plaintext.size() + 16);   // ciphertext || 16-byte tag
+    size_t olen = 0;
+    psa_status_t s = psa_aead_encrypt(
+        k, PSA_ALG_GCM, iv.data(), iv.size(),
+        aad.data(), aad.size(),
+        plaintext.data(), plaintext.size(),
+        out.data(), out.size(), &olen);
+    psa_destroy_key(k);
+    if (s != PSA_SUCCESS || olen < 16)
+        throw std::runtime_error("aes::gcm_encrypt: encryption failed");
+
+    size_t ctlen = olen - 16;
+    return { Bytes(out.begin(), out.begin() + ctlen),
+             Bytes(out.begin() + ctlen, out.begin() + olen) };
+}
+
+Bytes gcm_decrypt(const Bytes& key, const Bytes& iv,
+                  const Bytes& ciphertext, const Bytes& tag,
+                  const Bytes& aad) {
+    ensure_psa();
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attr, PSA_ALG_GCM);
+    psa_set_key_type(&attr, PSA_KEY_TYPE_AES);
+    psa_key_id_t k = 0;
+    if (psa_import_key(&attr, key.data(), key.size(), &k) != PSA_SUCCESS)
+        throw std::runtime_error("aes::gcm_decrypt: key import failed");
+
+    // PSA wants ciphertext||tag as one buffer.
+    Bytes in;
+    in.reserve(ciphertext.size() + tag.size());
+    in.insert(in.end(), ciphertext.begin(), ciphertext.end());
+    in.insert(in.end(), tag.begin(), tag.end());
+
+    Bytes  plain(ciphertext.size());
+    size_t olen = 0;
+    psa_status_t s = psa_aead_decrypt(
+        k, PSA_ALG_GCM, iv.data(), iv.size(),
+        aad.data(), aad.size(),
+        in.data(), in.size(),
+        plain.data(), plain.size(), &olen);
+    psa_destroy_key(k);
+    if (s != PSA_SUCCESS)
+        throw std::runtime_error("aes::gcm_decrypt: authentication tag mismatch");
+    plain.resize(olen);
+    return plain;
+}
+
+} // namespace aes
+
+#else  // ── mbedTLS 2.x / 3.x: legacy low-level GCM ─────────────────────────────
+#  include <mbedtls/gcm.h>
+
+namespace aes {
 
 GcmOutput gcm_encrypt(const Bytes& key, const Bytes& iv,
                       const Bytes& plaintext, const Bytes& aad) {
@@ -60,3 +142,5 @@ Bytes gcm_decrypt(const Bytes& key, const Bytes& iv,
 }
 
 } // namespace aes
+
+#endif

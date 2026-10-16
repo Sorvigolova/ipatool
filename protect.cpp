@@ -5,8 +5,13 @@
 #include <string.h>  // memset_s on macOS (Darwin declares it unconditionally)
 #include <functional>
 #include <stdexcept>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/entropy.h>
+#include <mbedtls/version.h>   // MBEDTLS_VERSION_MAJOR
+#if MBEDTLS_VERSION_MAJOR >= 4
+#  include <psa/crypto.h>      // 4.x: RNG via PSA (ctr_drbg/entropy setup removed)
+#else
+#  include <mbedtls/ctr_drbg.h>
+#  include <mbedtls/entropy.h>
+#endif
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -28,6 +33,13 @@ static const int MEM_TAG_LEN = 16;
 
 void secure_random(uint8_t* buf, size_t len) {
     if (len == 0) return;
+#if MBEDTLS_VERSION_MAJOR >= 4
+    // 4.x: the explicit entropy + CTR_DRBG setup is gone — PSA owns the RNG.
+    static const psa_status_t initrc = psa_crypto_init();   // idempotent, once
+    (void)initrc;
+    if (psa_generate_random(buf, len) != PSA_SUCCESS)
+        throw std::runtime_error("secure_random: RNG draw failed");
+#else
     // Lazily seed one process-wide CTR_DRBG from the platform entropy source.
     static mbedtls_entropy_context  entropy;
     static mbedtls_ctr_drbg_context ctr;
@@ -44,6 +56,7 @@ void secure_random(uint8_t* buf, size_t len) {
     (void)seeded;
     if (mbedtls_ctr_drbg_random(&ctr, buf, len) != 0)
         throw std::runtime_error("secure_random: RNG draw failed");
+#endif
 }
 
 void secure_zero(void* ptr, size_t len) {
