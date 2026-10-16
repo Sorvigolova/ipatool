@@ -1135,6 +1135,18 @@ std::string min_os_from_info_plist(const std::string& plistBytes) {
     } catch (const std::exception&) { return ""; }
 }
 
+// Read CFBundleSupportedPlatforms out of an Info.plist blob (e.g. ["iPhoneOS"]).
+// Empty if the key is absent or the plist can't be parsed.
+std::vector<std::string> platforms_from_info_plist(const std::string& plistBytes) {
+    std::vector<std::string> result;
+    try {
+        PlistDict info = decode_plist(plistBytes);
+        for (const auto& v : dict_arr(info, "CFBundleSupportedPlatforms"))
+            if (v.isString() && !v.str().empty()) result.push_back(v.str());
+    } catch (const std::exception&) { /* best-effort — leave empty */ }
+    return result;
+}
+
 // ── macOS: minimum OS from the preflight package (.pfpkg) ────────────────────
 // A macOS app has no iOS-style Info.plist; the store instead exposes a tiny
 // "preflightPackageURL". That resource is a XAR archive (magic "xar!") whose
@@ -1253,8 +1265,10 @@ AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account&
         // iOS: Payload/<App>.app/Info.plist → MinimumOSVersion (range-ZIP).
         try {
             std::string infoPlist;
-            if (fetch_ipa_info_plist(m_http, ipaURL, infoPlist))
-                out.minimumOSVersion = min_os_from_info_plist(infoPlist);
+            if (fetch_ipa_info_plist(m_http, ipaURL, infoPlist)) {
+                out.minimumOSVersion   = min_os_from_info_plist(infoPlist);
+                out.supportedPlatforms = platforms_from_info_plist(infoPlist);
+            }
         } catch (const std::exception&) { /* best-effort — leave empty */ }
     } else {
         // macOS: there's no .ipa; the store exposes a small preflight package
@@ -1267,8 +1281,12 @@ AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account&
             try {
                 // whole file, following redirects; cap guards a surprise large asset
                 HttpResponse pf = m_http.get_range(pfURL, "0-", 64u * 1024 * 1024);
-                if (!pf.body.empty())
-                    out.minimumOSVersion = min_os_from_pfpkg(pf.body);
+                if (!pf.body.empty()) {
+                    // A preflight package means this is a macOS title — there is
+                    // no CFBundleSupportedPlatforms to read, so set it explicitly.
+                    out.supportedPlatforms = {"macOS"};
+                    out.minimumOSVersion   = min_os_from_pfpkg(pf.body);
+                }
             } catch (const std::exception&) { /* best-effort — leave empty */ }
         }
     }

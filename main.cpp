@@ -1069,6 +1069,10 @@ static void cmd_get_version_metadata(const Args& args) {
         // omitted entirely otherwise.
         if (!out.minimumOSVersion.empty())
             j["minimumOSVersion"] = out.minimumOSVersion;
+        // iOS: CFBundleSupportedPlatforms from the IPA's Info.plist; macOS: ["macOS"]
+        // when a preflight package was fetched. Omitted when empty (best-effort).
+        if (!out.supportedPlatforms.empty())
+            j["supportedPlatforms"] = out.supportedPlatforms;
         j["success"]           = true;
         log_output(j);
     };

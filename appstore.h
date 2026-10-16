@@ -162,6 +162,7 @@ public:
         std::string displayVersion;
         std::string releaseDate;
         std::string minimumOSVersion;   // best-effort, read from the IPA's Info.plist
+        std::vector<std::string> supportedPlatforms;  // CFBundleSupportedPlatforms (iOS); ["macOS"] for a mac pkg
     };
 
     GetVersionMetadataOutput get_version_metadata(const Account& acc,
