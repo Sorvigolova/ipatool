@@ -617,6 +617,50 @@ elseif(NOT WIN32 OR MINGW)
     # targets get built, which is huge and slow). We only emulate x86-64.
     set(UNICORN_ARCH "x86" CACHE STRING "" FORCE)
     FetchContent_MakeAvailable(unicorn_src)
+
+    # ── Windows CFG fix: MinGW setjmp/longjmp via GCC builtins ────────────────
+    # Without this, the MinGW build crashes silently at the first SAP/kbsync
+    # emulation on any machine that has Windows "Exploit protection" Control Flow
+    # Guard (CFG) enabled. QEMU/Unicorn drives the JIT with sigsetjmp in cpu_exec
+    # and returns from a translated block via longjmp (cpu_loop_exit). On Win64
+    # the CRT longjmp does SEH stack unwinding AND, under Exploit Protection,
+    # validates the longjmp target (CFG longjmp hardening). Unwinding out of
+    # JIT-generated code (which carries no unwind data) plus the target check both
+    # trigger __fastfail — a silent process kill with no crash dump and no SEH/VEH
+    # handler ever firing (exactly the symptom reported).
+    #
+    # Unicorn's os-win32.h already special-cases this for MSVC, using a custom asm
+    # _setjmp_wrapper that yields a clean jmp_buf — which is why the MSVC/vcpkg
+    # build survives the same protection. Its MinGW branch, however, used
+    # _setjmp(env, NULL), which still goes through the CRT longjmp and dies under
+    # CFG. We rewrite that branch to use GCC's __builtin_setjmp/__builtin_longjmp:
+    # a plain register-restore jump with no SEH unwinding and no CRT longjmp
+    # hardening, bypassing both mechanisms. jmp_buf is larger than the 5 slots the
+    # builtin needs; __builtin_longjmp only yields value 1, which cpu_exec treats
+    # as "returned via longjmp" (it checks != 0), so the control flow is preserved.
+    #
+    # Patched on disk at configure time (so it survives a fresh FetchContent
+    # clone); idempotent; os-win32.h is a header, so Ninja rebuilds every TU that
+    # includes it. Only affects the MinGW-from-source build — MSVC/system Unicorn
+    # is untouched.
+    set(_OSW_FILE "${unicorn_src_SOURCE_DIR}/qemu/include/sysemu/os-win32.h")
+    if(EXISTS "${_OSW_FILE}")
+        file(READ "${_OSW_FILE}" _OSW_SRC)
+        string(FIND "${_OSW_SRC}" "ipatool: MinGW builtin setjmp" _OSW_DONE)
+        if(_OSW_DONE EQUAL -1)
+            string(REPLACE
+                "#else // MingW\n\n#undef setjmp\n#define setjmp(env) _setjmp(env, NULL)\n#endif"
+                "#else // MinGW -- ipatool: MinGW builtin setjmp (Windows CFG fix)\n/* GCC builtins: a plain register-restore jump with NO SEH stack unwinding and\n * NO CRT longjmp hardening. On Win64 the CRT longjmp unwinds the stack and,\n * under Windows Exploit Protection, validates the longjmp target (CFG longjmp\n * hardening); both __fastfail when returning out of JIT-generated code via\n * cpu_loop_exit. The builtins bypass the CRT entirely. */\n#undef setjmp\n#define setjmp(env) __builtin_setjmp(env)\n#undef longjmp\n#define longjmp(env, val) __builtin_longjmp((env), 1)\n#endif"
+                _OSW_SRC "${_OSW_SRC}")
+            file(WRITE "${_OSW_FILE}" "${_OSW_SRC}")
+            message(STATUS "Unicorn os-win32.h patched — MinGW setjmp/longjmp via GCC builtins (Windows CFG fix)")
+        else()
+            message(STATUS "Unicorn os-win32.h already patched (MinGW builtin setjmp/longjmp)")
+        endif()
+    else()
+        message(WARNING "os-win32.h not found at ${_OSW_FILE} — Windows CFG setjmp fix NOT applied")
+    endif()
+
     set(UNICORN_LIBRARY unicorn)
     set(UNICORN_INCLUDE_DIR ${unicorn_src_SOURCE_DIR}/include)
     message(STATUS "Unicorn built from source: ${UNICORN_INCLUDE_DIR}")
