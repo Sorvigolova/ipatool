@@ -2449,84 +2449,22 @@ void AppStore::patch_with_minizip(const std::string& srcPath,
 }
 
 // Extract a string value from a binary or XML plist by key name.
-// Used to read CFBundleExecutable from Info.plist without a full plist parser.
+// Binary plist keys and values are linked by object references.
 std::string AppStore::extract_plist_string(const std::vector<uint8_t>& data,
                                          const std::string& key)
 {
-    // Try XML first
-    std::string s(data.begin(), data.end());
-    size_t kpos = s.find("<key>" + key + "</key>");
-    if (kpos != std::string::npos) {
-        size_t vs = s.find("<string>", kpos);
-        size_t ve = s.find("</string>", vs);
-        if (vs != std::string::npos && ve != std::string::npos)
-            return s.substr(vs + 8, ve - vs - 8);
-    }
-    // Binary plist: key is preceded by its length byte, value follows similarly.
-    // Simple scan: find the key bytes and read the next string atom.
-    // Sufficient for short ASCII values like CFBundleExecutable.
-    for (size_t i = 0; i + key.size() < data.size(); i++) {
-        if (memcmp(data.data() + i, key.data(), key.size()) == 0) {
-            // Found key string; next string atom in binary plist follows
-            // after a string marker byte (0x5N where N=length, or 0x6N for UTF-16)
-            size_t j = i + key.size();
-            while (j < data.size()) {
-                uint8_t b = data[j++];
-                if ((b & 0xF0) == 0x50) { // ASCII string, length = b & 0x0F
-                    int len = b & 0x0F;
-                    if (j + len <= data.size())
-                        return std::string((char*)data.data() + j, len);
-                }
-            }
-        }
-    }
-    return "";
+    const auto plist = decode_plist(std::string(data.begin(), data.end()));
+    const auto it = plist.find(key);
+    return it != plist.end() && it->second.isString() ? it->second.str() : "";
 }
 
 // Parse SinfPaths array from SC_Info/Manifest.plist (XML or binary plist)
 std::vector<std::string> AppStore::extract_sinf_paths(const std::vector<uint8_t>& data)
 {
+    const auto plist = decode_plist(std::string(data.begin(), data.end()));
     std::vector<std::string> paths;
-    std::string s(data.begin(), data.end());
-    // XML plist path
-    size_t kpos = s.find("<key>SinfPaths</key>");
-    if (kpos != std::string::npos) {
-        size_t astart = s.find("<array>", kpos);
-        size_t aend   = s.find("</array>", astart);
-        if (astart != std::string::npos && aend != std::string::npos) {
-            std::string arr = s.substr(astart + 7, aend - astart - 7);
-            size_t pos = 0;
-            while (true) {
-                size_t vs = arr.find("<string>", pos);
-                size_t ve = arr.find("</string>", vs);
-                if (vs == std::string::npos || ve == std::string::npos) break;
-                paths.push_back(arr.substr(vs + 8, ve - vs - 8));
-                pos = ve + 9;
-            }
-        }
-        return paths;
-    }
-    // Binary plist: scan for "SinfPaths" key then collect following string atoms
-    const std::string marker = "SinfPaths";
-    size_t mpos = s.find(marker);
-    if (mpos != std::string::npos) {
-        size_t j = mpos + marker.size();
-        // Skip array marker
-        while (j < data.size() && (data[j] & 0xF0) != 0x50 && (data[j] & 0xF0) != 0xA0) j++;
-        if (j < data.size() && (data[j] & 0xF0) == 0xA0) {
-            int count = data[j] & 0x0F;
-            j++;
-            for (int i = 0; i < count && j < data.size(); i++) {
-                uint8_t b = data[j++];
-                if ((b & 0xF0) == 0x50) {
-                    int len = b & 0x0F;
-                    if (j + len <= data.size()) {
-                        paths.push_back(std::string((char*)data.data() + j, len));
-                        j += len;
-                    }
-                }
-            }
-        }
+    for (const auto& value : dict_arr(plist, "SinfPaths")) {
+        if (value.isString()) paths.push_back(value.str());
     }
     return paths;
 }
