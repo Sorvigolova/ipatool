@@ -290,6 +290,9 @@ private:
                          const std::string& guid, const std::string& pricingParam);
 
     // ── ZIP patching ──────────────────────────────────────────────────────────
+    // Allow regression tests to exercise the ZIP patcher without Store requests.
+    friend struct AppStoreTestAccess;
+
     // Injects a patched iTunesMetadata.plist into the downloaded IPA.
     // Uses minizip when available; falls back to a pure C++ copy without patching.
     //
@@ -314,7 +317,7 @@ private:
                                    const std::vector<Sinf>& sinfs);
 
     // Extract a string value from a binary or XML plist by key name.
-    // Used to read CFBundleExecutable from Info.plist without a full plist parser.
+    // Uses the shared decoder to resolve CFBundleExecutable in Info.plist.
     static std::string extract_plist_string(const std::vector<uint8_t>& data,
                                              const std::string& key);
 

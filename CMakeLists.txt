@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
+option(IPATOOL_BUILD_TESTS "Build offline IPA patching regression tests" OFF)
+
 # ── Static linking option (must be before project() for MSVC CRT selection) ───
 option(STATIC_BUILD "Build a static binary (Linux, macOS, and Windows)" OFF)
 
@@ -1195,3 +1197,21 @@ else()
     message(STATUS "    (libunicorn-dev is optional / often unpackaged on Ubuntu — if apt can't find it, drop it; unicorn is built from source)")
 endif()
 message(STATUS "")
+
+if(IPATOOL_BUILD_TESTS)
+    if(NOT MINIZIP_ENABLED)
+        message(FATAL_ERROR "IPA patching tests require minizip support")
+    endif()
+    enable_testing()
+    get_target_property(_ipa_test_sources ipatool SOURCES)
+    list(REMOVE_ITEM _ipa_test_sources main.cpp)
+    add_executable(ipa_patching_test tests/ipa_patching_test.cpp ${_ipa_test_sources})
+    target_include_directories(ipa_patching_test PRIVATE $<TARGET_PROPERTY:ipatool,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(ipa_patching_test PRIVATE $<TARGET_PROPERTY:ipatool,COMPILE_DEFINITIONS>)
+    target_compile_options(ipa_patching_test PRIVATE $<TARGET_PROPERTY:ipatool,COMPILE_OPTIONS>)
+    target_link_directories(ipa_patching_test PRIVATE $<TARGET_PROPERTY:ipatool,LINK_DIRECTORIES>)
+    target_link_options(ipa_patching_test PRIVATE $<TARGET_PROPERTY:ipatool,LINK_OPTIONS>)
+    target_link_libraries(ipa_patching_test PRIVATE $<TARGET_PROPERTY:ipatool,LINK_LIBRARIES>)
+    add_dependencies(ipa_patching_test ipatool)
+    add_test(NAME ipa_patching COMMAND ipa_patching_test "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+endif()

@@ -530,3 +530,17 @@ On Windows these are in `%USERPROFILE%\.ipatool\`. The account file is always en
 - `CMakeLists.txt` — cross-platform build (vcpkg + static support + asset embedding)
 - `sap_assets/` — Apple FairPlay dylibs embedded at build time (not tracked for redistribution)
 ```
+
+## Offline regression tests
+
+Enable the IPA patching tests alongside your usual build options:
+
+```sh
+cmake -S . -B build -DIPATOOL_BUILD_TESTS=ON
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+These tests require minizip and use synthetic plists, executable bytes and licenses;
+no Apple Account or App Store connection is needed to run them. Binary plist
+fixtures are checked in. To regenerate them, run `python3 tests/generate_plist_fixtures.py`.
