@@ -314,7 +314,6 @@ private:
                                    const std::vector<Sinf>& sinfs);
 
     // Extract a string value from a binary or XML plist by key name.
-    // Used to read CFBundleExecutable from Info.plist without a full plist parser.
     static std::string extract_plist_string(const std::vector<uint8_t>& data,
                                              const std::string& key);
 
