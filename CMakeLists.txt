@@ -529,6 +529,7 @@ elseif(APPLE)
         GIT_REPOSITORY https://github.com/unicorn-engine/unicorn.git
         GIT_TAG        2.1.4
         GIT_SHALLOW    TRUE
+        LIST_SEPARATOR |
         ${_curl_timestamp_opt}
         CMAKE_ARGS
             -DCMAKE_BUILD_TYPE=Release
@@ -538,10 +539,9 @@ elseif(APPLE)
             -DUNICORN_BUILD_SHARED=OFF
             -DUNICORN_BUILD_SAMPLES=OFF
             -DUNICORN_BUILD_TESTS=OFF
-            -DUNICORN_ARCH=x86
+            -DUNICORN_ARCH=x86|aarch64
             -DUNICORN_ARCH_X86=ON
             -DUNICORN_ARCH_ARM=OFF
-            -DUNICORN_ARCH_ARM64=OFF
             -DUNICORN_ARCH_MIPS=OFF
             -DUNICORN_ARCH_SPARC=OFF
             -DUNICORN_ARCH_PPC=OFF
@@ -600,8 +600,8 @@ echo \"unicorn patched: crc32c.c.o removed, crc32c stub added\"
     message(STATUS "Unicorn will be built as static lib: ${UNICORN_LIBRARY}")
 elseif(NOT WIN32 OR MINGW)
     # Linux / MinGW-w64: build from source with the same GCC toolchain (fast TCG,
-    # unlike an MSVC-built Unicorn). Static x86-only lib, ~30s.
-    message(STATUS "System Unicorn not found — building from source (x86 only, ~30s)")
+    # unlike an MSVC-built Unicorn). SAP needs x86 and Store ADI needs AArch64.
+    message(STATUS "System Unicorn not found — building x86 and AArch64 from source")
     include(FetchContent)
     FetchContent_Declare(
         unicorn_src
@@ -614,8 +614,8 @@ elseif(NOT WIN32 OR MINGW)
     set(UNICORN_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
     # unicorn 2.1.x selects targets via the UNICORN_ARCH *string* list, not the
     # per-arch UNICORN_ARCH_<NAME> booleans (those are ignored → all 16 QEMU
-    # targets get built, which is huge and slow). We only emulate x86-64.
-    set(UNICORN_ARCH "x86" CACHE STRING "" FORCE)
+    # targets get built, which is huge and slow).
+    set(UNICORN_ARCH "x86;aarch64" CACHE STRING "" FORCE)
     FetchContent_MakeAvailable(unicorn_src)
 
     # ── Windows CFG fix: MinGW setjmp/longjmp via GCC builtins ────────────────
@@ -683,6 +683,7 @@ add_executable(ipatool
     hwid.cpp
     device_mac.cpp
     appstore.cpp
+    store_adi.cpp
     http_client.cpp
     plist.cpp
     sha2.cpp
