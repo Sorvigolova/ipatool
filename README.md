@@ -10,7 +10,7 @@ Uses **libcurl** for networking and a small **Unicorn Engine** sandbox to run Ap
 ## What it does
 
 - Authenticates with the App Store and downloads apps you own as `.ipa` (iOS) or decrypted `.pkg` (macOS).
-- Signs every authentication request with an Apple **SAP action signature** (`X-Apple-ActionSignature`), required by the modern App Store protocol.
+- Uses native Store authentication with local Store AMD proof on Windows, Linux, and macOS.
 - Generates a **kbsync** blob locally and uses it to sign the `volumeStoreDownloadProduct` download request, with a `redownloadProduct → updateProduct` fallback cascade.
 - Decrypts encrypted macOS `.pkg` downloads.
 
@@ -57,7 +57,7 @@ ipatool-cpp protects your Apple ID credentials using machine-bound encryption �
 | libcurl | HTTPS networking (Schannel on Windows, mbedTLS elsewhere) |
 | mbedTLS (`libmbedcrypto`) | AES-256-GCM, SHA-256, MD5, PBKDF2, HMAC, secure RNG |
 | nlohmann-json | iTunes Search/Lookup JSON parsing |
-| Unicorn Engine | x86-64 sandbox for SAP signing / kbsync / .pkg decryption |
+| Unicorn Engine | x86-64 for SAP, kbsync and package decryption, plus AArch64 for Store AMD |
 | minizip *(optional)* | IPA repacking (falls back to a plain copy if absent) |
 
 > The app's own crypto (account-file and in-memory encryption) uses mbedTLS's
@@ -146,7 +146,7 @@ What the build does automatically:
   brotli/zstd/idn2/psl/libssh2/nghttp2/3/ngtcp2.
 - Builds **mbedTLS from source** and statically links `libmbedcrypto` for the
   app's own crypto (AES-256-GCM / SHA-256 / MD5 / PBKDF2 / RNG).
-- Builds **Unicorn (x86-only) from source** with GCC → fast, static.
+- Builds **Unicorn (x86 and AArch64) from source** with GCC for a static executable.
 - Statically links minizip, zlib and bzip2, plus
   `-static -static-libgcc -static-libstdc++`.
 
@@ -335,7 +335,9 @@ kbsync flags:
 ```
 ipatool auth login -e EMAIL -p PASSWORD [--auth-code CODE] [--keychain-passphrase PASSPHRASE]
 ```
-Authenticates with the App Store and saves credentials to `~/.ipatool/account`. Every authenticate request is SAP-signed; login is refused if the bag has no usable SAP configuration. If 2FA is enabled and `--auth-code` is omitted, you are prompted interactively.
+Authenticates with the App Store and saves credentials to `~/.ipatool/account`. If 2FA is enabled and `--auth-code` is omitted, you are prompted interactively.
+
+IPATool generates Store AMD proof in its built-in Unicorn sandbox. First-time device registration downloads two verified ADI libraries from Apple's official Android package and caches them alongside the device state in `~/.ipatool/store-proof`. A previous helper's device state is migrated automatically. The executable uses the same local authentication and download code on Windows, Linux and macOS.
 
 #### `auth info`
 ```

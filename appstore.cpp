@@ -2,6 +2,7 @@
 #include "SapSigner.h"   // SAP signing (v2.4.0+)
 #include "device_mac.h"  // device MAC / GUID
 #include "StoreAgentMachine.h"
+#include "store_proof.h"
 #include <thread>
 #include <chrono>
 #include <fstream>
@@ -462,6 +463,17 @@ static bool is_redownload_unavailable(const PlistDict& d) {
 // AppStore — Login
 // ─────────────────────────────────────────────────────────────────────────────
 
+static HttpResponse commerce_store_post(HttpClient& http, const std::string& url,
+    const std::string& body, std::map<std::string, std::string> headers,
+    const Account& account, const std::string& guid) {
+    if (ipt::store_proof_url(url)) {
+        headers["X-Token"] = account.passwordToken.get();
+        headers["X-Apple-Store-Front"] = account.storeFront;
+        return ipt::store_proof_post(http, url, body, std::move(headers), guid);
+    }
+    return http.post(url, body, headers);
+}
+
 Account AppStore::login(const std::string& email,
               const std::string& password,
               const std::string& authCode,
@@ -469,14 +481,11 @@ Account AppStore::login(const std::string& email,
 {
     std::string guid = get_guid();
 
-    // Fetch bag for both the auth endpoint and SAP config
+    const bool defaultEndpoint = endpoint.empty();
     BagOutput bag = fetch_bag(guid);
-    std::string loginEndpoint = endpoint.empty() ? bag.authEndpoint : endpoint;
-
-    // Create SAP signer — performs handshake with Apple servers (v2.4.0+).
-    // Apple rejects unsigned authenticate requests and still counts them as
-    // failed sign-ins (repeated failures lock the Apple ID), so any SAP problem
-    // stops the login before a single request is sent — same as the Go version.
+    const auto& authEndpoint = defaultEndpoint ? bag.authEndpoint : endpoint;
+    if (defaultEndpoint && !ipt::store_auth_url(authEndpoint))
+        throw IpaError("Apple did not advertise a supported native Store authentication endpoint");
     if (bag.signSapSetup.empty() || bag.signSapSetupCert.empty()
         || bag.sapVersion != 200 || bag.hardwareID.empty())
         throw IpaError("bag has no usable SAP signing configuration; "
@@ -504,7 +513,7 @@ Account AppStore::login(const std::string& email,
         throw IpaError("failed to initialize SAP signer");
     if (m_debug) fprintf(stderr, "[DEBUG] SAP signer initialized OK\n");
 
-    return do_login(email, password, authCode, guid, loginEndpoint, *signer);
+    return do_login(email, password, authCode, guid, authEndpoint, *signer);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1017,9 +1026,9 @@ std::vector<uint8_t> http_range(const HttpClient& http, const std::string& url,
     return std::vector<uint8_t>(r.body.begin(), r.body.end());
 }
 
-// Pull Payload/<App>.app/Info.plist out of the remote .ipa. false on any issue.
-bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url,
-                          std::string& outPlist) {
+// Pull one entry from a remote ZIP by name, or locate the main app's Info.plist.
+bool fetch_zip_entry(const HttpClient& http, const std::string& url,
+                     std::string& output, std::string_view exactEntry = {}) {
     int64_t size = http_total_size(http, url);
     if (size <= 0) return false;
 
@@ -1058,7 +1067,7 @@ bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url,
     }
     if (cdOffset < 0 || cdSize <= 0 || cdOffset + cdSize > size) return false;
 
-    // 3. Scan the central directory for the MAIN app's Info.plist.
+    // 3. Scan the central directory for the requested entry.
     std::vector<uint8_t> cd = http_range(http, url, cdOffset, cdSize);
     if ((int64_t)cd.size() != cdSize) return false;
 
@@ -1079,7 +1088,7 @@ bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url,
         if (p + 46 + nl > cd.size()) break;
         std::string name(reinterpret_cast<const char*>(&cd[p + 46]), nl);
 
-        if (std::regex_match(name, mainInfo)) {
+        if (exactEntry.empty() ? std::regex_match(name, mainInfo) : name == exactEntry) {
             int64_t cs64 = cs, us64 = us, lo64 = lo;
             // ZIP64 extra (id 0x0001) supplies 64-bit values for whichever
             // 32-bit fields read 0xFFFFFFFF, in order: uncomp, comp, localoff.
@@ -1103,7 +1112,8 @@ bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url,
         }
         p += 46 + nl + el + cl;
     }
-    if (localOff < 0 || compSize < 0 || (method != 0 && method != 8)) return false;
+    if (localOff < 0 || compSize < 0 || uncompSize < 0 || (method != 0 && method != 8)) return false;
+    if (!exactEntry.empty() && (compSize > 16 * 1024 * 1024 || uncompSize > 16 * 1024 * 1024)) return false;
     if (localOff + 30 > size) return false;
 
     // 4. Read the local file header for the true data offset, then the bytes.
@@ -1119,10 +1129,14 @@ bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url,
 
     // 5. Stored (0) or raw-deflate (8).
     if (method == 0) {
-        outPlist.assign(reinterpret_cast<const char*>(data.data()), data.size());
+        output.assign(reinterpret_cast<const char*>(data.data()), data.size());
         return true;
     }
-    return zip_inflate_raw(data.data(), data.size(), (size_t)uncompSize, outPlist);
+    return zip_inflate_raw(data.data(), data.size(), (size_t)uncompSize, output);
+}
+
+bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url, std::string& output) {
+    return fetch_zip_entry(http, url, output);
 }
 
 // Read MinimumOSVersion out of an Info.plist blob (binary or XML). "" if absent.
@@ -1211,6 +1225,11 @@ std::string min_os_from_pfpkg(const std::string& fileBytes) {
 }
 
 } // namespace
+
+bool ipt::fetch_remote_zip_entry(const HttpClient& http, const std::string& url,
+                                 std::string_view name, std::string& output) {
+    return fetch_zip_entry(http, url, output, name);
+}
 
 AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account& acc,
                                                const App& app,
@@ -1398,7 +1417,7 @@ PlistDict AppStore::volume_store_download_product(const Account& acc, const App&
 
     std::string body = encode_plist_xml(p);
     if (m_debug) debug_dump_request("volumeStoreDownload", "POST", url, hdrs, body);
-    HttpResponse res = m_http.post(url, body, hdrs);
+    HttpResponse res = commerce_store_post(m_http, url, body, hdrs, acc, guid);
     httpStatus = res.statusCode;
     if (m_debug) debug_dump_response("volumeStoreDownload", res);
     return decode_plist(res.body);
@@ -1695,7 +1714,7 @@ PlistDict AppStore::redownload_product(const Account& acc, const App& app,
     std::string url  = redownloadEndpoint + "?guid=" + guid;
 
     if (m_debug) debug_dump_request(label, "POST", url, hdrs, body);
-    HttpResponse res = m_http.post(url, body, hdrs);
+    HttpResponse res = commerce_store_post(m_http, url, body, hdrs, acc, guid);
     httpStatus = res.statusCode;
     if (m_debug) debug_dump_response(label, res);
 
@@ -1713,7 +1732,7 @@ PlistDict AppStore::update_product(const Account& acc, const App& app,
     std::string url  = m_updateEndpoint + "?guid=" + guid;
 
     if (m_debug) debug_dump_request("updateProduct", "POST", url, hdrs, body);
-    HttpResponse res = m_http.post(url, body, hdrs);
+    HttpResponse res = commerce_store_post(m_http, url, body, hdrs, acc, guid);
     if (m_debug) debug_dump_response("updateProduct", res);
 
     PlistDict data = decode_plist_safe(res.body);
@@ -1881,7 +1900,10 @@ AppStore::BagOutput AppStore::fetch_bag(const std::string& guidArg) {
     std::string guid = guidArg.empty() ? get_guid() : guidArg;
     std::string url = std::string("https://") + PRIVATE_INIT_DOMAIN
                     + PRIVATE_INIT_PATH + "?guid=" + guid;
-    HttpResponse res = m_http.get(url, {{"Accept", "application/xml"}});
+    std::map<std::string, std::string> headers = {{"Accept", "application/xml"}};
+    headers["User-Agent"] = ipt::store_user_agent;
+    url += "&ix=6";
+    HttpResponse res = m_http.get(url, headers);
 
     // Bag body is huge — log only status and size.
     if (m_debug)
@@ -1895,24 +1917,19 @@ AppStore::BagOutput AppStore::fetch_bag(const std::string& guidArg) {
 
     BagOutput out;
 
-    // Extract redownloadProduct (simple flat lookup under urlBag)
+    // Configurator 2.21 can receive a flat bag rather than a urlBag wrapper.
     auto ubIt = d.find("urlBag");
-    if (ubIt != d.end() && ubIt->second.isDict()) {
-        out.redownloadEndpoint  = dict_str(ubIt->second.dictVal, "redownloadProduct");
-        out.updateEndpoint      = dict_str(ubIt->second.dictVal, "updateProduct");
-        out.volumeStoreDownloadEndpoint = dict_str(ubIt->second.dictVal, "volumeStoreDownloadProduct");
-        out.songDownloadDoneEndpoint = dict_str(ubIt->second.dictVal, "songDownloadDone");
-        m_updateEndpoint        = out.updateEndpoint;
-
-        // ── SAP config fields (v2.4.0+) — must be extracted here, before
-        //    the early returns below for the auth endpoint. ──────────────────
-        const PlistDict& ub = ubIt->second.dictVal;
-        out.signSapSetup     = dict_str(ub, "sign-sap-setup");
-        out.signSapSetupCert = dict_str(ub, "sign-sap-setup-cert");
-        std::string sapVer   = dict_str(ub, "sign-sap-version");
-        if (!sapVer.empty()) {
-            try { out.sapVersion = (uint32_t)std::stoul(sapVer); } catch (...) {}
-        }
+    const auto& bag = ubIt != d.end() && ubIt->second.isDict() ? ubIt->second.dictVal : d;
+    out.redownloadEndpoint = dict_str(bag, "redownloadProduct");
+    out.updateEndpoint = dict_str(bag, "updateProduct");
+    out.volumeStoreDownloadEndpoint = dict_str(bag, "volumeStoreDownloadProduct");
+    out.songDownloadDoneEndpoint = dict_str(bag, "songDownloadDone");
+    m_updateEndpoint = out.updateEndpoint;
+    out.signSapSetup = dict_str(bag, "sign-sap-setup");
+    out.signSapSetupCert = dict_str(bag, "sign-sap-setup-cert");
+    const auto sapVer = dict_str(bag, "sign-sap-version");
+    if (!sapVer.empty()) {
+        try { out.sapVersion = (uint32_t)std::stoul(sapVer); } catch (...) {}
     }
 
     // Convert guid "AABBCCDDEEFF" → raw bytes for SapSigner::Config
@@ -1945,6 +1962,10 @@ AppStore::BagOutput AppStore::fetch_bag(const std::string& guidArg) {
     }
 
     FOUND_URL:
+    if (ipt::store_auth_url(ep)) {
+        out.authEndpoint = ep;
+        return out;
+    }
     if (!ep.empty()) {
         //Try to find URL addend by its path and add it to the tail
         std::string addend;
@@ -1998,12 +2019,6 @@ AppStore::BagOutput AppStore::fetch_bag(const std::string& guidArg) {
         return out;
     }
 
-    // ── Extract SAP setup fields (v2.4.0+) ───────────────────────────────
-    // Fallback to known-good hardcoded endpoint
-    fprintf(stderr,
-        "[WARN] Could not parse urlBag -- using default auth endpoint.\n"
-        "       Retry with --debug to inspect the raw server response.\n");
-    out.authEndpoint = "https://auth.itunes.apple.com/auth/v1/native/fast";
     return out;
 }
 
@@ -2051,15 +2066,18 @@ Account AppStore::do_login(const std::string& email,
                  const std::string& baseEndpoint,
                  SapSigner& signer)
 {
+    const bool nativeAuth = ipt::store_auth_url(baseEndpoint);
     std::string  currentURL   = baseEndpoint;
     bool         retry        = true;
     bool         fromRedirect = false;  // pod-redirect sets attempt=1 (Go v2.4.0 behaviour)
     HttpResponse lastRes;
     PlistDict    lastData;
+    std::string  dsid;
 
     for (int attempt = 1; retry && attempt <= 4; attempt++) {
         // Pod redirect: Apple expects attempt=1, not the outer loop counter
         int requestAttempt = fromRedirect ? 1 : attempt;
+        if (nativeAuth && !authCode.empty()) requestAttempt = 2;
         fromRedirect = false;
 
         PlistDict payload;
@@ -2073,12 +2091,10 @@ Account AppStore::do_login(const std::string& email,
         std::string body = encode_plist_xml(payload);
 
         std::map<std::string, std::string> headers = {
-            {"Content-Type", "application/x-www-form-urlencoded"},
-            {"User-Agent",   CONFIGURATOR_UA},
+            {"Content-Type", nativeAuth ? "application/x-apple-plist" : "application/x-www-form-urlencoded"},
+            {"User-Agent",   nativeAuth ? ipt::store_user_agent : CONFIGURATOR_UA},
         };
 
-        // SAP-sign the request body (v2.4.0+)
-        // Never send an unsigned attempt — it would only burn a sign-in try.
         try {
             auto sigBytes = signer.Sign(std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(body.data()), body.size()));
@@ -2094,11 +2110,26 @@ Account AppStore::do_login(const std::string& email,
         lastRes = {};
         for (int tx = 1; tx <= 3; ++tx) {
             if (m_debug) debug_dump_auth_request(currentURL, headers, body);
-            lastRes = m_http.post(currentURL, body, headers);
+            lastRes = nativeAuth ? ipt::store_proof_post(m_http, currentURL, body, headers, guid)
+                                : m_http.post(currentURL, body, headers);
             if (m_debug) debug_dump_auth_response(lastRes);
             int sc  = lastRes.statusCode;
-            if (sc == 429)
-                throw IpaError("rate limited by Apple (HTTP 429): " + lastRes.body);
+            if (sc == 429) {
+                std::string message = "rate limited by Apple (HTTP 429)";
+                const auto detail = trim_copy(lastRes.body);
+                if (!detail.empty()) message += ": " + detail;
+                const auto retryAfter = lastRes.headers.find("retry-after");
+                if (retryAfter != lastRes.headers.end()) {
+                    const auto value = trim_copy(retryAfter->second);
+                    if (!value.empty()) {
+                        if (value.find_first_not_of("0123456789") == std::string::npos)
+                            message += "\nTry again in " + value + (value == "1" ? " second." : " seconds.");
+                        else
+                            message += "\nTry again after " + value + ".";
+                    }
+                }
+                throw IpaError(message);
+            }
             bool transient = (sc == 204 || sc == 404 || sc / 100 == 5);
             if (!transient) break;
             if (m_debug)
@@ -2111,15 +2142,36 @@ Account AppStore::do_login(const std::string& email,
 
         std::string failureType     = dict_str(lastData, "failureType");
         std::string customerMessage = dict_str(lastData, "customerMessage");
+        dsid = dict_str(lastData, "dsPersonId");
+        if (nativeAuth && dsid.empty()) {
+            const auto header = lastRes.headers.find("x-dsid");
+            if (header != lastRes.headers.end()
+                && !header->second.empty()
+                && header->second.find_first_not_of("0123456789") == std::string::npos)
+                dsid = header->second;
+        }
 
-        if (lastRes.statusCode == 302) {
+        const auto status = lastRes.statusCode;
+        if (nativeAuth && (status == 301 || status == 302 || status == 307 || status == 308)) {
+            const auto location = lastRes.headers.find("location");
+            if (location == lastRes.headers.end())
+                throw IpaError("native Store authentication redirect has no location");
+            auto target = location->second;
+            if (target.starts_with("/auth/")) target = "https://auth.itunes.apple.com" + target;
+            if (!ipt::store_auth_url(target))
+                throw IpaError("unexpected native Store authentication redirect");
+            currentURL = std::move(target);
+            fromRedirect = true;
+            continue;
+        }
+        if (status == 302) {
             auto locIt = lastRes.headers.find("location");
             if (locIt == lastRes.headers.end())
                 throw IpaError("redirect with no location header");
             currentURL   = locIt->second;
             fromRedirect = true;   // Apple expects attempt=1 on the pod-redirect POST
             retry = true;
-        } else if (attempt == 1 && failureType == FAILURE_INVALID_CREDENTIALS) {
+        } else if (attempt == 1 && failureType == FAILURE_INVALID_CREDENTIALS && !nativeAuth) {
             retry = true;
         } else if (failureType.empty() && authCode.empty()
                    && customerMessage == CUSTOMER_MSG_BAD_LOGIN) {
@@ -2131,7 +2183,7 @@ Account AppStore::do_login(const std::string& email,
             throw IpaError(!customerMessage.empty() ? customerMessage : "something went wrong");
         } else if (lastRes.statusCode != 200
                    || dict_str(lastData, "passwordToken").empty()
-                   || dict_str(lastData, "dsPersonId").empty()) {
+                   || dsid.empty()) {
             throw IpaError("something went wrong (status="
                            + std::to_string(lastRes.statusCode) + ")");
         } else {
@@ -2158,8 +2210,9 @@ Account AppStore::do_login(const std::string& email,
     acc.lastName            = dict_str(addrDict, "lastName");
     acc.name                = acc.firstName + " " + acc.lastName;
     acc.email               = dict_str(dict_dict(lastData, "accountInfo"), "appleId");
+    if (nativeAuth && acc.email.empty()) acc.email = email;
     acc.passwordToken.set(  dict_str(lastData, "passwordToken"));
-    acc.directoryServicesID = dict_str(lastData, "dsPersonId");
+    acc.directoryServicesID = dsid;
     acc.storeFront          = sf;
     acc.password.set(       password);
     acc.pod                 = pod;
@@ -2202,7 +2255,7 @@ PlistDict AppStore::do_purchase(const Account& acc, const App& app,
 
     std::string body = encode_plist_xml(payload);
     if (m_debug) debug_dump_request("buyProduct", "POST", url, headers, body);
-    HttpResponse res  = m_http.post(url, body, headers);
+    HttpResponse res = commerce_store_post(m_http, url, body, headers, acc, guid);
     if (m_debug) debug_dump_response("buyProduct", res);
     PlistDict    data  = decode_plist(res.body);
 
