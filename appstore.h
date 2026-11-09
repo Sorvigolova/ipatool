@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -50,12 +51,17 @@ std::string build_query(const std::map<std::string, std::string>& params);
 
 // Forward declaration — SapSigner.h for full type
 class SapSigner;
+class StoreAgentMachine;
 
 class AppStore {
 public:
     // cookieFile: path to store session cookies (persisted between login and download)
+    // The ADI state (store AMD proof) lives next to the cookie file.
     explicit AppStore(const std::string& cookieFile = "")
-        : m_http(cookieFile) {}
+        : m_http(cookieFile) { init_store_adi(cookieFile); }
+    // The HTTP observer captures `this`.
+    AppStore(const AppStore&) = delete;
+    AppStore& operator=(const AppStore&) = delete;
 
     // ── Bag ──────────────────────────────────────────────────────────────────
 
@@ -70,6 +76,12 @@ public:
         std::string          signSapSetupCert;   // bag key sign-sap-setup-cert → https://s.mzstatic.com/sap/setupCert.plist
         uint32_t             sapVersion   = 0;   // sign-sap-version (must be 200)
         std::vector<uint8_t> hardwareID;         // raw MAC bytes for SapSigner::Config
+        // ADI provisioning endpoints — present in bag.xml?guid=&ix=6 requested
+        // as Configurator 2.21.
+        std::string          mdFinishProvisioning;   // → https://auth.itunes.apple.com/auth/v1/otp/1.0/finish
+        std::string          amdFinishProvisioning;  // → https://auth.itunes.apple.com/auth/v1/otp/1.5/finish
+        std::string          mdSyncMachine;          // → https://auth.itunes.apple.com/auth/v1/otp/1.0/sync
+        std::string          amdSyncMachine;         // → https://auth.itunes.apple.com/auth/v1/otp/1.5/sync
     };
 
     // Fetch and parse bag.xml. Returns every endpoint the download/auth flow needs
@@ -139,6 +151,17 @@ public:
 public:
     void set_debug(bool v); // also enables SapSigner HTTP dumps
 
+    // ── Store AMD (anisette) — 10.9 CoreADI under storeagent emulation ───────
+    // Native authentication (bag.xml?guid=&ix=6 → /auth/v1/native) and the
+    // commerce download/purchase requests carry X-Apple-AMD / X-Apple-AMD-M
+    // once the anonymous DSID (-1) is provisioned. The server drives it:
+    //   RP → erase the provisioning, resend without MD
+    //   SP → ADI start with x-apple-amd-data, POST {clientData, guid} to
+    //        amd-finish-provisioning (otp/1.5), ADI end, resend with MD
+    //   SM → logged only (machine sync is not implemented)
+    // State (adi.pb, SC Info, host UUID) persists in <config>/adi-state.
+    // --debug prints the exchange as "[ADI] …" lines.
+
     // ── kbsync ────────────────────────────────────────────────────────────────
     // Generates the kbsync blob for an account DSID by running storeagent's
     // FairPlayGlobalContextInit + FairPlayKBSyncDataWithDSID under the
@@ -192,6 +215,44 @@ private:
     bool       m_debug = false;
     std::string m_regeneratedKbsync;     // fresh kbsync produced by a mid-resolve retry (for caching)
     std::string m_regeneratedPod;        // pod rediscovered via the pod-less list_purchases fallback
+
+    // ── Store AMD state ───────────────────────────────────────────────────────
+    std::string m_adiStatePath;
+    std::string m_provFinishUrl;         // finish URL override (empty = from bag)
+    std::string m_bagMdFinish;           // bag md-finish-provisioning (if present)
+    std::string m_bagAmdFinish;          // bag amd-finish-provisioning (if present)
+    std::string m_mdFamily = "X-Apple-AMD"; // header family (AMD by default; MD if the server asks with x-apple-md-action)
+    std::shared_ptr<StoreAgentMachine> m_adi; // CoreADI + FairPlay, lives for the run
+    uint32_t    m_adiCtx = 0;            // FairPlay global context on m_adi
+
+    void init_store_adi(const std::string& cookieFile);
+    StoreAgentMachine& adi_machine();    // lazy create + import state + FP init
+    void adi_save();
+    // Adds X-Apple-MD / X-Apple-MD-M when `dsid` is provisioned (no-op otherwise).
+    void prov_add_md(std::map<std::string, std::string>& hdrs, uint64_t dsid,
+                     const char* label);
+    // Reacts to x-apple-md-action on `res`. Returns true when the request
+    // should be resent (RP erased / SP provisioned).
+    bool prov_handle(const char* label, const HttpResponse& res, uint64_t dsid,
+                     const std::string& guid, const std::string& token);
+    std::string prov_finish_url(uint64_t dsid) const;
+    bool        m_adiStateExisted = false; // adi-state file present at start (lazy emulator)
+    std::string m_bagAmdSync;            // bag amd-sync-machine
+    std::string m_bagMdSync;             // bag md-sync-machine
+
+    // GET init.itunes.apple.com/bag.xml<query> with `headers`, check status,
+    // parse, unwrap the signed form {bag=<data>, certs, signature}. Returns
+    // the dictionary that holds the URL keys (urlBag when present).
+    PlistDict request_bag(const std::string& query,
+                          const std::map<std::string, std::string>& headers,
+                          const char* label);
+    // m_http.post with the MD/action loop around it.
+    HttpResponse prov_post(const char* label, const std::string& url,
+                           const std::string& body,
+                           const std::map<std::string, std::string>& headers,
+                           uint64_t dsid, const std::string& guid,
+                           const std::string& token,
+                           const std::string& storeFront = "");
 
     // ── volumeStoreDownloadProduct (bag download endpoint, kbsync-signed) ────────
     // POSTs the bag's volumeStoreDownloadProduct with the base64 kbsync and returns

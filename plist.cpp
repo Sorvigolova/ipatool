@@ -4,6 +4,7 @@
 #include <ctime>
 #include <cctype>
 #include <algorithm>
+#include <vector>
 
 // ── XML escape / unescape ────────────────────────────────────────────────────
 
@@ -460,6 +461,15 @@ PlistDict decode_plist_xml(const std::string& raw) {
 // ── Binary plist decoder (bplist00) ──────────────────────────────────────────
 
 class BplistDecoder {
+    // Any structural problem (out-of-range offset, bad ref, cycle, too deep)
+    // aborts the whole decode; decode() turns it into an empty value.
+    struct Malformed {};
+
+    static constexpr int      kMaxDepth  = 64;
+    // Shared refs are legal, so a small file can describe a huge tree
+    // ("billion laughs"); cap the total number of objects materialised.
+    static constexpr uint64_t kMaxVisits = 1000000;
+
     const uint8_t* data_     = nullptr;
     size_t         size_     = 0;
     int            refSize_  = 1;
@@ -467,8 +477,17 @@ class BplistDecoder {
     uint64_t       numObjs_  = 0;
     uint64_t       topObj_   = 0;
     uint64_t       offTable_ = 0;
+    size_t         objEnd_   = 0;          // objects live in [8, objEnd_)
+    mutable std::vector<uint8_t> active_;  // refs on the current path (cycle check)
+    mutable uint64_t visits_ = 0;
 
-    uint64_t read_be(size_t pos, int n) const {
+    // Throw unless [pos, pos+n) lies inside [8, limit).
+    static void need(size_t pos, uint64_t n, size_t limit) {
+        if (pos < 8 || pos > limit || n > limit - pos) throw Malformed{};
+    }
+
+    uint64_t read_be(size_t pos, int n, size_t limit) const {
+        need(pos, (uint64_t)n, limit);
         uint64_t v = 0;
         for (int i = 0; i < n; i++)
             v = (v << 8) | data_[pos + i];
@@ -476,10 +495,36 @@ class BplistDecoder {
     }
 
     uint64_t obj_offset(uint64_t ref) const {
-        return read_be((size_t)(offTable_ + ref * offSize_), offSize_);
+        if (ref >= numObjs_) throw Malformed{};
+        uint64_t off = read_be((size_t)(offTable_ + ref * offSize_), offSize_,
+                               size_ - 32);
+        if (off < 8 || off >= objEnd_) throw Malformed{};
+        return off;
     }
 
-    PlistValue read_obj(uint64_t ref) const {
+    // Count for markers whose low nibble is the size (0xF = int object follows).
+    size_t read_count(uint8_t lo, size_t& pos) const {
+        if (lo != 0xF) return lo;
+        need(pos, 1, objEnd_);
+        uint8_t intMarker = data_[pos++];
+        if ((intMarker & 0xF0) != 0x10 || (intMarker & 0xF) > 3) throw Malformed{};
+        int bytes = 1 << (intMarker & 0xF);
+        uint64_t v = read_be(pos, bytes, objEnd_);
+        pos += bytes;
+        if (v > objEnd_) throw Malformed{};  // no count can exceed the file
+        return (size_t)v;
+    }
+
+    PlistValue read_obj(uint64_t ref, int depth) const {
+        if (depth > kMaxDepth || ref >= numObjs_ || ++visits_ > kMaxVisits)
+            throw Malformed{};
+        if (active_[(size_t)ref]) throw Malformed{};   // ref cycle
+        struct Guard {
+            std::vector<uint8_t>& a; size_t r;
+            ~Guard() { a[r] = 0; }
+        } guard{active_, (size_t)ref};
+        active_[(size_t)ref] = 1;
+
         size_t pos = (size_t)obj_offset(ref);
         uint8_t marker = data_[pos++];
         uint8_t hi = (marker >> 4) & 0xF;
@@ -490,33 +535,44 @@ class BplistDecoder {
         if (marker == 0x08) return PlistValue::makeBool(false);
         if (marker == 0x09) return PlistValue::makeBool(true);
 
-        // int
+        // int (1, 2, 4, 8 bytes; 16-byte ints keep their low 8 bytes)
         if (hi == 0x1) {
+            if (lo > 4) throw Malformed{};
             int bytes = 1 << lo;
-            uint64_t v = read_be(pos, bytes);
+            need(pos, bytes, objEnd_);
+            uint64_t v = read_be(pos + (bytes > 8 ? bytes - 8 : 0),
+                                 bytes > 8 ? 8 : bytes, objEnd_);
             return PlistValue::makeInt((int64_t)v);
         }
 
-        // real
+        // real (4 = float, 8 = double)
         if (hi == 0x2) {
-            int bytes = 1 << lo;
-            uint64_t bits = read_be(pos, bytes);
-            double d = 0;
-            memcpy(&d, &bits, bytes < 8 ? bytes : 8);
-            return PlistValue::makeReal(d);
+            if (lo == 2) {
+                uint32_t bits = (uint32_t)read_be(pos, 4, objEnd_);
+                float f; memcpy(&f, &bits, 4);
+                return PlistValue::makeReal((double)f);
+            }
+            if (lo == 3) {
+                uint64_t bits = read_be(pos, 8, objEnd_);
+                double d; memcpy(&d, &bits, 8);
+                return PlistValue::makeReal(d);
+            }
+            throw Malformed{};
         }
 
         // date (64-bit float, seconds since 2001-01-01)
         if (marker == 0x33) {
-            uint64_t bits = read_be(pos, 8);
+            uint64_t bits = read_be(pos, 8, objEnd_);
             double ts; memcpy(&ts, &bits, 8);
+            // Outside years 1..9999 (or NaN) there is no sensible ISO8601 form.
+            if (!(ts > -63113904000.0 && ts < 252423993600.0)) throw Malformed{};
             // Convert Apple epoch to ISO8601 string
             time_t unix_ts = (time_t)((int64_t)ts + 978307200LL);
-            struct tm t;
+            struct tm t{};
 #ifdef _WIN32
-            gmtime_s(&t, &unix_ts);
+            if (gmtime_s(&t, &unix_ts) != 0) throw Malformed{};
 #else
-            gmtime_r(&unix_ts, &t);
+            if (!gmtime_r(&unix_ts, &t)) throw Malformed{};
 #endif
             char buf[64];
             snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
@@ -527,34 +583,48 @@ class BplistDecoder {
 
         // data
         if (hi == 0x4) {
-            size_t n = lo;
-            if (lo == 0xF) n = (size_t)read_int_at(pos);
+            size_t n = read_count(lo, pos);
+            need(pos, n, objEnd_);
             std::vector<uint8_t> bytes(data_ + pos, data_ + pos + n);
             return PlistValue::makeData(bytes);
         }
 
         // ASCII string
         if (hi == 0x5) {
-            size_t n = lo;
-            if (lo == 0xF) n = (size_t)read_int_at(pos);
+            size_t n = read_count(lo, pos);
+            need(pos, n, objEnd_);
             return PlistValue::makeString(std::string((const char*)data_ + pos, n));
         }
 
-        // UTF-16 string
+        // UTF-16BE string → UTF-8 (surrogate pairs combined; lone ones → U+FFFD)
         if (hi == 0x6) {
-            size_t n = lo;
-            if (lo == 0xF) n = (size_t)read_int_at(pos);
-            // Convert UTF-16BE to UTF-8
+            size_t n = read_count(lo, pos);
+            need(pos, (uint64_t)n * 2, objEnd_);
+            auto unit = [&](size_t i) -> uint32_t {
+                return (uint32_t)((data_[pos + i*2] << 8) | data_[pos + i*2 + 1]);
+            };
             std::string s;
             for (size_t i = 0; i < n; i++) {
-                uint16_t cp = (uint16_t)((data_[pos + i*2] << 8) | data_[pos + i*2 + 1]);
+                uint32_t cp = unit(i);
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < n
+                        && unit(i + 1) >= 0xDC00 && unit(i + 1) <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (unit(i + 1) - 0xDC00);
+                    ++i;
+                } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+                    cp = 0xFFFD;
+                }
                 if (cp < 0x80) {
                     s += (char)cp;
                 } else if (cp < 0x800) {
                     s += (char)(0xC0 | (cp >> 6));
                     s += (char)(0x80 | (cp & 0x3F));
-                } else {
+                } else if (cp < 0x10000) {
                     s += (char)(0xE0 | (cp >> 12));
+                    s += (char)(0x80 | ((cp >> 6) & 0x3F));
+                    s += (char)(0x80 | (cp & 0x3F));
+                } else {
+                    s += (char)(0xF0 | (cp >> 18));
+                    s += (char)(0x80 | ((cp >> 12) & 0x3F));
                     s += (char)(0x80 | ((cp >> 6) & 0x3F));
                     s += (char)(0x80 | (cp & 0x3F));
                 }
@@ -564,26 +634,27 @@ class BplistDecoder {
 
         // array
         if (hi == 0xA) {
-            size_t n = lo;
-            if (lo == 0xF) n = (size_t)read_int_at(pos);
+            size_t n = read_count(lo, pos);
+            need(pos, (uint64_t)n * refSize_, objEnd_);
             PlistArray arr;
+            arr.reserve(n);
             for (size_t i = 0; i < n; i++) {
-                uint64_t ref = read_be(pos + i * refSize_, refSize_);
-                arr.push_back(read_obj(ref));
+                uint64_t r = read_be(pos + i * refSize_, refSize_, objEnd_);
+                arr.push_back(read_obj(r, depth + 1));
             }
             return PlistValue::makeArray(arr);
         }
 
         // dict
         if (hi == 0xD) {
-            size_t n = lo;
-            if (lo == 0xF) n = (size_t)read_int_at(pos);
+            size_t n = read_count(lo, pos);
+            need(pos, (uint64_t)n * 2 * refSize_, objEnd_);
             PlistDict d;
             for (size_t i = 0; i < n; i++) {
-                uint64_t kref = read_be(pos + i * refSize_, refSize_);
-                uint64_t vref = read_be(pos + (n + i) * refSize_, refSize_);
-                PlistValue kv = read_obj(kref);
-                PlistValue vv = read_obj(vref);
+                uint64_t kref = read_be(pos + i * refSize_, refSize_, objEnd_);
+                uint64_t vref = read_be(pos + (n + i) * refSize_, refSize_, objEnd_);
+                PlistValue kv = read_obj(kref, depth + 1);
+                PlistValue vv = read_obj(vref, depth + 1);
                 d[kv.isString() ? kv.str() : ""] = std::move(vv);
             }
             return PlistValue::makeDict(d);
@@ -592,32 +663,40 @@ class BplistDecoder {
         return {};
     }
 
-    // Read a bplist int object at pos, advance pos past it, return value.
-    // pos points right after a count marker byte that had lo==0xF; the next
-    // byte is an int marker.
-    uint64_t read_int_at(size_t& pos) const {
-        uint8_t intMarker = data_[pos++];
-        int bytes = 1 << (intMarker & 0xF);
-        uint64_t v = read_be(pos, bytes);
-        pos += bytes;
-        return v;
-    }
-
 public:
+    // Returns an empty value for anything that is not a well-formed bplist00.
     PlistValue decode(const uint8_t* data, size_t size) {
         data_ = data; size_ = size;
-        if (size < 8 || memcmp(data, "bplist00", 8) != 0)
+        if (size < 8 + 1 + 32 || memcmp(data, "bplist00", 8) != 0)
             return {};
-        // Read trailer (last 32 bytes)
-        if (size < 32) return {};
+        // Trailer (last 32 bytes)
         size_t t = size - 32;
         offSize_  = data[t + 6];
         refSize_  = data[t + 7];
-        numObjs_  = read_be(t + 8,  8);
-        topObj_   = read_be(t + 16, 8);
-        offTable_ = read_be(t + 24, 8);
-        if (!offSize_ || !refSize_ || !numObjs_) return {};
-        return read_obj(topObj_);
+        auto be64 = [&](size_t p) {
+            uint64_t v = 0;
+            for (int i = 0; i < 8; i++) v = (v << 8) | data[p + i];
+            return v;
+        };
+        numObjs_  = be64(t + 8);
+        topObj_   = be64(t + 16);
+        offTable_ = be64(t + 24);
+        if (offSize_ < 1 || offSize_ > 8 || refSize_ < 1 || refSize_ > 8) return {};
+        if (numObjs_ == 0 || topObj_ >= numObjs_) return {};
+        // Offset table must sit between the objects and the trailer.
+        if (offTable_ < 9 || offTable_ > t) return {};
+        if (numObjs_ > (t - offTable_) / (uint64_t)offSize_) return {};
+        objEnd_ = (size_t)offTable_;
+        try {
+            active_.assign((size_t)numObjs_, 0);
+            visits_ = 0;
+            PlistValue v = read_obj(topObj_, 0);
+            active_.clear();
+            return v;
+        } catch (const Malformed&) {
+            active_.clear();
+            return {};
+        }
     }
 };
 

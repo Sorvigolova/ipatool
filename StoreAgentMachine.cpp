@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstring>
 #include "compat_format.h"
+#include <random>
 #include <stdexcept>
 
 // x86-64 SysV arg registers — same as SapMachine
@@ -37,7 +38,8 @@ std::unique_ptr<StoreAgentMachine> StoreAgentMachine::Create(
     std::vector<uint8_t> commerceCore,
     std::vector<uint8_t> commerceKit,
     std::vector<uint8_t> coreFPIcxs,
-    std::vector<uint8_t> storeAgent)
+    std::vector<uint8_t> storeAgent,
+    std::vector<uint8_t> coreADI)
 {
     auto m = std::unique_ptr<StoreAgentMachine>(new StoreAgentMachine());
 
@@ -60,6 +62,9 @@ std::unique_ptr<StoreAgentMachine> StoreAgentMachine::Create(
     auto imgCommerceCore = MachImage::Open("CommerceCore", std::move(commerceCore));
     auto imgCommerceKit  = MachImage::Open("CommerceKit",  std::move(commerceKit));
     auto imgAgent        = MachImage::Open("storeagent",   std::move(storeAgent));
+    std::unique_ptr<MachImage> imgCoreADI;
+    if (!coreADI.empty())
+        imgCoreADI = MachImage::Open("CoreADI", std::move(coreADI));
 
     // 4. CoreFP named exports for the shim resolver
     static const char* kCoreFPExportNames[] = {
@@ -95,12 +100,34 @@ std::unique_ptr<StoreAgentMachine> StoreAgentMachine::Create(
     imgCommerceCore->Relocate(kCommerceBase, resolver);
     imgCommerceKit ->Relocate(kKitBase,      resolver);
     imgAgent       ->Relocate(kAgentBase,    resolver);
+    if (imgCoreADI)
+        imgCoreADI ->Relocate(kCoreADIBase,  resolver);
 
     // 8. Load into Unicorn
     imgCoreFP      ->Load(m->uc_);
     imgCommerceCore->Load(m->uc_);
     imgCommerceKit ->Load(m->uc_);
     imgAgent       ->Load(m->uc_);
+
+    // 8b. CoreADI — reachable only through storeagent's dlopen/dlsym
+    if (imgCoreADI) {
+        imgCoreADI->Load(m->uc_);
+        std::unordered_map<std::string, uint64_t> adiExports;
+        for (const char* n : { "_cvu8io98wun", "_vdfut768ig" })
+            adiExports[n] = imgCoreADI->Export(n, kCoreADIBase);   // throws if missing
+        m->shims_->RegisterDylib(kCoreADIPath, std::move(adiExports));
+        m->shims_->SetVirtualRoots({ kAdiVirtualRoot, kSCInfoVirtualRoot });
+
+        // Fresh identity until ImportAdiState() replaces it.
+        std::array<uint8_t, 16> uuid{};
+        std::random_device rd;
+        for (auto& b : uuid) b = static_cast<uint8_t>(rd());
+        uuid[6] = static_cast<uint8_t>((uuid[6] & 0x0F) | 0x40);   // RFC 4122 v4
+        uuid[8] = static_cast<uint8_t>((uuid[8] & 0x3F) | 0x80);
+        m->shims_->SetHostUUID(uuid);
+        m->hostUUID_  = uuid;
+        m->adiLoaded_ = true;
+    }
 
     // FairPlayDisposeStorage — frees buffers returned by FairPlay (kbsync)
     try { m->disposeFn_ = imgCommerceKit->Export("_jEHf8Xzsv8K", kKitBase); } catch (...) {}
@@ -292,6 +319,188 @@ void StoreAgentMachine::CloseSession(uint64_t session) {
     ClearScratch();
     if (st != 0)
         throw std::runtime_error(ipt::format("StoreAgent CloseSession returned {}", st));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ADI — storeagent's CoreADI wrappers
+// ═══════════════════════════════════════════════════════════════════════════
+
+void StoreAgentMachine::RequireADI() const {
+    if (!adiLoaded_)
+        throw std::runtime_error("StoreAgent ADI is unavailable (CoreADI not loaded)");
+}
+
+std::vector<uint8_t> StoreAgentMachine::GuestReadBytes(uint64_t addr, uint32_t len) {
+    if (!addr || !len) return {};
+    if (len > (uint32_t(1) << 24))
+        throw std::runtime_error(ipt::format("ADI output too large ({} bytes)", len));
+    std::vector<uint8_t> out(len);
+    UCK(uc_mem_read(uc_, addr, out.data(), len), "read ADI output");
+    return out;
+}
+
+StoreAgentMachine::AdiStartResult
+StoreAgentMachine::AdiStartProvisioning(uint64_t dsid, std::span<const uint8_t> serverData) {
+    RequireADI();
+    if (serverData.empty())
+        throw std::runtime_error("ADI provisioning data (x-apple-md-data) is empty");
+
+    uint64_t inAddr  = Scratch(serverData.data(), serverData.size());
+    uint64_t ptrFld  = Scratch(8);
+    uint64_t lenFld  = Scratch(4);
+    uint64_t sessFld = Scratch(4);
+
+    int32_t status = static_cast<int32_t>(Invoke(kAdiStart, {
+        dsid, inAddr, uint64_t(serverData.size()), ptrFld, lenFld, sessFld }));
+
+    AdiStartResult r;
+    if (status == 0) {
+        r.clientData = GuestReadBytes(GuestRead64(ptrFld), GuestRead32(lenFld));
+        r.session    = GuestRead32(sessFld);
+    }
+    ClearScratch();
+
+    if (status != 0)
+        throw std::runtime_error(ipt::format("ADI start provisioning returned {}", status));
+    if (r.clientData.empty())
+        throw std::runtime_error("ADI start provisioning returned no client data");
+    return r;
+}
+
+void StoreAgentMachine::AdiEndProvisioning(uint32_t session,
+                                           std::span<const uint8_t> settingInfo,
+                                           std::span<const uint8_t> transportKey) {
+    RequireADI();
+    if (settingInfo.empty() || transportKey.empty())
+        throw std::runtime_error("ADI end provisioning: settingInfo/transportKey is empty");
+
+    uint64_t siAddr = Scratch(settingInfo.data(),  settingInfo.size());
+    uint64_t tkAddr = Scratch(transportKey.data(), transportKey.size());
+
+    int32_t status = static_cast<int32_t>(Invoke(kAdiEnd, {
+        uint64_t(session),
+        siAddr, uint64_t(settingInfo.size()),
+        tkAddr, uint64_t(transportKey.size()) }));
+    ClearScratch();
+
+    if (status != 0)
+        throw std::runtime_error(ipt::format("ADI end provisioning returned {}", status));
+}
+
+std::optional<StoreAgentMachine::AdiOTP>
+StoreAgentMachine::AdiRequestOTP(uint64_t dsid, int32_t* statusOut) {
+    RequireADI();
+    uint64_t midPtr = Scratch(8);
+    uint64_t midLen = Scratch(4);
+    uint64_t otpPtr = Scratch(8);
+    uint64_t otpLen = Scratch(4);
+
+    int32_t status = static_cast<int32_t>(Invoke(kAdiOTP, {
+        dsid, midPtr, midLen, otpPtr, otpLen }));
+    if (statusOut) *statusOut = status;
+
+    std::optional<AdiOTP> r;
+    if (status == 0) {
+        AdiOTP o;
+        o.machineID = GuestReadBytes(GuestRead64(midPtr), GuestRead32(midLen));
+        o.otp       = GuestReadBytes(GuestRead64(otpPtr), GuestRead32(otpLen));
+        if (!o.machineID.empty() && !o.otp.empty()) r = std::move(o);
+    }
+    ClearScratch();
+    return r;
+}
+
+int32_t StoreAgentMachine::AdiErase(uint64_t dsid) {
+    RequireADI();
+    int32_t status = static_cast<int32_t>(Invoke(kAdiErase, { dsid }));
+    ClearScratch();
+    return status;
+}
+
+int32_t StoreAgentMachine::ImportKeyBag(uint32_t globalCtx, std::span<const uint8_t> keyBag) {
+    if (keyBag.empty()) throw std::runtime_error("FairPlay keybag is empty");
+    uint64_t kbAddr = Scratch(keyBag.data(), keyBag.size());
+    int32_t status = static_cast<int32_t>(Invoke(kImportKeyBag, {
+        uint64_t(globalCtx), kbAddr, uint64_t(keyBag.size()) }));
+    ClearScratch();
+    return status;
+}
+
+// ─── ADI state (de)serialisation ─────────────────────────────────────────────
+//  "ADIS" | u32 version=1 | uuid[16] | u32 nFiles | {u32 len, path, u32 len, data}…
+//         | u32 nDirs | {u32 len, path}…        (little-endian)
+
+static constexpr uint32_t kAdiStateMagic   = 0x53494441; // "ADIS"
+static constexpr uint32_t kAdiStateVersion = 1;
+
+std::vector<uint8_t> StoreAgentMachine::ExportAdiState() const {
+    RequireADI();
+    std::vector<uint8_t> out;
+    auto put32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i)));
+    };
+    auto putBytes = [&](const void* p, size_t n) {
+        put32(static_cast<uint32_t>(n));
+        auto b = static_cast<const uint8_t*>(p);
+        out.insert(out.end(), b, b + n);
+    };
+    put32(kAdiStateMagic);
+    put32(kAdiStateVersion);
+    out.insert(out.end(), hostUUID_.begin(), hostUUID_.end());
+    const auto& files = shims_->GetVirtualFiles();
+    put32(static_cast<uint32_t>(files.size()));
+    for (const auto& [path, data] : files) {
+        putBytes(path.data(), path.size());
+        putBytes(data.data(), data.size());
+    }
+    const auto& dirs = shims_->GetVirtualDirs();
+    put32(static_cast<uint32_t>(dirs.size()));
+    for (const auto& d : dirs) putBytes(d.data(), d.size());
+    return out;
+}
+
+void StoreAgentMachine::ImportAdiState(std::span<const uint8_t> state) {
+    RequireADI();
+    size_t pos = 0;
+    auto need = [&](size_t n) {
+        if (state.size() - pos < n) throw std::runtime_error("ADI state is truncated");
+    };
+    auto get32 = [&]() {
+        need(4);
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) v |= uint32_t(state[pos + i]) << (8 * i);
+        pos += 4;
+        return v;
+    };
+    auto getBytes = [&]() {
+        uint32_t n = get32();
+        need(n);
+        std::vector<uint8_t> v(state.begin() + pos, state.begin() + pos + n);
+        pos += n;
+        return v;
+    };
+
+    if (get32() != kAdiStateMagic)   throw std::runtime_error("ADI state: bad magic");
+    if (get32() != kAdiStateVersion) throw std::runtime_error("ADI state: unsupported version");
+    need(16);
+    std::array<uint8_t, 16> uuid{};
+    std::memcpy(uuid.data(), state.data() + pos, 16);
+    pos += 16;
+
+    SapShims::VirtualFiles files;
+    for (uint32_t i = 0, n = get32(); i < n; ++i) {
+        auto p = getBytes();
+        files[std::string(p.begin(), p.end())] = getBytes();
+    }
+    std::set<std::string> dirs;
+    for (uint32_t i = 0, n = get32(); i < n; ++i) {
+        auto p = getBytes();
+        dirs.insert(std::string(p.begin(), p.end()));
+    }
+
+    hostUUID_ = uuid;
+    shims_->SetHostUUID(uuid);
+    shims_->SetVirtualFiles(std::move(files), std::move(dirs));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

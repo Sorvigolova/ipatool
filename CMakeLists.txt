@@ -725,7 +725,7 @@ endif()
 # Windows: .rc RCDATA (already handled above)
 # Fallback (any platform): load from sap_assets/ directory at runtime
 
-set(_SAP_ASSETS CoreFP CommerceCore CommerceKit "CoreFP.icxs" storeagent)
+set(_SAP_ASSETS CoreFP CommerceCore CommerceKit "CoreFP.icxs" storeagent CoreADI)
 
 if(NOT WIN32)
     if(APPLE)

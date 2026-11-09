@@ -1,9 +1,12 @@
 #pragma once
 #include "MachImage.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -53,6 +56,28 @@ public:
     // Called by the machine before each guest function invocation.
     void BeforeInvoke() { ResetFault(); }
 
+    // ── Extra dylibs reachable through the dlopen/dlsym shims ─────────────────
+    // CoreFP stays on the legacy fake handle; every registered dylib gets its
+    // own handle so dlsym() resolves against the right export table.
+    void RegisterDylib(const std::string& path,
+                       std::unordered_map<std::string, uint64_t> exports);
+
+    // ── Virtual filesystem ────────────────────────────────────────────────────
+    // Backs open/read/write/stat/mkdir/unlink for guest code that keeps state
+    // on disk (CoreADI's provisioning database). CoreFP.icxs is served
+    // separately and never appears here.
+    using VirtualFiles = std::map<std::string, std::vector<uint8_t>>;
+    void SetVirtualFiles(VirtualFiles files, std::set<std::string> dirs = {});
+    // Only paths under these prefixes may be created (O_CREAT / mkdir).
+    // Everything else keeps the historical behaviour (open → -1), so CoreFP
+    // and the SAP/kbsync paths never start writing files they did not before.
+    void SetVirtualRoots(std::vector<std::string> prefixes) { vfsRoots_ = std::move(prefixes); }
+    const VirtualFiles&          GetVirtualFiles() const { return vfsFiles_; }
+    const std::set<std::string>& GetVirtualDirs()  const { return vfsDirs_; }
+
+    // 16-byte value returned by gethostuuid().
+    void SetHostUUID(const std::array<uint8_t, 16>& uuid) { hostUUID_ = uuid; }
+
 private:
     // ── shim registration ─────────────────────────────────────────────────────
     using Handler = std::function<void()>;
@@ -63,6 +88,7 @@ private:
 
     void RegisterMemoryServices();
     void RegisterPlatformServices();
+    void RegisterFileServices();
 
     // ── Unicorn code hook dispatch ─────────────────────────────────────────────
     static void HookCallback(uc_engine*, uint64_t addr, uint32_t, void* user);
@@ -134,6 +160,48 @@ private:
 
     // Misc iteration counter (CoreFP internal)
     uint32_t iterator_ = 0;
+
+    // ── extra dylibs (dlopen/dlsym) ───────────────────────────────────────────
+    struct Dylib { uint64_t handle; std::unordered_map<std::string, uint64_t> exports; };
+    std::unordered_map<std::string, Dylib> dylibs_;      // path → dylib
+    uint64_t                               nextDylibHandle_ = 0x7ADE0001;
+
+    // ── virtual filesystem ────────────────────────────────────────────────────
+    struct OpenFile { std::string path; uint64_t pos = 0; bool append = false; };
+    VirtualFiles                           vfsFiles_;
+    std::set<std::string>                  vfsDirs_;
+    std::vector<std::string>               vfsRoots_;
+    std::unordered_map<uint64_t, OpenFile> openFiles_;   // fd → file
+    uint64_t                               nextFd_ = 16;
+    std::unordered_map<uint64_t, std::string> fsRefs_;   // FSRef id → path
+    uint64_t                               nextFsRef_ = 1;
+    std::array<uint8_t, 16>                hostUUID_{};
+
+    void SetErrno(uint32_t e) { GuestWrite32(errnoCell_, e); }
+    static std::string NormalizePath(std::string p);
+    bool VfsExists(const std::string& p) const { return vfsFiles_.count(p) || IsVfsDir(p); }
+    // A directory exists if it was created, or if it is an ancestor of a
+    // virtual root ("/Users", "/Users/Shared" for "/Users/Shared/adi").
+    bool IsVfsDir(const std::string& p) const {
+        if (vfsDirs_.count(p)) return true;
+        for (auto& r : vfsRoots_)
+            if (r.size() > p.size() && r.compare(0, p.size(), p) == 0 &&
+                (p == "/" || r[p.size()] == '/'))
+                return true;
+        return false;
+    }
+    bool VfsWritable(const std::string& p) const {
+        for (auto& r : vfsRoots_)
+            if (!r.empty() && p.compare(0, r.size(), r) == 0 &&
+                (r.back() == '/' || p.size() == r.size() || p[r.size()] == '/'))
+                return true;
+        return false;
+    }
+    void WriteStat(uint64_t addr, bool isDir, uint64_t size);
+
+    // Optional import trace (env IPATOOL_SHIM_TRACE=1): logs calls into
+    // auto-generated zero-return stubs, i.e. imports nobody implemented.
+    bool traceUnknown_ = false;
 
     std::string fault_;
 };

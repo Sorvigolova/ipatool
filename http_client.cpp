@@ -351,6 +351,7 @@ HttpResponse HttpClient::perform(const std::string& method,
             curl_easy_cleanup(curl);
             resp.statusCode = static_cast<int>(code);
             resp.body       = std::move(respBody);
+            if (m_observer) m_observer(method, url, resp);
             return resp;
         }
 

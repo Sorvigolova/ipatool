@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include "compat_format.h"
 #include <random>
 #include <stdexcept>
@@ -56,6 +58,9 @@ SapShims::SapShims(uc_engine* uc,
     , macAddress_(std::move(macAddress))
 {
     UC_CHECK(uc_mem_map(uc_, kShimBase, kShimSize, UC_PROT_ALL), "map shim region");
+
+    if (const char* t = std::getenv("IPATOOL_SHIM_TRACE"); t && *t && *t != '0')
+        traceUnknown_ = true;
 
     RegisterMemoryServices();
     RegisterPlatformServices();
@@ -308,7 +313,75 @@ uint64_t SapShims::Resolve(std::string_view name) {
     if (ce != coreExports_.end()) { symbols_[key] = ce->second; return ce->second; }
 
     // Unknown → zero-return stub
-    return AddFunction(key, [this, key]() { SetResult(0); });
+    return AddFunction(key, [this, key]() {
+        if (traceUnknown_)
+            std::fprintf(stderr, "[shim] unimplemented import %s -> 0\n", key.c_str());
+        SetResult(0);
+    });
+}
+
+// ─── extra dylibs ─────────────────────────────────────────────────────────────
+
+void SapShims::RegisterDylib(const std::string& path,
+                             std::unordered_map<std::string, uint64_t> exports) {
+    auto it = dylibs_.find(path);
+    if (it != dylibs_.end()) { it->second.exports = std::move(exports); return; }
+    dylibs_[path] = Dylib{ nextDylibHandle_++, std::move(exports) };
+}
+
+// ─── virtual filesystem helpers ───────────────────────────────────────────────
+
+void SapShims::SetVirtualFiles(VirtualFiles files, std::set<std::string> dirs) {
+    vfsFiles_.clear();
+    vfsDirs_.clear();
+    for (auto& [p, d] : files) vfsFiles_[NormalizePath(p)] = std::move(d);
+    for (auto& p : dirs)       vfsDirs_.insert(NormalizePath(p));
+    openFiles_.clear();
+    fsRefs_.clear();
+}
+
+/*static*/ std::string SapShims::NormalizePath(std::string p) {
+    // Collapse "//" and "/./", drop a trailing '/'. Guest paths are absolute
+    // and never contain "..", so no further canonicalisation is needed.
+    std::string out;
+    out.reserve(p.size());
+    for (size_t i = 0; i < p.size(); ++i) {
+        if (p[i] == '/' && !out.empty() && out.back() == '/') continue;
+        if (p[i] == '.' && !out.empty() && out.back() == '/' &&
+            (i + 1 == p.size() || p[i + 1] == '/')) { ++i; continue; }
+        out += p[i];
+    }
+    while (out.size() > 1 && out.back() == '/') out.pop_back();
+    return out;
+}
+
+void SapShims::WriteStat(uint64_t addr, bool isDir, uint64_t size) {
+    // Darwin x86-64 struct stat (_DARWIN_FEATURE_64_BIT_INODE), 144 bytes:
+    //   +0 dev(i32) +4 mode(u16) +6 nlink(u16) +8 ino(u64) +16 uid +20 gid
+    //   +24 rdev  +32/+48/+64/+80 a/m/c/birth timespec  +96 size(i64)
+    //   +104 blocks(i64) +112 blksize(i32) +116 flags +120 gen ...
+    uint8_t st[144] = {};
+    uint32_t dev   = 0x01000004;
+    uint16_t mode  = isDir ? 0040755 : 0100644;
+    uint16_t nlink = 1;
+    uint64_t ino   = 0x1000 + (std::hash<uint64_t>{}(size) & 0xFFFF);
+    uint32_t uid   = 501, gid = 20;
+    int64_t  now   = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count());
+    int64_t  sz    = isDir ? 102 : static_cast<int64_t>(size);
+    int64_t  blocks = (sz + 511) / 512;
+    int32_t  blksize = 4096;
+    std::memcpy(st + 0,  &dev,   4);
+    std::memcpy(st + 4,  &mode,  2);
+    std::memcpy(st + 6,  &nlink, 2);
+    std::memcpy(st + 8,  &ino,   8);
+    std::memcpy(st + 16, &uid,   4);
+    std::memcpy(st + 20, &gid,   4);
+    for (int off : {32, 48, 64, 80}) std::memcpy(st + off, &now, 8);
+    std::memcpy(st + 96,  &sz,      8);
+    std::memcpy(st + 104, &blocks,  8);
+    std::memcpy(st + 112, &blksize, 4);
+    GuestWrite(addr, st, sizeof st);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -443,7 +516,6 @@ void SapShims::RegisterPlatformServices() {
     // ── returnZero (release/mutex) group ──────────────────────────────────────
     AddAliases({
         "_CFRelease", "_IOObjectRelease",
-        "_close", "_close$UNIX2003",
         "_pthread_mutex_lock", "_pthread_mutex_unlock",
         "_pthread_rwlock_init",  "_pthread_rwlock_init$UNIX2003",
         "_pthread_rwlock_unlock","_pthread_rwlock_unlock$UNIX2003",
@@ -453,7 +525,7 @@ void SapShims::RegisterPlatformServices() {
     // ── returnMinusOne group ───────────────────────────────────────────────────
     AddAliases({
         "_fcntl", "_fcntl$UNIX2003",
-        "_lstat$INODE64", "_statfs", "_statfs$INODE64",
+        "_statfs", "_statfs$INODE64",
     }, [this]() { SetResult(UINT64_MAX); });
 
     // ── abort group ───────────────────────────────────────────────────────────
@@ -537,11 +609,26 @@ void SapShims::RegisterPlatformServices() {
     // ── dlopen / dlsym ────────────────────────────────────────────────────────
     AddFunction("_dlopen", [this]() {
         std::string path = GuestReadCString(Arg(0));
-        SetResult(path == kCoreFPDlPath ? kFakeHandle : 0);
+        if (path == kCoreFPDlPath) { SetResult(kFakeHandle); return; }
+        auto it = dylibs_.find(path);
+        if (traceUnknown_)
+            std::fprintf(stderr, "[shim] dlopen(%s) -> %s\n", path.c_str(),
+                         it != dylibs_.end() ? "ok" : "NULL");
+        SetResult(it != dylibs_.end() ? it->second.handle : 0);
     });
     AddFunction("_dlsym", [this]() {
-        // arg0=handle, arg1=name — prepend '_' to look up in coreExports
-        std::string name = "_" + GuestReadCString(Arg(1));
+        // arg0=handle, arg1=name — prepend '_' (Mach-O symbol convention)
+        uint64_t    handle = Arg(0);
+        std::string name   = "_" + GuestReadCString(Arg(1));
+        for (auto& [path, lib] : dylibs_) {
+            if (lib.handle != handle) continue;
+            auto e = lib.exports.find(name);
+            if (traceUnknown_)
+                std::fprintf(stderr, "[shim] dlsym(%s, %s) -> %s\n", path.c_str(), name.c_str(),
+                             e != lib.exports.end() ? "ok" : "NULL");
+            SetResult(e != lib.exports.end() ? e->second : 0);
+            return;
+        }
         auto it = coreExports_.find(name);
         SetResult(it != coreExports_.end() ? it->second : 0);
     });
@@ -573,25 +660,8 @@ void SapShims::RegisterPlatformServices() {
         SetResult(sel == kKeyedMsg ? kFakeHandle : 0);
     });
 
-    // ── open / read (CoreFP.icxs file simulation) ─────────────────────────────
-    AddAliases({"_open", "_open$UNIX2003"}, [this]() {
-        std::string path = GuestReadCString(Arg(0));
-        if (path == kIcxsPath) {
-            icxsOffset_ = 0;
-            SetResult(kCoreFPFile);
-        } else {
-            SetResult(UINT64_MAX); // -1
-        }
-    });
-    AddAliases({"_read", "_read$UNIX2003"}, [this]() {
-        uint64_t fd  = Arg(0), buf = Arg(1), req = Arg(2);
-        if (fd != kCoreFPFile) { SetResult(UINT64_MAX); return; }
-        size_t rem  = icxs_.size() - icxsOffset_;
-        size_t nread = std::min(rem, static_cast<size_t>(req));
-        if (nread) GuestWrite(buf, icxs_.data() + icxsOffset_, nread);
-        icxsOffset_ += nread;
-        SetResult(nread);
-    });
+    // ── open / read / write / stat … (CoreFP.icxs + virtual filesystem) ──────
+    RegisterFileServices();
 
     // ── pthread_once ─────────────────────────────────────────────────────────
     // When control != 0: mark done, push initializer as fake return address
@@ -636,6 +706,30 @@ void SapShims::RegisterPlatformServices() {
         SetResult(bufAddr);
     });
 
+    // ── Gestalt(OSType selector, SInt32* response) ────────────────────────────
+    // CoreFP asks for the OS version while importing a keybag. Answer as the
+    // OS X 10.9.5 the emulated binaries come from.
+    AddFunction("_Gestalt", [this]() {
+        uint32_t sel   = static_cast<uint32_t>(Arg(0));
+        uint64_t resp  = Arg(1);
+        int32_t  value = 0;
+        bool     known = true;
+        switch (sel) {
+            case 0x73797376: value = 0x1095; break;   // 'sysv' — BCD 10.9.5
+            case 0x73797331: value = 10;     break;   // 'sys1' — major
+            case 0x73797332: value = 9;      break;   // 'sys2' — minor
+            case 0x73797333: value = 5;      break;   // 'sys3' — bugfix
+            default:         known = false;  break;
+        }
+        if (traceUnknown_)
+            std::fprintf(stderr, "[shim] Gestalt('%c%c%c%c')%s\n",
+                         char(sel >> 24), char(sel >> 16), char(sel >> 8), char(sel),
+                         known ? "" : " -> gestaltUndefSelectorErr");
+        if (resp) GuestWrite32(resp, static_cast<uint32_t>(value));
+        // gestaltUndefSelectorErr = -5551
+        SetResult(known ? 0 : static_cast<uint64_t>(static_cast<int64_t>(-5551)));
+    });
+
     // ── sysctl / sysctlbyname ─────────────────────────────────────────────────
     AddFunction("_sysctl",       [this]() { SetResult(UINT64_MAX); });
     AddFunction("_sysctlbyname", [this]() {
@@ -643,6 +737,202 @@ void SapShims::RegisterPlatformServices() {
         if (lenAddr) GuestWrite64(lenAddr, 0);
         SetResult(0);
     });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  File services — CoreFP.icxs (read-only, fd 3) + in-memory virtual FS
+// ═══════════════════════════════════════════════════════════════════════════
+
+void SapShims::RegisterFileServices() {
+    // Darwin <fcntl.h> / <errno.h> values
+    static constexpr uint32_t kOAccMode = 0x0003, kOAppend = 0x0008,
+                              kOCreat   = 0x0200, kOTrunc  = 0x0400, kOExcl = 0x0800;
+    static constexpr uint32_t kENOENT = 2, kEBADF = 9, kEEXIST = 17,
+                              kENOTDIR = 20, kEISDIR = 21, kEINVAL = 22;
+    static constexpr int16_t  kFnfErr = -43;   // Carbon "file not found"
+
+    AddAliases({"_open", "_open$UNIX2003", "_open$NOCANCEL$UNIX2003"}, [this]() {
+        std::string raw  = GuestReadCString(Arg(0));
+        uint32_t    flag = static_cast<uint32_t>(Arg(1));
+
+        if (raw == kIcxsPath) {
+            icxsOffset_ = 0;
+            SetResult(kCoreFPFile);
+            return;
+        }
+
+        std::string path = NormalizePath(raw);
+        if (traceUnknown_)
+            std::fprintf(stderr, "[shim] open(%s, %#x)%s\n", path.c_str(), flag,
+                         VfsExists(path) ? "" : VfsWritable(path) ? " [new]" : " [outside vfs]");
+        if (IsVfsDir(path)) {
+            if ((flag & kOAccMode) != 0) { SetErrno(kEISDIR); SetResult(UINT64_MAX); return; }
+        } else if (!vfsFiles_.count(path)) {
+            if (!(flag & kOCreat) || !VfsWritable(path)) { SetErrno(kENOENT); SetResult(UINT64_MAX); return; }
+            vfsFiles_[path] = {};
+        } else if ((flag & kOCreat) && (flag & kOExcl)) {
+            SetErrno(kEEXIST); SetResult(UINT64_MAX); return;
+        }
+        if ((flag & kOTrunc) && (flag & kOAccMode) != 0) vfsFiles_[path].clear();
+
+        uint64_t fd = nextFd_++;
+        openFiles_[fd] = OpenFile{ path, 0, (flag & kOAppend) != 0 };
+        SetResult(fd);
+    });
+
+    AddAliases({"_read", "_read$UNIX2003", "_read$NOCANCEL$UNIX2003"}, [this]() {
+        uint64_t fd = Arg(0), buf = Arg(1), req = Arg(2);
+        if (fd == kCoreFPFile) {
+            size_t rem   = icxs_.size() - icxsOffset_;
+            size_t nread = std::min(rem, static_cast<size_t>(req));
+            if (nread) GuestWrite(buf, icxs_.data() + icxsOffset_, nread);
+            icxsOffset_ += nread;
+            SetResult(nread);
+            return;
+        }
+        auto it = openFiles_.find(fd);
+        if (it == openFiles_.end()) { SetErrno(kEBADF); SetResult(UINT64_MAX); return; }
+        auto& data = vfsFiles_[it->second.path];
+        uint64_t pos = std::min<uint64_t>(it->second.pos, data.size());
+        uint64_t n   = std::min<uint64_t>(req, data.size() - pos);
+        if (n > kMaxGuestTransfer) throw std::runtime_error("read: transfer too large");
+        if (n) GuestWrite(buf, data.data() + pos, n);
+        it->second.pos = pos + n;
+        SetResult(n);
+    });
+
+    AddAliases({"_write", "_write$UNIX2003", "_write$NOCANCEL$UNIX2003"}, [this]() {
+        uint64_t fd = Arg(0), buf = Arg(1), len = Arg(2);
+        auto it = openFiles_.find(fd);
+        if (it == openFiles_.end()) {
+            // stdout/stderr and anything else: swallow silently
+            SetResult(fd <= 2 ? len : UINT64_MAX);
+            if (fd > 2) SetErrno(kEBADF);
+            return;
+        }
+        if (len > kMaxGuestTransfer) throw std::runtime_error("write: transfer too large");
+        auto& data = vfsFiles_[it->second.path];
+        uint64_t pos = it->second.append ? data.size() : it->second.pos;
+        if (data.size() < pos + len) data.resize(pos + len);
+        if (len) GuestRead(buf, data.data() + pos, len);
+        it->second.pos = pos + len;
+        SetResult(len);
+    });
+
+    AddFunction("_lseek", [this]() {
+        uint64_t fd = Arg(0); int64_t off = static_cast<int64_t>(Arg(1));
+        int whence  = static_cast<int>(Arg(2));
+        auto it = openFiles_.find(fd);
+        if (it == openFiles_.end()) { SetErrno(kEBADF); SetResult(UINT64_MAX); return; }
+        int64_t base = whence == 0 ? 0
+                     : whence == 1 ? static_cast<int64_t>(it->second.pos)
+                     : whence == 2 ? static_cast<int64_t>(vfsFiles_[it->second.path].size())
+                     : -1;
+        if (base < 0 || base + off < 0) { SetErrno(kEINVAL); SetResult(UINT64_MAX); return; }
+        it->second.pos = static_cast<uint64_t>(base + off);
+        SetResult(it->second.pos);
+    });
+
+    AddFunction("_ftruncate", [this]() {
+        auto it = openFiles_.find(Arg(0));
+        if (it == openFiles_.end()) { SetErrno(kEBADF); SetResult(UINT64_MAX); return; }
+        vfsFiles_[it->second.path].resize(Arg(1));
+        SetResult(0);
+    });
+
+    AddAliases({"_close", "_close$UNIX2003", "_close$NOCANCEL$UNIX2003"}, [this]() {
+        openFiles_.erase(Arg(0));   // fd 3 (icxs) and unknown fds: plain success
+        SetResult(0);
+    });
+
+    AddAliases({"_fsync", "_fsync$UNIX2003"}, [this]() { SetResult(0); });
+    // Single-threaded guest: every advisory lock is granted immediately
+    // (FairPlay takes one on "SC Info/.sid.lockFile" around keybag writes).
+    AddAliases({"_lockf", "_lockf$UNIX2003", "_flock"}, [this]() { SetResult(0); });
+
+    AddAliases({"_fstat$INODE64", "_fstat"}, [this]() {
+        uint64_t fd = Arg(0), st = Arg(1);
+        auto it = openFiles_.find(fd);
+        if (it == openFiles_.end()) { SetErrno(kEBADF); SetResult(UINT64_MAX); return; }
+        bool dir = IsVfsDir(it->second.path) != 0;
+        WriteStat(st, dir, dir ? 0 : vfsFiles_[it->second.path].size());
+        SetResult(0);
+    });
+
+    AddAliases({"_lstat$INODE64", "_stat$INODE64", "_lstat", "_stat"}, [this]() {
+        std::string path = NormalizePath(GuestReadCString(Arg(0)));
+        uint64_t st = Arg(1);
+        if (traceUnknown_)
+            std::fprintf(stderr, "[shim] stat(%s)%s\n", path.c_str(), VfsExists(path) ? "" : " -> ENOENT");
+        if (IsVfsDir(path))       { WriteStat(st, true, 0); SetResult(0); return; }
+        auto it = vfsFiles_.find(path);
+        if (it != vfsFiles_.end())      { WriteStat(st, false, it->second.size()); SetResult(0); return; }
+        SetErrno(kENOENT);
+        SetResult(UINT64_MAX);
+    });
+
+    AddFunction("_mkdir", [this]() {
+        std::string path = NormalizePath(GuestReadCString(Arg(0)));
+        if (traceUnknown_) std::fprintf(stderr, "[shim] mkdir(%s)\n", path.c_str());
+        if (VfsExists(path))    { SetErrno(kEEXIST); SetResult(UINT64_MAX); return; }
+        if (!VfsWritable(path)) { SetErrno(kENOENT); SetResult(UINT64_MAX); return; }
+        vfsDirs_.insert(path);
+        SetResult(0);
+    });
+
+    AddFunction("_rmdir", [this]() {
+        std::string path = NormalizePath(GuestReadCString(Arg(0)));
+        if (!vfsDirs_.erase(path)) { SetErrno(kENOENT); SetResult(UINT64_MAX); return; }
+        SetResult(0);
+    });
+
+    AddFunction("_unlink", [this]() {
+        std::string path = NormalizePath(GuestReadCString(Arg(0)));
+        if (IsVfsDir(path))   { SetErrno(kEISDIR); SetResult(UINT64_MAX); return; }
+        if (!vfsFiles_.erase(path)) { SetErrno(kENOENT); SetResult(UINT64_MAX); return; }
+        SetResult(0);
+    });
+
+    AddFunction("_rename", [this]() {
+        std::string from = NormalizePath(GuestReadCString(Arg(0)));
+        std::string to   = NormalizePath(GuestReadCString(Arg(1)));
+        auto it = vfsFiles_.find(from);
+        if (it == vfsFiles_.end()) { SetErrno(kENOENT); SetResult(UINT64_MAX); return; }
+        if (IsVfsDir(to))    { SetErrno(kENOTDIR); SetResult(UINT64_MAX); return; }
+        auto data = std::move(it->second);
+        vfsFiles_.erase(it);
+        vfsFiles_[to] = std::move(data);
+        for (auto& [fd, f] : openFiles_) if (f.path == from) f.path = to;
+        SetResult(0);
+    });
+
+    // ── gethostuuid(uuid_t out, const struct timespec* wait) ──────────────────
+    AddFunction("_gethostuuid", [this]() {
+        uint64_t out = Arg(0);
+        if (!out) { SetErrno(kEINVAL); SetResult(UINT64_MAX); return; }
+        GuestWrite(out, hostUUID_.data(), hostUUID_.size());
+        SetResult(0);
+    });
+
+    // ── Carbon File Manager (CoreServices) ────────────────────────────────────
+    // FSPathMakeRef(const UInt8* path, FSRef* ref, Boolean* isDirectory)
+    AddFunction("_FSPathMakeRef", [this]() {
+        std::string path = NormalizePath(GuestReadCString(Arg(0)));
+        uint64_t ref = Arg(1), isDir = Arg(2);
+        if (!VfsExists(path)) { SetResult(static_cast<uint64_t>(static_cast<int64_t>(kFnfErr))); return; }
+        uint64_t id = nextFsRef_++;
+        fsRefs_[id] = path;
+        if (ref) {
+            uint8_t fsref[80] = {};          // FSRef is an opaque 80-byte blob
+            std::memcpy(fsref, &id, 8);
+            GuestWrite(ref, fsref, sizeof fsref);
+        }
+        if (isDir) { uint8_t d = IsVfsDir(path) ? 1 : 0; GuestWrite(isDir, &d, 1); }
+        SetResult(0);
+    });
+    // Catalog info (Finder flags / dates) carries nothing CoreADI needs back;
+    // report success and leave the caller's buffers untouched.
+    AddAliases({"_FSGetCatalogInfo", "_FSSetCatalogInfo"}, [this]() { SetResult(0); });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

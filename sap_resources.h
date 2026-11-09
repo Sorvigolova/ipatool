@@ -5,3 +5,4 @@
 #define IDR_SAP_COMMERCEKIT   203
 #define IDR_SAP_COREFP_ICXS   204
 #define IDR_SAP_STOREAGENT    205
+#define IDR_SAP_COREADI       206

@@ -31,6 +31,13 @@ public:
 
     void set_debug(bool v) { m_debug = v; }
 
+    // Optional hook called with every completed API response (post/get).
+    // Used by the Store AMD flow to report x-apple-amd-* headers under --debug.
+    using Observer = std::function<void(const std::string& method,
+                                        const std::string& url,
+                                        const HttpResponse& res)>;
+    void set_observer(Observer cb) { m_observer = std::move(cb); }
+
     HttpResponse post(const std::string& url,
                       const std::string& body,
                       const std::map<std::string, std::string>& reqHeaders) const;
@@ -62,6 +69,7 @@ public:
 private:
     std::string m_cookieFile;
     bool        m_debug = false;
+    Observer    m_observer;
 
     // Shared GET/POST implementation with automatic retry on transient errors.
     HttpResponse perform(const std::string& method,

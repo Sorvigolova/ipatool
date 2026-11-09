@@ -7,6 +7,8 @@
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <functional>
+#include <iterator>
 #include <stdexcept>
 #include <cstring>
 #include <algorithm>
@@ -15,6 +17,7 @@
 #include <fstream>
 #include <filesystem>   // C++17 — replaces getcwd / stat / S_ISDIR
 #include <regex>
+#include <random>
 #include <ctime>
 #include <cstdint>
 #include <zlib.h>        // raw inflate for the range-read Info.plist (min-OS)
@@ -171,6 +174,7 @@ static std::vector<uint8_t> load_sap_asset(const char* name) {
         { "CommerceKit",  _binary_CommerceKit_start,  _binary_CommerceKit_end  },
         { "CoreFP.icxs",  _binary_CoreFP_icxs_start,  _binary_CoreFP_icxs_end  },
         { "storeagent",   _binary_storeagent_start,   _binary_storeagent_end   },
+        { "CoreADI",      _binary_CoreADI_start,      _binary_CoreADI_end      },
     };
     for (auto& e : kEmbed) {
         if (std::strcmp(e.name, name) == 0 && e.start && e.end > e.start)
@@ -184,6 +188,7 @@ static std::vector<uint8_t> load_sap_asset(const char* name) {
         { "CommerceKit",  IDR_SAP_COMMERCEKIT   },
         { "CoreFP.icxs",  IDR_SAP_COREFP_ICXS  },
         { "storeagent",   IDR_SAP_STOREAGENT    },
+        { "CoreADI",      IDR_SAP_COREADI       },
     };
     for (auto& e : kMap) {
         if (std::strcmp(e.name, name) == 0) {
@@ -352,12 +357,17 @@ static void debug_err(const std::string& s) {
     fwrite(s.data(), 1, s.size(), stderr);
 }
 
+namespace {
+bool g_adiLog = false;                  // [ADI] trace, follows --debug
+void prov_log(const std::string& s);    // defined below
+}
+
 static void debug_dump_request(const char* label, const char* method,
                                const std::string& url,
                                const std::map<std::string, std::string>& headers,
                                const std::string& body) {
     std::ostringstream o;
-    o << "[DEBUG] ── " << label << " request ──\n"
+    o << "[DEBUG] -- " << label << " request --\n"
       << "[DEBUG] " << method << " " << url << "\n"
       << "[DEBUG] request headers:\n";
     for (auto& [k, v] : headers)
@@ -368,7 +378,7 @@ static void debug_dump_request(const char* label, const char* method,
 
 static void debug_dump_response(const char* label, const HttpResponse& res) {
     std::ostringstream o;
-    o << "[DEBUG] ── " << label << " response ──\n"
+    o << "[DEBUG] -- " << label << " response --\n"
       << "[DEBUG] status: " << res.statusCode << "\n"
       << "[DEBUG] response headers:\n";
     for (auto& [k, v] : res.headers)
@@ -472,6 +482,8 @@ Account AppStore::login(const std::string& email,
     // Fetch bag for both the auth endpoint and SAP config
     BagOutput bag = fetch_bag(guid);
     std::string loginEndpoint = endpoint.empty() ? bag.authEndpoint : endpoint;
+
+    prov_log("authenticate endpoint: " + loginEndpoint);
 
     // Create SAP signer — performs handshake with Apple servers (v2.4.0+).
     // Apple rejects unsigned authenticate requests and still counts them as
@@ -775,7 +787,7 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
                 // complete-but-corrupt file — safe to discard. Re-download once
                 // from scratch (remove → rangeStart 0 → full GET) and re-check.
                 if (m_debug)
-                    fprintf(stderr, "[DEBUG] md5 mismatch — discarding and re-downloading once\n");
+                    fprintf(stderr, "[DEBUG] md5 mismatch - discarding and re-downloading once\n");
                 fs::remove(ipt::fs_path(rawTmpPath));
                 m_http.download(downloadURL, rawTmpPath, 0, progress);
 
@@ -792,7 +804,7 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
                 }
             }
         } else if (m_debug) {
-            fprintf(stderr, "[DEBUG] no md5 in response — skipping hash verification\n");
+            fprintf(stderr, "[DEBUG] no md5 in response - skipping hash verification\n");
         }
         // Completion ping is best-effort: a failure here must not invalidate the
         // file we already downloaded and verified.
@@ -1307,6 +1319,7 @@ std::string AppStore::get_guid() {
 
 void AppStore::set_debug(bool v) {
     m_debug = v;
+    g_adiLog = v;
     m_http.set_debug(v);
     SapSigner::SetDebug(v);
     device_mac_set_debug(v);
@@ -1338,6 +1351,353 @@ std::vector<uint8_t> AppStore::generate_kbsync(uint64_t dsid) {
         fprintf(stderr, "[DEBUG] kbsync: %zu bytes for DSID %llu\n",
                 kbsync.size(), static_cast<unsigned long long>(dsid));
     return kbsync;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Store AMD (ADI provisioning)
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// DSIDs used by the anonymous (no account) provisioning path — same values the
+// upstream Go port uses: ADI is provisioned for ~0, kbsync is made for ~1.
+constexpr uint64_t kAnonAdiDSID    = ~uint64_t(0);
+
+// User-Agent for the native Store flow: bag (ix=6), authenticate, provisioning
+// finish and the AMD-carrying commerce requests.
+constexpr const char* PROV_AUTH_UA =
+    "Configurator/2.21 (Macintosh; OS X 15.7; 24G222) AppleWebKit/0620.2.4.11.6";
+// Fallbacks = what the Mac App Store bag (bag.xml?ix=5, MacAppStore UA) serves
+// for md-/amd-finish-provisioning (Nov 2026).
+constexpr const char* kDefaultMdFinishURL =
+    "https://auth.itunes.apple.com/auth/v1/otp/1.0/finish";
+constexpr const char* kDefaultAmdFinishURL =
+    "https://auth.itunes.apple.com/auth/v1/otp/1.5/finish";
+
+void prov_log(const std::string& s) {
+    if (g_adiLog) debug_err("[ADI] " + s + "\n");
+}
+
+std::string dsid_str(uint64_t dsid) {
+    if (dsid == kAnonAdiDSID) return "-1 (anonymous)";
+    return std::to_string(dsid);
+}
+
+// "https://host/path?query" → "host/path" (keeps the log readable)
+std::string short_url(const std::string& url) {
+    std::string s = url;
+    auto p = s.find("://");
+    if (p != std::string::npos) s = s.substr(p + 3);
+    auto q = s.find('?');
+    if (q != std::string::npos) s = s.substr(0, q);
+    return s;
+}
+
+bool is_md_header(const std::string& k) {   // k is lower-case
+    return k.rfind("x-apple-md", 0) == 0 || k.rfind("x-apple-amd", 0) == 0 ||
+           k.rfind("x-apple-i-md", 0) == 0;
+}
+
+std::string clip(const std::string& v, size_t n = 96) {
+    return v.size() <= n ? v : v.substr(0, n) + "...(" + std::to_string(v.size()) + " chars)";
+}
+
+PlistDict decode_plist_quiet(const std::string& body) {
+    try { return decode_plist(body); } catch (...) { return {}; }
+}
+
+// plist value → bytes: <data> as-is, <string> base64-decoded.
+std::vector<uint8_t> plist_bytes(const PlistDict& d, const std::string& key) {
+    auto it = d.find(key);
+    if (it == d.end()) return {};
+    if (it->second.isData())   return it->second.dataVal;
+    if (it->second.isString()) {
+        try { return SapBase64::Decode(it->second.str()); } catch (...) {}
+    }
+    return {};
+}
+
+} // namespace
+
+void AppStore::init_store_adi(const std::string& cookieFile) {
+    if (!cookieFile.empty()) {
+        auto slash = cookieFile.find_last_of("/\\");
+        std::string dir = slash == std::string::npos ? "." : cookieFile.substr(0, slash);
+        m_adiStatePath = dir + "/adi-state";
+        std::error_code ec;
+        m_adiStateExisted = std::filesystem::exists(ipt::fs_path(m_adiStatePath), ec);
+    }
+
+    // With --debug: report store/auth responses and any MD-family header.
+    m_http.set_observer([this](const std::string& method, const std::string& url,
+                               const HttpResponse& res) {
+        if (!m_debug) return;
+        std::string line = method + " " + short_url(url) + " -> " +
+                           std::to_string(res.statusCode);
+        bool any = false;
+        for (const auto& [k, v] : res.headers) {
+            if (!is_md_header(k)) continue;
+            line += "\n        " + k + ": " + clip(v);
+            any = true;
+        }
+        if (!any) {
+            // Action headers only ever come from the store/auth hosts.
+            std::string host = short_url(url);
+            host = host.substr(0, host.find('/'));
+            bool storeHost = host.find("buy.itunes.apple.com") != std::string::npos ||
+                             host == "auth.itunes.apple.com" ||
+                             host == "downloaddispatch.itunes.apple.com";
+            if (!storeHost) return;
+            line += "   (response: no md/amd action)";
+        }
+        prov_log(line);
+    });
+}
+
+StoreAgentMachine& AppStore::adi_machine() {
+    if (m_adi) return *m_adi;
+
+    auto t0 = std::chrono::steady_clock::now();
+    prov_log("starting storeagent + CoreADI emulator (FairPlay init can take a while)...");
+    m_adi = StoreAgentMachine::Create(
+        load_sap_asset("CoreFP"),
+        load_sap_asset("CommerceCore"),
+        load_sap_asset("CommerceKit"),
+        load_sap_asset("CoreFP.icxs"),
+        load_sap_asset("storeagent"),
+        load_sap_asset("CoreADI"));
+
+    // Saved state first: FairPlay's global init reads the SC Info keybag.
+    if (!m_adiStatePath.empty()) {
+        std::ifstream in(ipt::fs_path(m_adiStatePath), std::ios::binary);
+        if (in) {
+            std::vector<uint8_t> st((std::istreambuf_iterator<char>(in)),
+                                     std::istreambuf_iterator<char>());
+            try {
+                m_adi->ImportAdiState(st);
+                prov_log("loaded ADI state (" + std::to_string(st.size()) + " bytes)");
+            } catch (const std::exception& e) {
+                prov_log(std::string("ignoring unreadable ADI state: ") + e.what());
+            }
+        } else {
+            prov_log("no saved ADI state - starting unprovisioned");
+        }
+    }
+
+    m_adiCtx = m_adi->InitializeGlobal(device_mac_address());
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    prov_log("emulator ready in " + std::to_string(ms) + " ms, FairPlay ctx " +
+             std::to_string(m_adiCtx));
+    return *m_adi;
+}
+
+void AppStore::adi_save() {
+    if (!m_adi || m_adiStatePath.empty()) return;
+    auto st = m_adi->ExportAdiState();
+    std::ofstream out(ipt::fs_path(m_adiStatePath), std::ios::binary | std::ios::trunc);
+    if (!out) { prov_log("WARNING: cannot write ADI state to " + m_adiStatePath); return; }
+    out.write(reinterpret_cast<const char*>(st.data()), static_cast<std::streamsize>(st.size()));
+}
+
+std::string AppStore::prov_finish_url(uint64_t /*dsid*/) const {
+    // The endpoint follows the header family the server used (md → otp/1.0,
+    // amd → otp/1.5 in the Mac App Store bag); either one accepts an account
+    // DSID or the anonymous -1, so the DSID does not pick the endpoint.
+    if (!m_provFinishUrl.empty()) return m_provFinishUrl;
+    if (m_mdFamily == "X-Apple-AMD")
+        return !m_bagAmdFinish.empty() ? m_bagAmdFinish : kDefaultAmdFinishURL;
+    return !m_bagMdFinish.empty() ? m_bagMdFinish : kDefaultMdFinishURL;
+}
+
+void AppStore::prov_add_md(std::map<std::string, std::string>& hdrs, uint64_t dsid,
+                           const char* label) {
+    // Lazy start: with no saved state and no provisioning done in this run
+    // nothing can be provisioned, so don't pay for the FairPlay init yet.
+    if (!m_adi && !m_adiStateExisted) {
+        prov_log(std::string(label) + ": DSID " + dsid_str(dsid) +
+                 " not provisioned (no ADI state yet) -> no MD headers");
+        return;
+    }
+    try {
+        auto& m = adi_machine();
+        int32_t st = 0;
+        auto otp = m.AdiRequestOTP(dsid, &st);
+        if (!otp) {
+            prov_log(std::string(label) + ": DSID " + dsid_str(dsid) +
+                     " not provisioned (OTP status " + std::to_string(st) + ") -> no MD headers");
+            return;
+        }
+        hdrs[m_mdFamily]        = SapBase64::Encode(otp->otp);
+        hdrs[m_mdFamily + "-M"] = SapBase64::Encode(otp->machineID);
+        prov_log(std::string(label) + ": DSID " + dsid_str(dsid) + " provisioned -> sending " +
+                 m_mdFamily + " (" + std::to_string(otp->otp.size()) + " B) + " +
+                 m_mdFamily + "-M (" + std::to_string(otp->machineID.size()) + " B)");
+        adi_save();   // the OTP counter lives in adi.pb
+    } catch (const std::exception& e) {
+        prov_log(std::string(label) + ": OTP failed: " + e.what());
+    }
+}
+
+bool AppStore::prov_handle(const char* label, const HttpResponse& res, uint64_t dsid,
+                           const std::string& guid, const std::string& token) {
+
+    std::string action, data, family;
+    for (const char* fam : { "x-apple-md", "x-apple-amd" }) {
+        auto a = res.headers.find(std::string(fam) + "-action");
+        if (a == res.headers.end()) continue;
+        action = a->second;
+        auto d = res.headers.find(std::string(fam) + "-data");
+        if (d != res.headers.end()) data = d->second;
+        family = std::string(fam) == "x-apple-md" ? "X-Apple-MD" : "X-Apple-AMD";
+        break;
+    }
+    if (action.empty()) return false;
+
+    if (family != m_mdFamily) {
+        prov_log("server uses the " + family + " header family - switching");
+        m_mdFamily = family;
+    }
+    prov_log(std::string(label) + ": server action '" + action + "' for DSID " + dsid_str(dsid) +
+             (data.empty() ? "" : ", data " + std::to_string(data.size()) + " chars"));
+
+    try {
+        auto& m = adi_machine();
+
+        if (action == "RP") {   // Restart Provisioning
+            int32_t st = m.AdiErase(dsid);
+            adi_save();
+            prov_log("RP: erased provisioning (status " + std::to_string(st) + "), resending without MD");
+            return true;
+        }
+
+        if (action == "SM") {   // Sync Machine
+            prov_log("SM: machine sync requested - not implemented yet (md-sync-machine), continuing");
+            return false;
+        }
+
+        if (action != "SP") {
+            prov_log("unknown action '" + action + "' - ignored");
+            return false;
+        }
+
+        // ── SP: Start Provisioning ─────────────────────────────────────────
+        if (data.empty()) { prov_log("SP without md-data - cannot provision"); return false; }
+        auto spim = SapBase64::Decode(data);
+        prov_log("SP: server data " + std::to_string(spim.size()) + " bytes");
+
+        auto start = m.AdiStartProvisioning(dsid, spim);
+        prov_log("SP: ADI start OK - clientData " + std::to_string(start.clientData.size()) +
+                 " bytes, session " + std::to_string(start.session));
+
+        // Anonymous finish (DSID -1): {clientData, guid}. Only an account
+        // DSID gets the 10.9 storeagent extras (kbsync, dsId).
+        PlistDict p;
+        p["clientData"] = PlistValue::makeString(SapBase64::Encode(start.clientData));
+        p["guid"]       = PlistValue::makeString(guid);
+        if (dsid != kAnonAdiDSID) {
+            auto kb = m.KBSyncData(m_adiCtx, dsid);
+            prov_log("SP: kbsync " + std::to_string(kb.size()) + " bytes for DSID " + std::to_string(dsid));
+            p["kbsync"] = PlistValue::makeString(SapBase64::Encode(kb));
+            p["dsId"]   = PlistValue::makeInt(static_cast<int64_t>(dsid));
+        }
+        std::string body = encode_plist_xml(p);
+
+        std::map<std::string, std::string> hdrs = {
+            {"Content-Type", "application/x-apple-plist"},
+            {"User-Agent",   PROV_AUTH_UA},
+        };
+        if (dsid != kAnonAdiDSID) {
+            hdrs["X-Dsid"]      = std::to_string(dsid);
+            hdrs["iCloud-DSID"] = std::to_string(dsid);
+        }
+        if (!token.empty() && dsid != kAnonAdiDSID) hdrs["X-Token"] = token;
+
+        std::string url = prov_finish_url(dsid);
+        prov_log("SP: POST " + url);
+        if (m_debug) debug_dump_request("finishProvisioning", "POST", url, hdrs, body);
+        HttpResponse fr = m_http.post(url, body, hdrs);
+        if (m_debug) debug_dump_response("finishProvisioning", fr);
+
+        PlistDict r = decode_plist_quiet(fr.body);
+        {
+            std::string keys;
+            for (const auto& [k, v] : r) keys += (keys.empty() ? "" : ", ") + k;
+            prov_log("SP: finish -> HTTP " + std::to_string(fr.statusCode) +
+                     ", keys: [" + keys + "]");
+        }
+        if (!dict_str(r, "failureType").empty() || !dict_str(r, "customerMessage").empty()) {
+            prov_log("SP: server refused: failureType=" + dict_str(r, "failureType") +
+                     " customerMessage=" + dict_str(r, "customerMessage"));
+            return false;
+        }
+
+        auto si = plist_bytes(r, "settingInfo");
+        auto tk = plist_bytes(r, "transportKey");
+        if (si.empty() || tk.empty()) {
+            prov_log("SP: response has no settingInfo/transportKey" +
+                     std::string(fr.body.empty() ? "" : " - body: " + clip(fr.body, 300)));
+            return false;
+        }
+        prov_log("SP: settingInfo " + std::to_string(si.size()) + " B, transportKey " +
+                 std::to_string(tk.size()) + " B");
+
+        m.AdiEndProvisioning(start.session, si, tk);
+        prov_log("SP: ADI end OK - DSID " + dsid_str(dsid) + " is provisioned");
+
+        auto keyBag = plist_bytes(r, "keybag");
+        if (!keyBag.empty()) {
+            int32_t kst = m.ImportKeyBag(m_adiCtx, keyBag);
+            prov_log("SP: FairPlay keybag " + std::to_string(keyBag.size()) +
+                     " B imported, status " + std::to_string(kst));
+        }
+        adi_save();
+
+        int32_t st = 0;
+        auto otp = m.AdiRequestOTP(dsid, &st);
+        prov_log(otp ? "SP: OTP check OK (" + std::to_string(otp->otp.size()) + " B) - resending with MD"
+                     : "SP: OTP check still fails (status " + std::to_string(st) + ")");
+        return otp.has_value();
+    } catch (const std::exception& e) {
+        prov_log(std::string(label) + ": action '" + action + "' failed: " + e.what());
+        return false;
+    }
+}
+
+namespace {
+// Depth-first lookup of a string key anywhere in the bag (urlBag, root, nested).
+std::string bag_find(const PlistDict& d, const std::string& key) {
+    std::string v = dict_str(d, key);
+    if (!v.empty()) return v;
+    for (const auto& [k, val] : d)
+        if (val.isDict()) {
+            v = bag_find(val.dictVal, key);
+            if (!v.empty()) return v;
+        }
+    return {};
+}
+} // namespace
+
+HttpResponse AppStore::prov_post(const char* label, const std::string& url,
+                                 const std::string& body,
+                                 const std::map<std::string, std::string>& headers,
+                                 uint64_t dsid, const std::string& guid,
+                                 const std::string& token,
+                                 const std::string& storeFront) {
+    HttpResponse res;
+    for (int round = 0; round < 3; ++round) {
+        auto h = headers;
+        h["User-Agent"] = PROV_AUTH_UA;
+        if (!token.empty())      h["X-Token"]             = token;
+        if (!storeFront.empty()) h["X-Apple-Store-Front"] = storeFront;
+        prov_add_md(h, dsid, label);
+        if (m_debug) debug_dump_request(label, "POST", url, h, body);
+        res = m_http.post(url, body, h);
+        if (m_debug) debug_dump_response(label, res);
+        if (!prov_handle(label, res, dsid, guid, token)) break;
+        prov_log(std::string(label) + ": resending (round " + std::to_string(round + 2) + ")");
+    }
+    return res;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1397,10 +1757,9 @@ PlistDict AppStore::volume_store_download_product(const Account& acc, const App&
         p["hasBeenAuthedForBuy"] = PlistValue::makeString("true");
 
     std::string body = encode_plist_xml(p);
-    if (m_debug) debug_dump_request("volumeStoreDownload", "POST", url, hdrs, body);
-    HttpResponse res = m_http.post(url, body, hdrs);
+    HttpResponse res = prov_post("volumeStoreDownload", url, body, hdrs,
+                    kAnonAdiDSID, guid, acc.passwordToken.get(), acc.storeFront);
     httpStatus = res.statusCode;
-    if (m_debug) debug_dump_response("volumeStoreDownload", res);
     return decode_plist(res.body);
 }
 
@@ -1417,11 +1776,17 @@ bool AppStore::report_download_done(const Account& acc, int64_t songId,
 
     // Inject the pod prefix right after the scheme:
     //   https://buy.itunes.apple.com/… → https://p<pod>-buy.itunes.apple.com/…
+    // The bag may already be pod-personalised (Apple reads the itspod cookie
+    // set at sign-in), so leave a host that already starts with p<digits>-.
     std::string url = songDownloadDoneEndpoint;
     if (!acc.pod.empty()) {
         auto pos = url.find("://");
-        if (pos != std::string::npos)
-            url.insert(pos + 3, "p" + acc.pod + "-");
+        if (pos != std::string::npos) {
+            size_t h = pos + 3, i = h + 1;
+            while (i < url.size() && std::isdigit((unsigned char)url[i])) ++i;
+            bool hasPod = i < url.size() && url[h] == 'p' && i > h + 1 && url[i] == '-';
+            if (!hasPod) url.insert(h, "p" + acc.pod + "-");
+        }
     }
     url += "?songId="       + std::to_string(songId)
          + "&download-id="  + downloadId
@@ -1571,7 +1936,7 @@ PlistDict AppStore::resolve_download(const Account& acc, const App& app,
                     m_regeneratedKbsync = fresh;   // caller caches this instead of clearing
                     kb = fresh;
                     if (m_debug)
-                        fprintf(stderr, "[DEBUG] volumeStoreDownload HTTP %d — regenerated kbsync, retrying\n", st);
+                        fprintf(stderr, "[DEBUG] volumeStoreDownload HTTP %d - regenerated kbsync, retrying\n", st);
                     int stR = 0;
                     vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
                                                            kb, externalVersionID,
@@ -1594,7 +1959,7 @@ PlistDict AppStore::resolve_download(const Account& acc, const App& app,
                                dict_str(dit->second.dictVal, "kind") == "authorization");
             if (authDialog) {
                 if (m_debug)
-                    fprintf(stderr, "[DEBUG] volumeStoreDownload auth dialog — retrying with hasBeenAuthedForBuy\n");
+                    fprintf(stderr, "[DEBUG] volumeStoreDownload auth dialog - retrying with hasBeenAuthedForBuy\n");
                 int st2 = 0;
                 vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
                                                        kb, externalVersionID,
@@ -1644,7 +2009,7 @@ PlistDict AppStore::resolve_download(const Account& acc, const App& app,
 
         if (wantUpdate && !pin.empty() && !m_updateEndpoint.empty()) {
             if (m_debug)
-                fprintf(stderr, "[DEBUG] redownloadProduct did not serve — trying updateProduct\n");
+                fprintf(stderr, "[DEBUG] redownloadProduct did not serve - trying updateProduct\n");
             try {
                 PlistDict up = update_product(acc, app, guid, pin);
                 if (served(up)) return up;
@@ -1694,10 +2059,9 @@ PlistDict AppStore::redownload_product(const Account& acc, const App& app,
     std::string body = download_request_payload(guid, app, pin);
     std::string url  = redownloadEndpoint + "?guid=" + guid;
 
-    if (m_debug) debug_dump_request(label, "POST", url, hdrs, body);
-    HttpResponse res = m_http.post(url, body, hdrs);
+    HttpResponse res = prov_post(label, url, body, hdrs, kAnonAdiDSID, guid,
+                    acc.passwordToken.get(), acc.storeFront);
     httpStatus = res.statusCode;
-    if (m_debug) debug_dump_response(label, res);
 
     return decode_plist_safe(res.body);
 }
@@ -1712,9 +2076,8 @@ PlistDict AppStore::update_product(const Account& acc, const App& app,
     std::string body = download_request_payload(guid, app, externalVersionID);
     std::string url  = m_updateEndpoint + "?guid=" + guid;
 
-    if (m_debug) debug_dump_request("updateProduct", "POST", url, hdrs, body);
-    HttpResponse res = m_http.post(url, body, hdrs);
-    if (m_debug) debug_dump_response("updateProduct", res);
+    HttpResponse res = prov_post("updateProduct", url, body, hdrs, kAnonAdiDSID, guid,
+                    acc.passwordToken.get(), acc.storeFront);
 
     PlistDict data = decode_plist_safe(res.body);
 
@@ -1868,7 +2231,7 @@ std::string AppStore::redownload_version_id(const Account& acc, const App& app,
         // Upstream aborts here; we keep the previous unpinned redownload so
         // apps that already worked are not broken by a lookup failure.
         if (m_debug)
-            fprintf(stderr, "[DEBUG] %s — sending unpinned redownload\n", e.what());
+            fprintf(stderr, "[DEBUG] %s - sending unpinned redownload\n", e.what());
         return "";
     }
 }
@@ -1877,42 +2240,89 @@ std::string AppStore::redownload_version_id(const Account& acc, const App& app,
 
 // Fetch and parse bag.xml. Called with no guid by external callers (uses
 // get_guid()); login() passes its own guid so the whole flow shares one identity.
-AppStore::BagOutput AppStore::fetch_bag(const std::string& guidArg) {
-    std::string guid = guidArg.empty() ? get_guid() : guidArg;
-    std::string url = std::string("https://") + PRIVATE_INIT_DOMAIN
-                    + PRIVATE_INIT_PATH + "?guid=" + guid;
-    HttpResponse res = m_http.get(url, {{"Accept", "application/xml"}});
+PlistDict AppStore::request_bag(const std::string& query,
+                                const std::map<std::string, std::string>& headers,
+                                const char* label) {
+    std::string url = std::string("https://") + PRIVATE_INIT_DOMAIN + PRIVATE_INIT_PATH + query;
+    HttpResponse res = m_http.get(url, headers);
 
     // Bag body is huge — log only status and size.
     if (m_debug)
-        fprintf(stderr, "[DEBUG] bag status: %d (%zu bytes)\n",
-                res.statusCode, res.body.size());
+        fprintf(stderr, "[DEBUG] %s status: %d (%zu bytes)\n",
+                label, res.statusCode, res.body.size());
 
     if (res.statusCode != 200)
-        throw IpaError("bag request failed: " + std::to_string(res.statusCode));
+        throw IpaError(std::string(label) + " request failed: " + std::to_string(res.statusCode));
 
     PlistDict d = decode_plist(res.body);
 
+    // Signed form: {bag = <data: nested plist>, certs, signature}
+    bool signedBag = false;
+    if (auto it = d.find("bag"); it != d.end() && it->second.isData()) {
+        std::string inner(it->second.dataVal.begin(), it->second.dataVal.end());
+        d = decode_plist(inner);
+        signedBag = true;
+    }
+
+    // --debug: keep the raw body and report which keys we rely on are present.
+    if (m_debug) {
+        std::string l = label;
+        std::string tag = l == "native bag" ? "ix6-native" : "default";
+        auto slash = m_adiStatePath.find_last_of("/\\");
+        std::string dir  = slash == std::string::npos ? "." : m_adiStatePath.substr(0, slash);
+        std::string dump = dir + "/bag-" + tag + ".xml";
+        std::ofstream out(ipt::fs_path(dump), std::ios::binary | std::ios::trunc);
+        if (out) out.write(res.body.data(), static_cast<std::streamsize>(res.body.size()));
+
+        const PlistDict* ub = &d;
+        if (auto u = d.find("urlBag"); u != d.end() && u->second.isDict()) ub = &u->second.dictVal;
+        std::string report = std::string(label) + " (" + query + "): " +
+                             std::to_string(res.body.size()) + " B, " +
+                             (signedBag ? "signed" : "plain") + ", " +
+                             (ub != &d ? "urlBag" : "flat") + ", " +
+                             std::to_string(ub->size()) + " keys -> " + dump;
+        static const char* kKeys[] = {
+            "authenticateAccount", "sign-sap-setup", "sign-sap-setup-cert", "sign-sap-version",
+            "volumeStoreDownloadProduct", "redownloadProduct", "updateProduct",
+            "songDownloadDone", "buyProduct",
+            "md-finish-provisioning", "amd-finish-provisioning",
+            "md-sync-machine", "amd-sync-machine",
+        };
+        for (const char* k : kKeys) {
+            std::string v = bag_find(d, k);
+            report += "\n        " + std::string(k) + " = " + (v.empty() ? "<absent>" : clip(v, 110));
+        }
+        prov_log(report);
+    }
+    return d;
+}
+
+AppStore::BagOutput AppStore::fetch_bag(const std::string& guidArg) {
+    std::string guid = guidArg.empty() ? get_guid() : guidArg;
+
+    // One bag for everything — bag.xml?guid=&ix=6 requested as Configurator
+    // 2.21 (OS X 15.7). It is plain and flat (no urlBag) and holds the native
+    // authenticate endpoint, SAP config, download endpoints and the md-/amd-
+    // provisioning URLs.
+    PlistDict d = request_bag("?guid=" + guid + "&ix=6", {
+        {"Accept",     "application/xml"},
+        {"User-Agent", PROV_AUTH_UA},
+    }, "native bag");
+
     BagOutput out;
 
-    // Extract redownloadProduct (simple flat lookup under urlBag)
+    // Endpoints + SAP config: under urlBag when present, otherwise flat.
     auto ubIt = d.find("urlBag");
-    if (ubIt != d.end() && ubIt->second.isDict()) {
-        out.redownloadEndpoint  = dict_str(ubIt->second.dictVal, "redownloadProduct");
-        out.updateEndpoint      = dict_str(ubIt->second.dictVal, "updateProduct");
-        out.volumeStoreDownloadEndpoint = dict_str(ubIt->second.dictVal, "volumeStoreDownloadProduct");
-        out.songDownloadDoneEndpoint = dict_str(ubIt->second.dictVal, "songDownloadDone");
-        m_updateEndpoint        = out.updateEndpoint;
-
-        // ── SAP config fields (v2.4.0+) — must be extracted here, before
-        //    the early returns below for the auth endpoint. ──────────────────
-        const PlistDict& ub = ubIt->second.dictVal;
-        out.signSapSetup     = dict_str(ub, "sign-sap-setup");
-        out.signSapSetupCert = dict_str(ub, "sign-sap-setup-cert");
-        std::string sapVer   = dict_str(ub, "sign-sap-version");
-        if (!sapVer.empty()) {
-            try { out.sapVersion = (uint32_t)std::stoul(sapVer); } catch (...) {}
-        }
+    const PlistDict& ub = (ubIt != d.end() && ubIt->second.isDict()) ? ubIt->second.dictVal : d;
+    out.redownloadEndpoint          = dict_str(ub, "redownloadProduct");
+    out.updateEndpoint              = dict_str(ub, "updateProduct");
+    out.volumeStoreDownloadEndpoint = dict_str(ub, "volumeStoreDownloadProduct");
+    out.songDownloadDoneEndpoint    = dict_str(ub, "songDownloadDone");
+    m_updateEndpoint                = out.updateEndpoint;
+    out.signSapSetup     = dict_str(ub, "sign-sap-setup");
+    out.signSapSetupCert = dict_str(ub, "sign-sap-setup-cert");
+    if (std::string sapVer = dict_str(ub, "sign-sap-version"); !sapVer.empty()) {
+        try { out.sapVersion = (uint32_t)std::stoul(sapVer); } catch (...) {}
     }
 
     // Convert guid "AABBCCDDEEFF" → raw bytes for SapSigner::Config
@@ -1921,90 +2331,25 @@ AppStore::BagOutput AppStore::fetch_bag(const std::string& guidArg) {
         catch (...) { break; }
     }
 
-    // Extract authenticateAccount (complex: may need URL addend)
-    std::string ep;
+    out.mdFinishProvisioning  = bag_find(d, "md-finish-provisioning");
+    out.amdFinishProvisioning = bag_find(d, "amd-finish-provisioning");
+    out.mdSyncMachine         = bag_find(d, "md-sync-machine");
+    out.amdSyncMachine        = bag_find(d, "amd-sync-machine");
+    if (!out.mdFinishProvisioning.empty())  m_bagMdFinish  = out.mdFinishProvisioning;
+    if (!out.amdFinishProvisioning.empty()) m_bagAmdFinish = out.amdFinishProvisioning;
+    if (!out.mdSyncMachine.empty())         m_bagMdSync    = out.mdSyncMachine;
+    if (!out.amdSyncMachine.empty())        m_bagAmdSync   = out.amdSyncMachine;
 
-    // Try nested: d["urlBag"]["authenticateAccount"]
-    if (ubIt != d.end() && ubIt->second.isDict()) {
-        ep = dict_str(ubIt->second.dictVal, "authenticateAccount");
-        if (!ep.empty()) goto FOUND_URL;
+    // Native endpoint is used exactly as advertised — no path-addend
+    // rewriting and no trailing '/', as PR #5 does; .../native/fast
+    // answered MD-less requests with an empty 204 in our tests.
+    out.authEndpoint = bag_find(d, "authenticateAccount");
+    if (out.authEndpoint.empty()) {
+        out.authEndpoint = "https://auth.itunes.apple.com/auth/v1/native";
+        prov_log("bag has no authenticateAccount - using " + out.authEndpoint);
     }
-
-    // Try flat: d["authenticateAccount"] directly
-    {
-        ep = dict_str(d, "authenticateAccount");
-        if (!ep.empty()) goto FOUND_URL;
-    }
-
-    // Scan all top-level dict values for authenticateAccount
-    for (auto& [k, v] : d) {
-        if (v.isDict()) {
-            ep = dict_str(v.dictVal, "authenticateAccount");
-            if (!ep.empty()) goto FOUND_URL;
-        }
-    }
-
-    FOUND_URL:
-    if (!ep.empty()) {
-        //Try to find URL addend by its path and add it to the tail
-        std::string addend;
-        std::string path = std::regex_replace(ep, std::regex(R"(^https?://[^/]+(/?))"), "");
-
-        //Check if path is empty
-        if (path.empty()) { out.authEndpoint = ep; return out; }
-
-        // Temporary stack for linear deep XML traversal
-        std::vector<std::reference_wrapper<const PlistDict>> xml_stack;
-        xml_stack.push_back(d);
-
-        while (!xml_stack.empty()) {
-            const PlistDict& current_layer = xml_stack.back();
-            xml_stack.pop_back();
-
-            // Try to find the target path key on the current layer
-            auto it = current_layer.find(path);
-            if (it != current_layer.end()) {
-                auto& v = it->second;
-
-                // Check if it is a non-empty array
-                if (v.isArray() && !v.arrayVal.empty()) {
-
-                    // Get the first element from the array
-                    auto& first_item = v.arrayVal[0];
-
-                    // Check if it is a string and extract it
-                    if (first_item.isString()) {
-                        addend = first_item.strVal;
-                        goto FOUND_ADDEND;
-                    }
-                }
-            }
-
-            // Push all nested dictionaries onto the stack for further processing
-            for (auto& [k, v] : current_layer) {
-                if (v.isDict()) {
-                    xml_stack.push_back(v.dictVal);
-                }
-            }
-        }
-        FOUND_ADDEND:
-        if (!addend.empty()) {
-            if (ep.back() != '/') ep += "/";
-            ep += addend;
-        }
-
-        ep += "/";
-        out.authEndpoint = ep;
-        return out;
-    }
-
-    // ── Extract SAP setup fields (v2.4.0+) ───────────────────────────────
-    // Fallback to known-good hardcoded endpoint
-    fprintf(stderr,
-        "[WARN] Could not parse urlBag -- using default auth endpoint.\n"
-        "       Retry with --debug to inspect the raw server response.\n");
-    out.authEndpoint = "https://auth.itunes.apple.com/auth/v1/native/fast";
     return out;
+
 }
 
 // ── Login implementation ─────────────────────────────────────────────────
@@ -2060,6 +2405,8 @@ Account AppStore::do_login(const std::string& email,
     for (int attempt = 1; retry && attempt <= 4; attempt++) {
         // Pod redirect: Apple expects attempt=1, not the outer loop counter
         int requestAttempt = fromRedirect ? 1 : attempt;
+        // Native endpoint: the 2FA retry (password + code) is attempt 2.
+        if (!authCode.empty()) requestAttempt = 2;
         fromRedirect = false;
 
         PlistDict payload;
@@ -2073,8 +2420,8 @@ Account AppStore::do_login(const std::string& email,
         std::string body = encode_plist_xml(payload);
 
         std::map<std::string, std::string> headers = {
-            {"Content-Type", "application/x-www-form-urlencoded"},
-            {"User-Agent",   CONFIGURATOR_UA},
+            {"Content-Type", "application/x-apple-plist"},
+            {"User-Agent",   PROV_AUTH_UA},
         };
 
         // SAP-sign the request body (v2.4.0+)
@@ -2089,22 +2436,36 @@ Account AppStore::do_login(const std::string& email,
             throw IpaError(std::string("failed to sign login request: ") + e.what());
         }
 
-        // Transport retry: up to 3 attempts on 204/404/5xx (250ms×attempt)
-        // 429 → hard stop. Matches Go sendAuthenticationRequest behaviour.
-        lastRes = {};
-        for (int tx = 1; tx <= 3; ++tx) {
-            if (m_debug) debug_dump_auth_request(currentURL, headers, body);
-            lastRes = m_http.post(currentURL, body, headers);
-            if (m_debug) debug_dump_auth_response(lastRes);
-            int sc  = lastRes.statusCode;
-            if (sc == 429)
-                throw IpaError("rate limited by Apple (HTTP 429): " + lastRes.body);
-            bool transient = (sc == 204 || sc == 404 || sc / 100 == 5);
-            if (!transient) break;
-            if (m_debug)
-                fprintf(stderr, "[DEBUG] auth HTTP %d — transport retry %d/3\n", sc, tx);
-            if (tx < 3)
-                std::this_thread::sleep_for(std::chrono::milliseconds(tx * 250));
+        // Up to 2 extra sends when the server asks for an ADI action. The
+        // first send carries MD only if DSID -1 is already provisioned;
+        // otherwise the native endpoint answers SP and prov_handle provisions.
+        const std::map<std::string, std::string> baseHeaders = headers;
+        for (int provRound = 0; provRound < 3; ++provRound) {
+            headers = baseHeaders;
+            prov_add_md(headers, kAnonAdiDSID, "authenticate");
+
+            // Transport retry: up to 3 sends on 5xx (250ms×attempt). 429 is a
+            // hard stop; 204/404 from the native endpoint mean "rejected", and
+            // every resend is a counted sign-in attempt, so they are final.
+            lastRes = {};
+            for (int tx = 1; tx <= 3; ++tx) {
+                if (m_debug) debug_dump_auth_request(currentURL, headers, body);
+                lastRes = m_http.post(currentURL, body, headers);
+                if (m_debug) debug_dump_auth_response(lastRes);
+                int sc = lastRes.statusCode;
+                if (sc == 429)
+                    throw IpaError("rate limited by Apple (HTTP 429): " + lastRes.body);
+                if (sc == 204 || sc == 404)
+                    prov_log("authenticate: HTTP " + std::to_string(sc) + " - not retrying");
+                if (sc / 100 != 5) break;
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] auth HTTP %d - transport retry %d/3\n", sc, tx);
+                if (tx < 3)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(tx * 250));
+            }
+
+            if (!prov_handle("authenticate", lastRes, kAnonAdiDSID, guid, "")) break;
+            prov_log("authenticate: resending (round " + std::to_string(provRound + 2) + ")");
         }
 
         lastData = decode_plist(lastRes.body);
@@ -2112,16 +2473,35 @@ Account AppStore::do_login(const std::string& email,
         std::string failureType     = dict_str(lastData, "failureType");
         std::string customerMessage = dict_str(lastData, "customerMessage");
 
-        if (lastRes.statusCode == 302) {
-            auto locIt = lastRes.headers.find("location");
-            if (locIt == lastRes.headers.end())
-                throw IpaError("redirect with no location header");
-            currentURL   = locIt->second;
-            fromRedirect = true;   // Apple expects attempt=1 on the pod-redirect POST
-            retry = true;
-        } else if (attempt == 1 && failureType == FAILURE_INVALID_CREDENTIALS) {
-            retry = true;
-        } else if (failureType.empty() && authCode.empty()
+        // The native endpoint may omit dsPersonId from the body and carry
+        // the DSID in the x-dsid response header instead.
+        if (dict_str(lastData, "dsPersonId").empty()) {
+            auto h = lastRes.headers.find("x-dsid");
+            if (h != lastRes.headers.end() && !h->second.empty() &&
+                h->second.find_first_not_of("0123456789") == std::string::npos) {
+                lastData["dsPersonId"] = PlistValue::makeString(h->second);
+                prov_log("authenticate: DSID taken from x-dsid header");
+            }
+        }
+        // Native redirects (relative Location allowed); stay on auth.itunes.
+        int sc = lastRes.statusCode;
+        if (sc == 301 || sc == 302 || sc == 307 || sc == 308) {
+            auto loc = lastRes.headers.find("location");
+            if (loc == lastRes.headers.end() || loc->second.empty())
+                throw IpaError("native authentication redirect has no location (HTTP " +
+                               std::to_string(sc) + ")");
+            std::string target = loc->second;
+            if (target.rfind("/auth/", 0) == 0) target = "https://auth.itunes.apple.com" + target;
+            if (target.rfind("https://auth.itunes.apple.com/auth/", 0) != 0)
+                throw IpaError("unexpected native authentication redirect: " + target);
+            prov_log("authenticate: redirect -> " + target);
+            currentURL   = target;
+            fromRedirect = true;
+            retry        = true;
+            continue;
+        }
+
+        if (failureType.empty() && authCode.empty()
                    && customerMessage == CUSTOMER_MSG_BAD_LOGIN) {
             throw AuthCodeRequired();
         } else if (failureType.empty()
@@ -2201,9 +2581,8 @@ PlistDict AppStore::do_purchase(const Account& acc, const App& app,
     };
 
     std::string body = encode_plist_xml(payload);
-    if (m_debug) debug_dump_request("buyProduct", "POST", url, headers, body);
-    HttpResponse res  = m_http.post(url, body, headers);
-    if (m_debug) debug_dump_response("buyProduct", res);
+    HttpResponse res = prov_post("buyProduct", url, body, headers,
+                    kAnonAdiDSID, guid, acc.passwordToken.get(), acc.storeFront);
     PlistDict    data  = decode_plist(res.body);
 
     std::string failureType     = dict_str(data, "failureType");

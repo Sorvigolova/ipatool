@@ -368,7 +368,7 @@ static const char* kPlistCT   = "application/x-plist";
 static std::vector<uint8_t> FetchCertificate(ISapHttpClient& http,
                                                const std::string& certURL) {
     if (SapSigner::Debug())
-        fprintf(stderr, "[DEBUG] ── SAP handshake step 1/2: fetch certificate ──\n");
+        fprintf(stderr, "[DEBUG] -- SAP handshake step 1/2: fetch certificate --\n");
     auto body = http.Get(certURL);
     return SapPlist::ExtractData(body, kCertKey);
 }
@@ -378,7 +378,7 @@ static std::vector<uint8_t> ExchangeSetup(ISapHttpClient& http,
                                             const std::string& setupURL,
                                             std::span<const uint8_t> request) {
     if (SapSigner::Debug())
-        fprintf(stderr, "[DEBUG] ── SAP handshake step 2/2: sign-sap-setup exchange ──\n");
+        fprintf(stderr, "[DEBUG] -- SAP handshake step 2/2: sign-sap-setup exchange --\n");
     auto plist = SapPlist::MakeData(kBufferKey, request);
     auto body  = http.Post(setupURL, plist, kPlistCT);
     return SapPlist::ExtractData(body, kBufferKey);

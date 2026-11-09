@@ -21,6 +21,9 @@ extern "C" {
     // storeagent (~2.5 MB)
     extern const uint8_t _binary_storeagent_start[];
     extern const uint8_t _binary_storeagent_end[];
+    // CoreADI (~2.5 MB, OS X 10.9 CoreADI.framework, fat i386/x86_64)
+    extern const uint8_t _binary_CoreADI_start[];
+    extern const uint8_t _binary_CoreADI_end[];
 }
 
 // Convenience: span-like view of each embedded asset
@@ -31,5 +34,6 @@ inline EmbeddedAsset embedded_CoreFP()       { return {_binary_CoreFP_start,    
 inline EmbeddedAsset embedded_CommerceCore() { return {_binary_CommerceCore_start, (size_t)(_binary_CommerceCore_end - _binary_CommerceCore_start )}; }
 inline EmbeddedAsset embedded_CommerceKit()  { return {_binary_CommerceKit_start,  (size_t)(_binary_CommerceKit_end  - _binary_CommerceKit_start  )}; }
 inline EmbeddedAsset embedded_CoreFP_icxs() { return {_binary_CoreFP_icxs_start,  (size_t)(_binary_CoreFP_icxs_end  - _binary_CoreFP_icxs_start  )}; }
+inline EmbeddedAsset embedded_CoreADI()     { return {_binary_CoreADI_start,      (size_t)(_binary_CoreADI_end      - _binary_CoreADI_start      )}; }
 inline EmbeddedAsset embedded_storeagent()  { return {_binary_storeagent_start,    (size_t)(_binary_storeagent_end   - _binary_storeagent_start   )}; }
 #endif // SAP_ASSETS_EMBEDDED

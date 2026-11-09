@@ -231,11 +231,11 @@ static std::string aes_gcm_decrypt(const std::vector<unsigned char>& blob,
 
     if (blob[0] == '{')
         throw std::runtime_error(
-            "account file is unencrypted — please run 'auth login' again");
+            "account file is unencrypted - please run 'auth login' again");
 
     if (blob[0] != FILE_FORMAT_V2)
         throw std::runtime_error(
-            "account file format is outdated — please run 'auth login' again");
+            "account file format is outdated - please run 'auth login' again");
 
     if (blob.size() < (size_t)(1 + 4 + SALT_LEN + IV_LEN + TAG_LEN))
         throw std::runtime_error("account file is too short or corrupted");
@@ -263,7 +263,7 @@ static std::string aes_gcm_decrypt(const std::vector<unsigned char>& blob,
         Bytes plain = aes::gcm_decrypt(key_bytes, iv, ct, tag);
         return std::string(plain.begin(), plain.end());
     } catch (const std::exception&) {
-        throw std::runtime_error("decryption failed — wrong device or passphrase");
+        throw std::runtime_error("decryption failed - wrong device or passphrase");
     }
 }
 
@@ -331,7 +331,7 @@ static bool load_account(Account& acc, const std::string& passphrase = "") {
     try {
         data = aes_gcm_decrypt(raw, machine_id, passphrase);
     } catch (const std::exception& e) {
-        print_red_err(std::string("Error: failed to decrypt account file — ")
+        print_red_err(std::string("Error: failed to decrypt account file - ")
                       + e.what() + "\n"
                       + "This account file was created on a different machine "
                         "or with a different passphrase.\n"
@@ -382,7 +382,7 @@ static std::string prepare_kbsync(AppStore& store, Account& acc,
         return acc.kbsync;
     } catch (const std::exception& e) {
         if (debug)
-            fprintf(stderr, "[DEBUG] kbsync generation failed (%s) — "
+            fprintf(stderr, "[DEBUG] kbsync generation failed (%s) - "
                     "skipping volumeStoreDownload stage\n", e.what());
         return "";
     }
@@ -1760,7 +1760,7 @@ int main(int argc, char** argv) {
     Args args = parse_args(argc, argv);
     g_format = get(args, "format", "", "text");
     if (g_format != "text" && g_format != "json") {
-        std::cerr << "Error: invalid format \''" << g_format << "\'' — use \'text\' or \'json\'\n";
+        std::cerr << "Error: invalid format \''" << g_format << "\'' - use \'text\' or \'json\'\n";
         return 1;
     }
 
