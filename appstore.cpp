@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>       // std::getenv (IPATOOL_ADI_EAGER_FP)
 #include <fstream>
 #include <filesystem>   // C++17 — replaces getcwd / stat / S_ISDIR
 #include <regex>
@@ -1458,7 +1459,7 @@ StoreAgentMachine& AppStore::adi_machine() {
     if (m_adi) return *m_adi;
 
     auto t0 = std::chrono::steady_clock::now();
-    prov_log("starting storeagent + CoreADI emulator (FairPlay init can take a while)...");
+    prov_log("starting storeagent + CoreADI emulator (FairPlay init is deferred until needed)...");
     m_adi = StoreAgentMachine::Create(
         load_sap_asset("CoreFP"),
         load_sap_asset("CommerceCore"),
@@ -1484,12 +1485,30 @@ StoreAgentMachine& AppStore::adi_machine() {
         }
     }
 
-    m_adiCtx = m_adi->InitializeGlobal(device_mac_address());
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - t0).count();
-    prov_log("emulator ready in " + std::to_string(ms) + " ms, FairPlay ctx " +
-             std::to_string(m_adiCtx));
+    prov_log("emulator ready in " + std::to_string(ms) + " ms (FairPlay init deferred)");
+
+    // Escape hatch / A-B test: the old behaviour (FairPlay init at creation).
+    if (const char* e = std::getenv("IPATOOL_ADI_EAGER_FP"); e && *e && *e != '0')
+        adi_fp_ctx();
     return *m_adi;
+}
+
+uint32_t AppStore::adi_fp_ctx() {
+    auto& m = adi_machine();
+    if (m_adiCtx) return m_adiCtx;
+
+    // The ADI state (SC Info keybag) was imported in adi_machine(), i.e. before
+    // this point — FairPlay's global init reads that keybag.
+    auto t0 = std::chrono::steady_clock::now();
+    prov_log("FairPlay global init (needed for kbsync / keybag import; can take ~20 s)...");
+    m_adiCtx = m.InitializeGlobal(device_mac_address());
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    prov_log("FairPlay ready in " + std::to_string(ms) + " ms, FairPlay ctx " +
+             std::to_string(m_adiCtx));
+    return m_adiCtx;
 }
 
 void AppStore::adi_save() {
@@ -1586,6 +1605,11 @@ bool AppStore::prov_handle(const char* label, const HttpResponse& res, uint64_t 
         auto spim = SapBase64::Decode(data);
         prov_log("SP: server data " + std::to_string(spim.size()) + " bytes");
 
+        // Provisioning is the one flow that needs FairPlay (kbsync + keybag
+        // import). Initialise it here — before AdiStartProvisioning — so the
+        // call order stays exactly what it was when the init ran at creation.
+        adi_fp_ctx();
+
         auto start = m.AdiStartProvisioning(dsid, spim);
         prov_log("SP: ADI start OK - clientData " + std::to_string(start.clientData.size()) +
                  " bytes, session " + std::to_string(start.session));
@@ -1596,7 +1620,7 @@ bool AppStore::prov_handle(const char* label, const HttpResponse& res, uint64_t 
         p["clientData"] = PlistValue::makeString(SapBase64::Encode(start.clientData));
         p["guid"]       = PlistValue::makeString(guid);
         if (dsid != kAnonAdiDSID) {
-            auto kb = m.KBSyncData(m_adiCtx, dsid);
+            auto kb = m.KBSyncData(adi_fp_ctx(), dsid);
             prov_log("SP: kbsync " + std::to_string(kb.size()) + " bytes for DSID " + std::to_string(dsid));
             p["kbsync"] = PlistValue::makeString(SapBase64::Encode(kb));
             p["dsId"]   = PlistValue::makeInt(static_cast<int64_t>(dsid));
@@ -1647,7 +1671,7 @@ bool AppStore::prov_handle(const char* label, const HttpResponse& res, uint64_t 
 
         auto keyBag = plist_bytes(r, "keybag");
         if (!keyBag.empty()) {
-            int32_t kst = m.ImportKeyBag(m_adiCtx, keyBag);
+            int32_t kst = m.ImportKeyBag(adi_fp_ctx(), keyBag);
             prov_log("SP: FairPlay keybag " + std::to_string(keyBag.size()) +
                      " B imported, status " + std::to_string(kst));
         }

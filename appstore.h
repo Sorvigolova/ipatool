@@ -223,10 +223,15 @@ private:
     std::string m_bagAmdFinish;          // bag amd-finish-provisioning (if present)
     std::string m_mdFamily = "X-Apple-AMD"; // header family (AMD by default; MD if the server asks with x-apple-md-action)
     std::shared_ptr<StoreAgentMachine> m_adi; // CoreADI + FairPlay, lives for the run
-    uint32_t    m_adiCtx = 0;            // FairPlay global context on m_adi
+    uint32_t    m_adiCtx = 0;            // FairPlay global context on m_adi (0 = not initialised yet)
 
     void init_store_adi(const std::string& cookieFile);
-    StoreAgentMachine& adi_machine();    // lazy create + import state + FP init
+    StoreAgentMachine& adi_machine();    // lazy create + import state (cheap: NO FairPlay init)
+    // Lazy FairPlayGlobalContextInit on m_adi — the slow part (~15-20 s under
+    // Unicorn). Only kbsync and the keybag import need the context; OTP
+    // generation (X-Apple-MD headers) and erase do not, so they never pay for it.
+    // IPATOOL_ADI_EAGER_FP=1 restores the old behaviour (init right at creation).
+    uint32_t           adi_fp_ctx();
     void adi_save();
     // Adds X-Apple-MD / X-Apple-MD-M when `dsid` is provisioned (no-op otherwise).
     void prov_add_md(std::map<std::string, std::string>& hdrs, uint64_t dsid,

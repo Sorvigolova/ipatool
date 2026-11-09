@@ -268,9 +268,11 @@ uint64_t SapShims::HeapRealloc(uint64_t oldPtr, uint64_t newSize) {
         return oldPtr;
     }
 
-    // Allocate new, copy, free old
+    // Allocate new, copy, free old. Read the size first: HeapAlloc inserts
+    // into allocations_, which can rehash and invalidate `it`.
+    const size_t oldSize = static_cast<size_t>(it->second.size);
     uint64_t newPtr = HeapAlloc(newSize);
-    std::vector<uint8_t> buf(it->second.size);
+    std::vector<uint8_t> buf(oldSize);
     GuestRead(oldPtr, buf.data(), buf.size());
     GuestWrite(newPtr, buf.data(), buf.size());
     HeapFree(oldPtr);
