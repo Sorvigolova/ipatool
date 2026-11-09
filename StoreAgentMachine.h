@@ -79,7 +79,11 @@ public:
     //          {clientData, kbsync, guid, dsId} to bag md-finish-provisioning
     //          → AdiEndProvisioning(session, settingInfo, transportKey)
     //          → ImportKeyBag(globalCtx, keybag) if the reply carries one
-    //   "SM" → machine sync via bag md-sync-machine (X-Apple-MD-S)
+    //   "SM" → AdiSynchronize(dsid, b64decode(md-data)) → POST
+    //          {clientData, machineId, dsId} to bag md-sync-machine
+    //          → the reply's syncState goes out as X-Apple-MD-S from then on
+    //          (-[ADIMachineSyncOperation run], -[ADIController
+    //          _mutateURLRequest:onCurrentThreadWithDSID:])
     bool HasADI() const { return adiLoaded_; }
 
     struct AdiStartResult { std::vector<uint8_t> clientData; uint32_t session = 0; };
@@ -97,6 +101,16 @@ public:
 
     // Drop the provisioning for a DSID (server action "RP"). Returns status.
     int32_t AdiErase(uint64_t dsid);
+
+    // Machine sync (server action "SM"): x-apple-md-data in, the clientData /
+    // machineId pair for md-sync-machine out. Throws on a non-zero status.
+    struct AdiSyncResult { std::vector<uint8_t> clientData; std::vector<uint8_t> machineId; };
+    AdiSyncResult AdiSynchronize(uint64_t dsid, std::span<const uint8_t> serverData);
+
+    // syncState from the md-sync-machine reply (sent as X-Apple-MD-S). Kept in
+    // the exported ADI state, outside the guest-visible virtual roots.
+    std::vector<uint8_t> GetSyncState() const;
+    void                 SetSyncState(std::vector<uint8_t> state);
 
     // FairPlay keybag from a provisioning / authorization reply.
     // Returns the FairPlay status (0 = imported).
@@ -146,10 +160,16 @@ private:
     //   end   (u32 session, u8* settingInfo, u32 len, u8* transportKey, u32 len)
     //   otp   (u64 dsid, u8** mid, u32* midLen, u8** otp, u32* otpLen)
     //   erase (u64 dsid)
+    //   sync  (u64 dsid, u8* sim, u32 len, u8** clientData, u32* len,
+    //          u8** machineId, u32* len)   — 7th argument on the stack
     static constexpr uint64_t kAdiStart     = kAgentBase + 0x1a8cf0;
     static constexpr uint64_t kAdiEnd       = kAgentBase + 0x1a9880;
     static constexpr uint64_t kAdiOTP       = kAgentBase + 0x1aa100;
     static constexpr uint64_t kAdiErase     = kAgentBase + 0x1aed40;
+    static constexpr uint64_t kAdiSync      = kAgentBase + 0x1ab240;
+    // Host-side slot for syncState inside the virtual-file map (not under a
+    // virtual root, so guest code never sees it).
+    static constexpr const char* kSyncStatePath = "/ipatool/adi-sync-state";
 
     // dlopen() path storeagent uses for CoreADI (plain string at 0x10021b310)
     static constexpr const char* kCoreADIPath =

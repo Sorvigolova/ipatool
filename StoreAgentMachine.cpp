@@ -153,9 +153,20 @@ uint64_t StoreAgentMachine::Invoke(uint64_t fn, std::initializer_list<uint64_t> 
     for (uint64_t a : args)
         if (ri < 6) UCK(uc_reg_write(uc_, kArgRegs[ri++], &a), "write arg");
 
-    uint64_t rsp = kStackEnd - 8;
+    // SysV: arguments 7+ go on the stack right above the return address.
+    // RSP is 16n+8 at entry (as if after a CALL).
+    const uint64_t extra = args.size() > 6 ? args.size() - 6 : 0;
+    uint64_t rsp = kStackEnd - (extra + 1) * 8;
     if (rsp % 16 != 8) rsp -= 8;
     UCK(uc_mem_write(uc_, rsp, &kReturnAddr, 8), "push return addr");
+    {
+        size_t i = 0;
+        for (uint64_t a : args) {
+            if (i >= 6)
+                UCK(uc_mem_write(uc_, rsp + 8 * (i - 5), &a, 8), "push stack arg");
+            ++i;
+        }
+    }
     UCK(uc_reg_write(uc_, UC_X86_REG_RSP, &rsp), "write RSP");
 
     uc_err err = uc_emu_start(uc_, fn, kReturnAddr, kTimeoutUs, 0);
@@ -415,6 +426,48 @@ int32_t StoreAgentMachine::AdiErase(uint64_t dsid) {
     int32_t status = static_cast<int32_t>(Invoke(kAdiErase, { dsid }));
     ClearScratch();
     return status;
+}
+
+StoreAgentMachine::AdiSyncResult
+StoreAgentMachine::AdiSynchronize(uint64_t dsid, std::span<const uint8_t> serverData) {
+    RequireADI();
+    if (serverData.empty())
+        throw std::runtime_error("ADI machine sync data (x-apple-md-data) is empty");
+
+    uint64_t inAddr = Scratch(serverData.data(), serverData.size());
+    uint64_t cdPtr  = Scratch(8);
+    uint64_t cdLen  = Scratch(4);
+    uint64_t midPtr = Scratch(8);
+    uint64_t midLen = Scratch(4);
+
+    int32_t status = static_cast<int32_t>(Invoke(kAdiSync, {
+        dsid, inAddr, uint64_t(serverData.size()), cdPtr, cdLen, midPtr, midLen }));
+
+    AdiSyncResult r;
+    if (status == 0) {
+        r.clientData = GuestReadBytes(GuestRead64(cdPtr),  GuestRead32(cdLen));
+        r.machineId  = GuestReadBytes(GuestRead64(midPtr), GuestRead32(midLen));
+    }
+    ClearScratch();
+
+    if (status != 0)
+        throw std::runtime_error(ipt::format("ADI machine sync returned {}", status));
+    if (r.clientData.empty())
+        throw std::runtime_error("ADI machine sync returned no client data");
+    return r;
+}
+
+std::vector<uint8_t> StoreAgentMachine::GetSyncState() const {
+    const auto& files = shims_->GetVirtualFiles();
+    auto it = files.find(kSyncStatePath);
+    return it != files.end() ? it->second : std::vector<uint8_t>{};
+}
+
+void StoreAgentMachine::SetSyncState(std::vector<uint8_t> state) {
+    auto files = shims_->GetVirtualFiles();
+    if (state.empty()) files.erase(kSyncStatePath);
+    else               files[kSyncStatePath] = std::move(state);
+    shims_->SetVirtualFiles(std::move(files), shims_->GetVirtualDirs());
 }
 
 int32_t StoreAgentMachine::ImportKeyBag(uint32_t globalCtx, std::span<const uint8_t> keyBag) {

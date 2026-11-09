@@ -218,7 +218,6 @@ private:
 
     // ── Store AMD state ───────────────────────────────────────────────────────
     std::string m_adiStatePath;
-    std::string m_provFinishUrl;         // finish URL override (empty = from bag)
     std::string m_bagMdFinish;           // bag md-finish-provisioning (if present)
     std::string m_bagAmdFinish;          // bag amd-finish-provisioning (if present)
     std::string m_mdFamily = "X-Apple-AMD"; // header family (AMD by default; MD if the server asks with x-apple-md-action)
@@ -241,6 +240,7 @@ private:
     bool prov_handle(const char* label, const HttpResponse& res, uint64_t dsid,
                      const std::string& guid, const std::string& token);
     std::string prov_finish_url(uint64_t dsid) const;
+    std::string prov_sync_url() const;
     bool        m_adiStateExisted = false; // adi-state file present at start (lazy emulator)
     std::string m_bagAmdSync;            // bag amd-sync-machine
     std::string m_bagMdSync;             // bag md-sync-machine

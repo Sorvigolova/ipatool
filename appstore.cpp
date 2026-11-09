@@ -1441,6 +1441,9 @@ constexpr const char* kDefaultMdFinishURL =
     "https://auth.itunes.apple.com/auth/v1/otp/1.0/finish";
 constexpr const char* kDefaultAmdFinishURL =
     "https://auth.itunes.apple.com/auth/v1/otp/1.5/finish";
+// md-/amd-sync-machine as the Mac App Store bag lists them (server action SM).
+constexpr const char* kDefaultMdSyncURL  = "https://auth.itunes.apple.com/auth/v1/otp/1.0/sync";
+constexpr const char* kDefaultAmdSyncURL = "https://auth.itunes.apple.com/auth/v1/otp/1.5/sync";
 
 void prov_log(const std::string& s) {
     if (g_adiLog) debug_err("[ADI] " + s + "\n");
@@ -1590,10 +1593,15 @@ std::string AppStore::prov_finish_url(uint64_t /*dsid*/) const {
     // The endpoint follows the header family the server used (md → otp/1.0,
     // amd → otp/1.5 in the Mac App Store bag); either one accepts an account
     // DSID or the anonymous -1, so the DSID does not pick the endpoint.
-    if (!m_provFinishUrl.empty()) return m_provFinishUrl;
     if (m_mdFamily == "X-Apple-AMD")
         return !m_bagAmdFinish.empty() ? m_bagAmdFinish : kDefaultAmdFinishURL;
     return !m_bagMdFinish.empty() ? m_bagMdFinish : kDefaultMdFinishURL;
+}
+
+std::string AppStore::prov_sync_url() const {
+    if (m_mdFamily == "X-Apple-AMD")
+        return !m_bagAmdSync.empty() ? m_bagAmdSync : kDefaultAmdSyncURL;
+    return !m_bagMdSync.empty() ? m_bagMdSync : kDefaultMdSyncURL;
 }
 
 void AppStore::prov_add_md(std::map<std::string, std::string>& hdrs, uint64_t dsid,
@@ -1616,9 +1624,14 @@ void AppStore::prov_add_md(std::map<std::string, std::string>& hdrs, uint64_t ds
         }
         hdrs[m_mdFamily]        = SapBase64::Encode(otp->otp);
         hdrs[m_mdFamily + "-M"] = SapBase64::Encode(otp->machineID);
+        // storeagent appends the last machine-sync result to every MD set.
+        const auto sync = m.GetSyncState();
+        if (!sync.empty()) hdrs[m_mdFamily + "-S"] = SapBase64::Encode(sync);
         prov_log(std::string(label) + ": DSID " + dsid_str(dsid) + " provisioned -> sending " +
                  m_mdFamily + " (" + std::to_string(otp->otp.size()) + " B) + " +
-                 m_mdFamily + "-M (" + std::to_string(otp->machineID.size()) + " B)");
+                 m_mdFamily + "-M (" + std::to_string(otp->machineID.size()) + " B)" +
+                 (sync.empty() ? "" : " + " + m_mdFamily + "-S (" +
+                                      std::to_string(sync.size()) + " B)"));
         adi_save();   // the OTP counter lives in adi.pb
     } catch (const std::exception& e) {
         prov_log(std::string(label) + ": OTP failed: " + e.what());
@@ -1657,9 +1670,53 @@ bool AppStore::prov_handle(const char* label, const HttpResponse& res, uint64_t 
             return true;
         }
 
-        if (action == "SM") {   // Sync Machine
-            prov_log("SM: machine sync requested - not implemented yet (md-sync-machine), continuing");
-            return false;
+        if (action == "SM") {   // Sync Machine (-[ADIMachineSyncOperation run])
+            if (data.empty()) { prov_log("SM without md-data - cannot sync"); return false; }
+            auto sim = SapBase64::Decode(data);
+            auto sync = m.AdiSynchronize(dsid, sim);
+            adi_save();   // the sync updates adi.pb
+            prov_log("SM: ADI sync OK - clientData " + std::to_string(sync.clientData.size()) +
+                     " B, machineId " + std::to_string(sync.machineId.size()) + " B");
+
+            // Body exactly as storeagent builds it: {clientData, machineId, dsId}.
+            PlistDict p;
+            p["clientData"] = PlistValue::makeString(SapBase64::Encode(sync.clientData));
+            p["machineId"]  = PlistValue::makeString(SapBase64::Encode(sync.machineId));
+            p["dsId"]       = PlistValue::makeInt(static_cast<int64_t>(dsid));
+            std::string body = encode_plist_xml(p);
+            std::map<std::string, std::string> hdrs = {
+                {"Content-Type", "application/x-apple-plist"},
+                {"User-Agent",   PROV_AUTH_UA},
+            };
+            if (dsid != kAnonAdiDSID) {
+                hdrs["X-Dsid"]      = std::to_string(dsid);
+                hdrs["iCloud-DSID"] = std::to_string(dsid);
+                if (!token.empty()) hdrs["X-Token"] = token;
+            }
+
+            std::string url = prov_sync_url();
+            prov_log("SM: POST " + url);
+            if (m_debug) debug_dump_request("syncMachine", "POST", url, hdrs, body);
+            HttpResponse sr = m_http.post(url, body, hdrs);
+            if (m_debug) debug_dump_response("syncMachine", sr);
+
+            PlistDict r = decode_plist_quiet(sr.body);
+            if (!dict_str(r, "failureType").empty() || !dict_str(r, "customerMessage").empty()) {
+                prov_log("SM: server refused: failureType=" + dict_str(r, "failureType") +
+                         " customerMessage=" + dict_str(r, "customerMessage"));
+                return false;
+            }
+            auto syncState = plist_bytes(r, "syncState");
+            if (!syncState.empty()) {
+                m.SetSyncState(syncState);
+                adi_save();
+                prov_log("SM: syncState " + std::to_string(syncState.size()) +
+                         " B - sent as " + m_mdFamily + "-S from now on");
+            } else {
+                prov_log("SM: HTTP " + std::to_string(sr.statusCode) + ", no syncState in reply");
+            }
+            prov_log("SM: machine sync done - resending");
+            return true;
         }
 
         if (action != "SP") {
@@ -2355,23 +2412,15 @@ PlistDict AppStore::request_bag(const std::string& query,
         signedBag = true;
     }
 
-    // --debug: keep the raw body and report which keys we rely on are present.
+    // --debug: report which keys we rely on are present.
     if (m_debug) {
-        std::string l = label;
-        std::string tag = l == "native bag" ? "ix6-native" : "default";
-        auto slash = m_adiStatePath.find_last_of("/\\");
-        std::string dir  = slash == std::string::npos ? "." : m_adiStatePath.substr(0, slash);
-        std::string dump = dir + "/bag-" + tag + ".xml";
-        std::ofstream out(ipt::fs_path(dump), std::ios::binary | std::ios::trunc);
-        if (out) out.write(res.body.data(), static_cast<std::streamsize>(res.body.size()));
-
         const PlistDict* ub = &d;
         if (auto u = d.find("urlBag"); u != d.end() && u->second.isDict()) ub = &u->second.dictVal;
         std::string report = std::string(label) + " (" + query + "): " +
                              std::to_string(res.body.size()) + " B, " +
                              (signedBag ? "signed" : "plain") + ", " +
                              (ub != &d ? "urlBag" : "flat") + ", " +
-                             std::to_string(ub->size()) + " keys -> " + dump;
+                             std::to_string(ub->size()) + " keys";
         static const char* kKeys[] = {
             "authenticateAccount", "sign-sap-setup", "sign-sap-setup-cert", "sign-sap-version",
             "volumeStoreDownloadProduct", "redownloadProduct", "updateProduct",
