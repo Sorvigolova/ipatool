@@ -70,22 +70,30 @@
 #  include <io.h>
 static bool is_tty() { return _isatty(_fileno(stdin)) != 0; }
 static std::string read_hidden(const std::string& prompt) {
+    // Wide console input: _getch() returns OEM (CP866) bytes, which would send
+    // a non-ASCII password to Apple in the wrong encoding.
     std::cerr << prompt << std::flush;
-    std::string s;
-    int c;
-    while ((c = _getch()) != '\r' && c != '\n' && c != EOF) {
-        if (c == '\b') {
-            if (!s.empty()) {
-                s.pop_back();
+    std::wstring w;
+    for (;;) {
+        wint_t c = _getwch();
+        if (c == L'\r' || c == L'\n' || c == WEOF) break;
+        // Arrows / F-keys arrive as a 0 or 0xE0 prefix plus a scan code (CRT
+        // contract; a literal U+00E0 is indistinguishable and gets skipped too).
+        if (c == 0 || c == 0xE0) { (void)_getwch(); continue; }
+        if (c == L'\b') {
+            if (!w.empty()) {
+                bool pair = w.size() >= 2 && w.back() >= 0xDC00 && w.back() <= 0xDFFF;
+                w.pop_back();
+                if (pair) w.pop_back();
                 std::cerr << "\b \b" << std::flush; // erase last *
             }
         } else if (c >= 32) { // printable chars only
-            s += (char)c;
-            std::cerr << '*' << std::flush;
+            w.push_back(static_cast<wchar_t>(c));
+            if (c < 0xDC00 || c > 0xDFFF) std::cerr << '*' << std::flush;
         }
     }
     std::cerr << "\n";
-    return s;
+    return ipt::wide_to_utf8(w);
 }
 #else
 #  include <termios.h>
@@ -121,6 +129,22 @@ static std::string read_hidden(const std::string& prompt) {
 
 static std::string read_line(const std::string& prompt) {
     std::cerr << prompt << std::flush;
+#ifdef _WIN32
+    // A real console delivers std::cin in the OEM code page; read UTF-16 instead.
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+        std::wstring w;
+        wchar_t buf[256];
+        DWORD got = 0;
+        while (ReadConsoleW(h, buf, 256, &got, nullptr) && got) {
+            w.append(buf, got);
+            if (w.find(L'\n') != std::wstring::npos) break;
+        }
+        while (!w.empty() && (w.back() == L'\n' || w.back() == L'\r')) w.pop_back();
+        return ipt::wide_to_utf8(w);
+    }
+#endif
     std::string s;
     std::getline(std::cin, s);
     return s;
@@ -136,25 +160,26 @@ static std::string home_dir() {
     // USERPROFILE first: Windows sets it for every process, while HOME is set
     // inconsistently (Git Bash, MSYS2, corporate policies), which used to put
     // ~/.ipatool in different places depending on the launching shell.
-    const char* home = getenv("USERPROFILE");
-    if (!home) home = getenv("HOME");
-    // The path may contain non-ASCII characters (e.g. Cyrillic).
-    // libcurl cannot handle such paths via char*.
-    // Convert to short 8.3 path format (ASCII only) using GetShortPathNameW.
-    if (home) {
-        wchar_t wlong[MAX_PATH] = {};
-        wchar_t wshort[MAX_PATH] = {};
-        MultiByteToWideChar(CP_ACP, 0, home, -1, wlong, MAX_PATH);
-        if (GetShortPathNameW(wlong, wshort, MAX_PATH) > 0) {
-            char buf[MAX_PATH] = {};
-            WideCharToMultiByte(CP_ACP, 0, wshort, -1, buf, MAX_PATH, NULL, NULL);
-            return std::string(buf);
-        }
+    //
+    // Read it through the wide API and keep it as UTF-8 like every other path
+    // in the program (all file access goes through ipt::fs_path). The narrow
+    // getenv returns the ANSI code page: a Cyrillic profile name then came back
+    // as CP1251 bytes, and the old 8.3 short-name workaround silently returned
+    // that same ANSI long path whenever 8.3 names are disabled on the volume.
+    for (const wchar_t* var : { L"USERPROFILE", L"HOME" }) {
+        DWORD n = GetEnvironmentVariableW(var, nullptr, 0);
+        if (n <= 1) continue;
+        std::wstring w(n, L'\0');
+        n = GetEnvironmentVariableW(var, w.data(), n);
+        if (n == 0 || n >= w.size()) continue;
+        w.resize(n);
+        return ipt::wide_to_utf8(w);
     }
+    return ".";
 #else
     const char* home = getenv("HOME");
-#endif
     return home ? home : ".";
+#endif
 }
 
 // Matches original ipatool directory layout exactly:

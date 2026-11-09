@@ -71,7 +71,7 @@
 #  include <minizip/zip.h>
 #  include <minizip/unzip.h>
 #  ifdef _WIN32
-#    include <minizip/iowin32.h>   // CreateFileW-based I/O for Unicode paths
+#    include <share.h>   // _SH_DENYNO for _wfsopen
 #  endif
 #endif
 
@@ -85,12 +85,80 @@ namespace fs = std::filesystem;
 #ifdef HAVE_MINIZIP
 // minizip's default ioapi opens files with the narrow CRT fopen, which mangles
 // non-ASCII (e.g. Cyrillic) paths on Windows. On Windows route zip/unzip through
-// the win32 wide-char I/O (CreateFileW) with a UTF-16 path; elsewhere the plain
+// our own wide-char file functions with a UTF-16 path; elsewhere the plain
 // UTF-8 path works natively.
+//
+// minizip's iowin32.h is deliberately not used: since vcpkg minizip 1.3.2 it is
+// only installed with the deprecated "unofficial-iowin32" feature, and other
+// minizip packages may not ship it at all. These callbacks only need the CRT.
+#  ifdef _WIN32
+namespace {
+
+voidpf ZCALLBACK wopen64(voidpf, const void* filename, int mode) {
+    const wchar_t* m = nullptr;
+    if ((mode & ZLIB_FILEFUNC_MODE_READWRITEFILTER) == ZLIB_FILEFUNC_MODE_READ)
+        m = L"rb";
+    else if (mode & ZLIB_FILEFUNC_MODE_EXISTING)
+        m = L"r+b";
+    else if (mode & ZLIB_FILEFUNC_MODE_CREATE)
+        m = L"wb";
+    if (!filename || !m) return nullptr;
+    // _wfsopen with _SH_DENYNO shares like plain fopen (no MSVC C4996 either).
+    return _wfsopen(static_cast<const wchar_t*>(filename), m, _SH_DENYNO);
+}
+
+uLong ZCALLBACK wread(voidpf, voidpf stream, void* buf, uLong size) {
+    return static_cast<uLong>(std::fread(buf, 1, size, static_cast<FILE*>(stream)));
+}
+
+uLong ZCALLBACK wwrite(voidpf, voidpf stream, const void* buf, uLong size) {
+    return static_cast<uLong>(std::fwrite(buf, 1, size, static_cast<FILE*>(stream)));
+}
+
+ZPOS64_T ZCALLBACK wtell64(voidpf, voidpf stream) {
+    __int64 pos = _ftelli64(static_cast<FILE*>(stream));
+    return pos < 0 ? static_cast<ZPOS64_T>(-1) : static_cast<ZPOS64_T>(pos);
+}
+
+long ZCALLBACK wseek64(voidpf, voidpf stream, ZPOS64_T offset, int origin) {
+    int whence;
+    switch (origin) {
+        case ZLIB_FILEFUNC_SEEK_CUR: whence = SEEK_CUR; break;
+        case ZLIB_FILEFUNC_SEEK_END: whence = SEEK_END; break;
+        case ZLIB_FILEFUNC_SEEK_SET: whence = SEEK_SET; break;
+        default: return -1;
+    }
+    return _fseeki64(static_cast<FILE*>(stream), static_cast<__int64>(offset), whence) == 0
+               ? 0 : -1;
+}
+
+int ZCALLBACK wclose(voidpf, voidpf stream) {
+    return std::fclose(static_cast<FILE*>(stream));
+}
+
+int ZCALLBACK werror(voidpf, voidpf stream) {
+    return std::ferror(static_cast<FILE*>(stream));
+}
+
+zlib_filefunc64_def wide_filefunc() {
+    zlib_filefunc64_def ff{};
+    ff.zopen64_file = wopen64;
+    ff.zread_file   = wread;
+    ff.zwrite_file  = wwrite;
+    ff.ztell64_file = wtell64;
+    ff.zseek64_file = wseek64;
+    ff.zclose_file  = wclose;
+    ff.zerror_file  = werror;
+    ff.opaque       = nullptr;
+    return ff;
+}
+
+} // namespace
+#  endif
+
 static unzFile ipt_unzOpen(const std::string& path) {
 #  ifdef _WIN32
-    zlib_filefunc64_def ff;
-    fill_win32_filefunc64W(&ff);
+    zlib_filefunc64_def ff = wide_filefunc();
     std::wstring w = ipt::utf8_to_wide(path);
     return unzOpen2_64(reinterpret_cast<const void*>(w.c_str()), &ff);
 #  else
@@ -99,8 +167,7 @@ static unzFile ipt_unzOpen(const std::string& path) {
 }
 static zipFile ipt_zipOpen(const std::string& path, int append) {
 #  ifdef _WIN32
-    zlib_filefunc64_def ff;
-    fill_win32_filefunc64W(&ff);
+    zlib_filefunc64_def ff = wide_filefunc();
     std::wstring w = ipt::utf8_to_wide(path);
     return zipOpen2_64(reinterpret_cast<const void*>(w.c_str()), append, nullptr, &ff);
 #  else
@@ -2917,7 +2984,9 @@ std::string AppStore::resolve_destination(const App& app,
 {
     std::string fname = make_filename(app, version, displayName, ext);
     if (outputPath.empty()) {
-        return ipt::to_utf8(fs::current_path() / fname);
+        // fname is UTF-8: wrap it, or MSVC's fs::path reads the narrow string
+        // in the ANSI code page and the name comes back double-encoded.
+        return ipt::to_utf8(fs::current_path() / ipt::fs_path(fname));
     }
     // Keep the user's UTF-8 path intact: fs::path::string() returns the active
     // ANSI code page on Windows, so join as plain UTF-8 instead of round-tripping.

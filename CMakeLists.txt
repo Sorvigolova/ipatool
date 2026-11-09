@@ -121,9 +121,9 @@ if(STATIC_BUILD AND NOT WIN32)
             INSTALL_COMMAND ${CMAKE_COMMAND} -E make_directory <INSTALL_DIR>/lib
             COMMAND ${CMAKE_COMMAND} -E make_directory <INSTALL_DIR>/include/minizip
             COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/libminizip.a          <INSTALL_DIR>/lib/libminizip.a
-            COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/contrib/minizip/zip.h   <INSTALL_DIR>/include/minizip/zip.h
-            COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/contrib/minizip/unzip.h <INSTALL_DIR>/include/minizip/unzip.h
-            COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/contrib/minizip/ioapi.h <INSTALL_DIR>/include/minizip/ioapi.h
+            # Whole contrib/minizip: the public headers pull in different private
+            # ones per version (1.3.2's ioapi.h needs ints.h, 1.3.1 has none).
+            COMMAND ${CMAKE_COMMAND} -E copy_directory <SOURCE_DIR>/contrib/minizip <INSTALL_DIR>/include/minizip
         )
         ExternalProject_Get_Property(minizip_static INSTALL_DIR)
         set(MZIP_INSTALL_DIR "${INSTALL_DIR}")
@@ -343,6 +343,19 @@ endif()
 # minizip (for cross-platform ZIP writing, used by IPA patching)
 # Try CONFIG mode first (vcpkg), then pkg-config (Linux system), then manual find
 find_package(minizip CONFIG QUIET)
+# vcpkg minizip >= 1.3.2 (zlib's own CMake package) exports MINIZIP::minizip
+# (shared) or MINIZIP::minizipstatic (static) instead of minizip::minizip.
+if(minizip_FOUND AND NOT TARGET minizip::minizip)
+    if(TARGET MINIZIP::minizip)
+        add_library(minizip::minizip INTERFACE IMPORTED)
+        target_link_libraries(minizip::minizip INTERFACE MINIZIP::minizip)
+    elseif(TARGET MINIZIP::minizipstatic)
+        add_library(minizip::minizip INTERFACE IMPORTED)
+        target_link_libraries(minizip::minizip INTERFACE MINIZIP::minizipstatic)
+    else()
+        set(minizip_FOUND FALSE)
+    endif()
+endif()
 if(NOT minizip_FOUND)
     find_package(unofficial-minizip CONFIG QUIET)
     if(unofficial-minizip_FOUND)
