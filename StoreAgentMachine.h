@@ -160,8 +160,8 @@ private:
     //   end   (u32 session, u8* settingInfo, u32 len, u8* transportKey, u32 len)
     //   otp   (u64 dsid, u8** mid, u32* midLen, u8** otp, u32* otpLen)
     //   erase (u64 dsid)
-    //   sync  (u64 dsid, u8* sim, u32 len, u8** clientData, u32* len,
-    //          u8** machineId, u32* len)   — 7th argument on the stack
+    //   sync  (u64 dsid, u8* sim, u32 len, u8** machineId, u32* len,
+    //          u8** clientData, u32* len)  — 7th argument on the stack
     static constexpr uint64_t kAdiStart     = kAgentBase + 0x1a8cf0;
     static constexpr uint64_t kAdiEnd       = kAgentBase + 0x1a9880;
     static constexpr uint64_t kAdiOTP       = kAgentBase + 0x1aa100;

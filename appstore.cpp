@@ -1665,6 +1665,7 @@ bool AppStore::prov_handle(const char* label, const HttpResponse& res, uint64_t 
 
         if (action == "RP") {   // Restart Provisioning
             int32_t st = m.AdiErase(dsid);
+            m.SetSyncState({});   // belongs to the provisioning just dropped
             adi_save();
             prov_log("RP: erased provisioning (status " + std::to_string(st) + "), resending without MD");
             return true;
@@ -1701,10 +1702,26 @@ bool AppStore::prov_handle(const char* label, const HttpResponse& res, uint64_t 
             if (m_debug) debug_dump_response("syncMachine", sr);
 
             PlistDict r = decode_plist_quiet(sr.body);
-            if (!dict_str(r, "failureType").empty() || !dict_str(r, "customerMessage").empty()) {
+            const bool refused = !dict_str(r, "failureType").empty() ||
+                                 (!dict_str(r, "customerMessage").empty() &&
+                                  dict_str(r, "customerMessage").rfind("AMD-Action:", 0) != 0);
+            if (refused) {
                 prov_log("SM: server refused: failureType=" + dict_str(r, "failureType") +
                          " customerMessage=" + dict_str(r, "customerMessage"));
                 return false;
+            }
+            // The sync endpoint may itself answer RP: the machine is beyond
+            // syncing. Drop the provisioning and resend — that leads to SP.
+            if (auto a = sr.headers.find("x-apple-amd-action"); a != sr.headers.end()
+                    || (a = sr.headers.find("x-apple-md-action")) != sr.headers.end()) {
+                if (a->second == "RP") {
+                    int32_t est = m.AdiErase(dsid);
+                    m.SetSyncState({});
+                    adi_save();
+                    prov_log("SM: sync answered RP - erased provisioning (status " +
+                             std::to_string(est) + "), resending without MD");
+                    return true;
+                }
             }
             auto syncState = plist_bytes(r, "syncState");
             if (!syncState.empty()) {
@@ -1791,6 +1808,7 @@ bool AppStore::prov_handle(const char* label, const HttpResponse& res, uint64_t 
                  std::to_string(tk.size()) + " B");
 
         m.AdiEndProvisioning(start.session, si, tk);
+        m.SetSyncState({});   // a fresh provisioning starts unsynced
         prov_log("SP: ADI end OK - DSID " + dsid_str(dsid) + " is provisioned");
 
         auto keyBag = plist_bytes(r, "keybag");

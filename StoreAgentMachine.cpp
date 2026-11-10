@@ -434,19 +434,22 @@ StoreAgentMachine::AdiSynchronize(uint64_t dsid, std::span<const uint8_t> server
     if (serverData.empty())
         throw std::runtime_error("ADI machine sync data (x-apple-md-data) is empty");
 
+    // Output order: machine ID first, then the sync message that storeagent
+    // posts as "clientData" (-[ADIMachineSyncOperation run]: r15 → machineId,
+    // r12 → clientData).
     uint64_t inAddr = Scratch(serverData.data(), serverData.size());
-    uint64_t cdPtr  = Scratch(8);
-    uint64_t cdLen  = Scratch(4);
     uint64_t midPtr = Scratch(8);
     uint64_t midLen = Scratch(4);
+    uint64_t cdPtr  = Scratch(8);
+    uint64_t cdLen  = Scratch(4);
 
     int32_t status = static_cast<int32_t>(Invoke(kAdiSync, {
-        dsid, inAddr, uint64_t(serverData.size()), cdPtr, cdLen, midPtr, midLen }));
+        dsid, inAddr, uint64_t(serverData.size()), midPtr, midLen, cdPtr, cdLen }));
 
     AdiSyncResult r;
     if (status == 0) {
-        r.clientData = GuestReadBytes(GuestRead64(cdPtr),  GuestRead32(cdLen));
         r.machineId  = GuestReadBytes(GuestRead64(midPtr), GuestRead32(midLen));
+        r.clientData = GuestReadBytes(GuestRead64(cdPtr),  GuestRead32(cdLen));
     }
     ClearScratch();
 
