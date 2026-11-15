@@ -1863,6 +1863,21 @@ HttpResponse AppStore::prov_post(const char* label, const std::string& url,
         if (!prov_handle(label, res, dsid, guid, token)) break;
         prov_log(std::string(label) + ": resending (round " + std::to_string(round + 2) + ")");
     }
+    // HTTP 401 Unauthorized on a commerce endpoint means the session itself has
+    // expired (cookies / password token), not a provisioning or kbsync problem —
+    // a 401 carries no x-apple-(a)md-action, so prov_handle above did nothing with
+    // it. Signal a silent re-login: the command layer catches PasswordTokenExpired,
+    // runs silent_relogin (which rewrites the cookie file and refreshes the token),
+    // and retries once with the fresh session. This mirrors the recovery already
+    // done for a plist PASSWORD_TOKEN_EXPIRED failure, and for the 401 the
+    // list-purchases path already handles. 403 is left alone: on the download
+    // cascade it is often a legitimate region/entitlement refusal, not a stale
+    // session, and must stay on its normal path.
+    if (res.statusCode == 401) {
+        prov_log(std::string(label) + ": HTTP 401 Unauthorized - session expired,"
+                 " requesting silent re-login");
+        throw PasswordTokenExpired();
+    }
     return res;
 }
 

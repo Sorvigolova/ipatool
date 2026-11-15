@@ -1557,16 +1557,43 @@ static void cmd_download(const Args& args) {
             SetConsoleCursorInfo(hErr, &cci);
         }
 #else
-        std::string bar;
-        bar.reserve(barW * 3);
-        for (int i = 0; i < filled;    i++) { bar += "\xe2\x96\x88"; } // █
-        for (int i = filled; i < barW; i++) { bar += "\xe2\x96\x91"; } // ░
+        // Fit the line to the terminal width. A fixed ~70-column line wraps on a
+        // narrow terminal (e.g. iSH on a phone, ~30-40 cols); the terminal then
+        // moves to a second row, and the next frame's "\r" returns only to the
+        // start of that last row, so the bar stacks up instead of redrawing in
+        // place. Query the width and shrink: full bar -> narrower bar -> a compact
+        // "NN% (...)" form -> just "NN%". "\x1b[K" erases to end of row so a
+        // shorter frame never leaves a tail from a longer one.
+        int cols = 0;
+        struct winsize ws;
+        if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+            cols = ws.ws_col;
+        if (cols <= 0) cols = 80;   // not a known-size TTY: assume a standard width
 
-        std::cerr << "\r" << prefix << bar << postfix << std::flush;
-        if (done) {
-            int totalW = (int)prefix.size() + barW + (int)postfix.size();
-            std::cerr << "\r" << std::string(totalW, ' ') << "\r" << std::flush;
+        // prefix/postfix are ASCII, so their byte length equals their column
+        // width; each bar glyph is 3 bytes but one column.
+        const int overhead = (int)prefix.size() + (int)postfix.size();
+
+        std::string line;
+        if (overhead + 4 <= cols) {
+            // Full form: give the bar whatever columns are left, up to barW.
+            int bw   = std::min(barW, cols - overhead);
+            int fill = (total > 0) ? (int)((double)received / total * bw) : 0;
+            if (fill > bw) fill = bw;
+            std::string bar;
+            bar.reserve(bw * 3);
+            for (int i = 0;    i < fill; i++) bar += "\xe2\x96\x88"; // █
+            for (int i = fill; i < bw;   i++) bar += "\xe2\x96\x91"; // ░
+            line = prefix + bar + postfix;
+        } else {
+            // Too narrow for the bar: percentage plus details, or percentage only.
+            std::string compact = std::string(pctStr) + " " + suffix;
+            line = ((int)compact.size() <= cols) ? compact : std::string(pctStr);
         }
+
+        std::cerr << "\r" << line << "\x1b[K" << std::flush;
+        if (done) std::cerr << "\r\x1b[K" << std::flush;
+        (void)filled;   // computed above for the Windows branch; unused here
 #endif
     };
 
