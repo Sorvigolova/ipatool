@@ -545,6 +545,13 @@ Account AppStore::login(const std::string& email,
               const std::string& authCode,
               const std::string& endpoint)
 {
+    // Start every sign-in from a clean slate: a stale session cookie left over
+    // from a previous login (or an expired session) must not ride along into the
+    // new authenticate, or the server can answer on the old session instead of
+    // establishing a fresh one. Clearing first, then logging in, also means a
+    // re-login after a 401 truly replaces the cookies rather than merging.
+    m_http.clear_cookies();
+
     std::string guid = get_guid();
 
     // Fetch bag for both the auth endpoint and SAP config

@@ -111,6 +111,15 @@ static void save_cookies(CURL* curl, const std::string& file) {
     curl_slist_free_all(list);
 }
 
+// Remove the cookie file so the next request starts with an empty jar. Cookie
+// state is held only in this file (each request reloads it from disk), so there
+// is no in-memory jar to clear. Best-effort: a missing file is already "clear".
+void HttpClient::clear_cookies() const {
+    if (m_cookieFile.empty()) return;
+    std::error_code ec;
+    std::filesystem::remove(ipt::fs_path(m_cookieFile), ec);
+}
+
 // ── Retry helpers ─────────────────────────────────────────────────────────────
 
 // Only timeout errors are retried — other failures surface immediately.

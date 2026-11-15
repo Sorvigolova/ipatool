@@ -38,6 +38,12 @@ public:
                                         const HttpResponse& res)>;
     void set_observer(Observer cb) { m_observer = std::move(cb); }
 
+    // Drop every stored cookie by removing the cookie file. Cookie state lives
+    // only in that file (each request reloads it), so this starts the next
+    // request with an empty jar. Called at the start of a login so a stale
+    // session cookie can't ride along into a fresh sign-in.
+    void clear_cookies() const;
+
     HttpResponse post(const std::string& url,
                       const std::string& body,
                       const std::map<std::string, std::string>& reqHeaders) const;
