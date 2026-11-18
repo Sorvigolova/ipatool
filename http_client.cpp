@@ -558,7 +558,7 @@ bool HttpClient::download_parallel(const std::string& url,
                         if (is_retryable_curl(rc) && attempt < kPartRetries) {
                             if (m_debug)
                                 fprintf(stderr, "[DEBUG] chunk %d: %s - retry %d/%d%s\n",
-                                        idx, curl_easy_strerror(rc), attempt + 1, kPartRetries, dbg_eol());
+                                        idx + 1, curl_easy_strerror(rc), attempt + 1, kPartRetries, dbg_eol());
                             sleep_cancellable(kPartBackoffS[attempt]);
                             continue;
                         }
@@ -573,7 +573,7 @@ bool HttpClient::download_parallel(const std::string& url,
                         if (attempt < kPartRetries) {
                             if (m_debug)
                                 fprintf(stderr, "[DEBUG] chunk %d md5 mismatch - refetch %d/%d%s\n",
-                                        idx, attempt + 1, kPartRetries, dbg_eol());
+                                        idx + 1, attempt + 1, kPartRetries, dbg_eol());
                             sleep_cancellable(kPartBackoffS[attempt]);
                             continue;
                         }
@@ -600,7 +600,7 @@ bool HttpClient::download_parallel(const std::string& url,
 
                 if (m_debug)
                     fprintf(stderr, "[DEBUG] chunk %d/%d md5 ok (%lld bytes)%s\n",
-                            idx, chunkCount, (long long)len, dbg_eol());
+                            idx + 1, chunkCount, (long long)len, dbg_eol());
             }
 
             fflush(out);
