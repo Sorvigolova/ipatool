@@ -1104,9 +1104,39 @@ std::vector<uint8_t> http_range(const HttpClient& http, const std::string& url,
     return std::vector<uint8_t>(r.body.begin(), r.body.end());
 }
 
+// DOS date/time (local, no timezone, 2-second resolution) -> naive ISO-8601.
+static std::string dos_to_iso(uint16_t date, uint16_t time) {
+    int yr = ((date >> 9) & 0x7f) + 1980;
+    int mo = (date >> 5) & 0x0f;
+    int dy =  date       & 0x1f;
+    int hh = (time >> 11) & 0x1f;
+    int mi = (time >> 5)  & 0x3f;
+    int ss = (time        & 0x1f) * 2;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d", yr, mo, dy, hh, mi, ss);
+    return buf;
+}
+
+// Unix seconds (UTC) -> ISO-8601 with a trailing Z. "" on a bad value.
+static std::string unix_to_iso_utc(int64_t secs) {
+    time_t t = (time_t)secs;
+    struct tm g{};
+#ifdef _WIN32
+    if (gmtime_s(&g, &t) != 0) return "";
+#else
+    if (!gmtime_r(&t, &g)) return "";
+#endif
+    char buf[48];   // room for an out-of-range year without truncation
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour, g.tm_min, g.tm_sec);
+    return buf;
+}
+
 // Pull Payload/<App>.app/Info.plist out of the remote .ipa. false on any issue.
+// When outModified is non-null, it also receives that entry's ZIP modification
+// time as ISO-8601 (empty if unavailable) — used as the version's release date.
 bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url,
-                          std::string& outPlist) {
+                          std::string& outPlist, std::string* outModified = nullptr) {
     int64_t size = http_total_size(http, url);
     if (size <= 0) return false;
 
@@ -1167,6 +1197,31 @@ bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url,
         std::string name(reinterpret_cast<const char*>(&cd[p + 46]), nl);
 
         if (std::regex_match(name, mainInfo)) {
+            if (outModified) {
+                // The version's build/packaging date: prefer the extended-
+                // timestamp extra field (0x5455, Unix UTC) and fall back to the
+                // DOS date/time (local, 2-second resolution). iOS Info.plist
+                // carries no release-date key, so this entry's mtime is the only
+                // in-package per-version date — the catalog date is now uniform
+                // across versions and can't be trusted.
+                uint16_t dosTime = rd_u16(&cd[p + 12]);
+                uint16_t dosDate = rd_u16(&cd[p + 14]);
+                std::string mt;
+                size_t ep = p + 46 + nl, eend = ep + el, q = ep;
+                while (q + 4 <= eend && q + 4 <= cd.size()) {
+                    uint16_t id  = rd_u16(&cd[q]);
+                    uint16_t len = rd_u16(&cd[q + 2]);
+                    size_t   dp  = q + 4;
+                    // 0x5455: flags byte, then mtime (LE Unix) when bit0 is set.
+                    if (id == 0x5455 && len >= 5 && dp + 5 <= cd.size() && (cd[dp] & 0x01)) {
+                        mt = unix_to_iso_utc((int64_t)rd_u32(&cd[dp + 1]));
+                        break;
+                    }
+                    q += 4 + len;
+                }
+                if (mt.empty() && dosDate != 0) mt = dos_to_iso(dosDate, dosTime);
+                *outModified = mt;
+            }
             int64_t cs64 = cs, us64 = us, lo64 = lo;
             // ZIP64 extra (id 0x0001) supplies 64-bit values for whichever
             // 32-bit fields read 0xFFFFFFFF, in order: uncomp, comp, localoff.
@@ -1297,6 +1352,97 @@ std::string min_os_from_pfpkg(const std::string& fileBytes) {
     return "";
 }
 
+// macOS preflight: the build time of the selected version, encoded in a legacy
+// installer version string "<major.minor.patch>.0.1.<10-digit Unix time>" on a
+// <pkg-ref> in the Distribution XML, validated against the <product> version.
+// Returns ISO-8601 UTC, or "" if the package carries no such timestamp (then the
+// caller keeps the catalog date). Mirrors the Go reader's legacy build-time rule.
+std::string release_date_from_pfpkg(const std::string& fileBytes) {
+    auto split_dots = [](const std::string& s) {
+        std::vector<std::string> out; size_t start = 0;
+        for (size_t i = 0; i <= s.size(); ++i)
+            if (i == s.size() || s[i] == '.') { out.push_back(s.substr(start, i - start)); start = i + 1; }
+        return out;
+    };
+    auto all_digits = [](const std::string& s) {
+        if (s.empty()) return false;
+        for (char c : s) if (!std::isdigit((unsigned char)c)) return false;
+        return true;
+    };
+
+    const uint8_t* d = reinterpret_cast<const uint8_t*>(fileBytes.data());
+    size_t n = fileBytes.size();
+    static const std::regex prodRe(R"RX(<product\b[^>]*\bversion="([^"]*)")RX");
+    static const std::regex pkgRe(R"RX(<pkg-ref\b[^>]*\bversion="([^"]*)")RX");
+
+    for (size_t i = 0; i + 2 < n; ++i) {
+        if (!looks_zlib(d + i, n - i) && !looks_gzip(d + i, n - i)) continue;
+        std::string xml;
+        if (!inflate_grow(d + i, n - i, xml)) continue;
+        if (xml.find("pkg-ref") == std::string::npos) continue;
+
+        std::smatch pm;
+        if (!std::regex_search(xml, pm, prodRe)) continue;
+        std::vector<std::string> dv = split_dots(pm[1].str());
+        while (dv.size() < 3) dv.push_back("0");
+        if (dv.size() != 3) continue;
+        std::string base = dv[0] + "." + dv[1] + "." + dv[2];
+
+        // Scan every pkg-ref version for the legacy build-time shape. Multiple
+        // refs can describe one package; if two give different times, the result
+        // is ambiguous — leave it to the catalog rather than guess.
+        long long secs = 0;
+        bool conflict = false;
+        for (std::sregex_iterator it(xml.begin(), xml.end(), pkgRe), end; it != end; ++it) {
+            std::vector<std::string> p = split_dots((*it)[1].str());
+            if (p.size() != 6) continue;
+            if (p[0] + "." + p[1] + "." + p[2] != base) continue;
+            if (p[3] != "0" || p[4] != "1" || p[5].size() != 10) continue;
+            bool ok = true;
+            for (const auto& part : p) if (!all_digits(part)) { ok = false; break; }
+            if (!ok) continue;
+            long long t = 0;
+            try { t = std::stoll(p[5]); } catch (...) { continue; }
+            if (t <= 0) continue;
+            if (secs != 0 && secs != t) { conflict = true; break; }
+            secs = t;
+        }
+        if (!conflict && secs > 0) return unix_to_iso_utc(secs);
+    }
+    return "";
+}
+
+// Inflate a XAR's table-of-contents from in-memory bytes. The TOC is a zlib
+// stream right after the 28-byte header (big-endian fields). "" on anything that
+// isn't a readable XAR. The preflight package is a small, unencrypted XAR, so its
+// TOC is reachable this way (the main .pkg is encrypted and is not read here).
+std::string xar_toc_xml(const std::string& fileBytes) {
+    if (fileBytes.size() < 28) return "";
+    const uint8_t* f = reinterpret_cast<const uint8_t*>(fileBytes.data());
+    if (!(f[0]==0x78 && f[1]==0x61 && f[2]==0x72 && f[3]==0x21)) return "";   // "xar!"
+    uint32_t headerSize = (uint32_t)((f[4] << 8) | f[5]);
+    uint64_t tocComp = 0; for (int i = 0; i < 8; i++) tocComp = (tocComp << 8) | f[8 + i];
+    if (headerSize < 28 || tocComp == 0 || tocComp > 16u * 1024 * 1024
+        || (uint64_t)headerSize + tocComp > fileBytes.size())
+        return "";
+    std::string xml;
+    if (!inflate_grow(f + headerSize, (size_t)tocComp, xml)) return "";
+    return xml;
+}
+
+// The XAR's own <creation-time> (UTC) — when Apple built this package for the
+// version. In a preflight the per-file mtimes are zeroed, so this is the only
+// in-package build date, and it is historical (not the download time). ISO-8601
+// with a trailing Z, or "" if absent.
+std::string xar_creation_time(const std::string& toc) {
+    static const std::regex re(R"RX(<creation-time>([^<]+)</creation-time>)RX");
+    std::smatch m;
+    if (!std::regex_search(toc, m, re)) return "";
+    std::string t = m[1].str();
+    if (!t.empty() && t.back() != 'Z' && t.find('+') == std::string::npos) t += "Z";
+    return t;
+}
+
 } // namespace
 
 AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account& acc,
@@ -1349,19 +1495,37 @@ AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account&
         return true;
     };
     if (ends_with_ci(ipaPath, ".ipa")) {
-        // iOS: Payload/<App>.app/Info.plist → MinimumOSVersion (range-ZIP).
+        // iOS: Payload/<App>.app/Info.plist → MinimumOSVersion (range-ZIP), and
+        // the version's real release date. Apple's catalog releaseDate has gone
+        // stale (same value for every version), so prefer the Info.plist entry's
+        // ZIP mtime (this version's build/packaging time). Info.plist carries no
+        // release-date key — and a developer could add a custom key by that name,
+        // so we never read a date out of the plist body. Keep the catalog date
+        // only when the IPA yields no mtime.
         try {
-            std::string infoPlist;
-            if (fetch_ipa_info_plist(m_http, ipaURL, infoPlist)) {
+            std::string infoPlist, infoModified;
+            if (fetch_ipa_info_plist(m_http, ipaURL, infoPlist, &infoModified)) {
                 out.minimumOSVersion   = min_os_from_info_plist(infoPlist);
                 out.supportedPlatforms = platforms_from_info_plist(infoPlist);
+
+                if (!infoModified.empty()) {
+                    if (m_debug && !out.releaseDate.empty() && out.releaseDate != infoModified)
+                        fprintf(stderr, "[DEBUG] releaseDate: catalog %s -> IPA %s\n",
+                                out.releaseDate.c_str(), infoModified.c_str());
+                    out.releaseDate = infoModified;
+                }
             }
-        } catch (const std::exception&) { /* best-effort — leave empty */ }
+        } catch (const std::exception&) { /* best-effort — keep the catalog date */ }
     } else {
-        // macOS: there's no .ipa; the store exposes a small preflight package
-        // (XAR) whose Distribution XML carries <allowed-os-versions><os-version
-        // min="…"/>. Download it whole (tens of KB) and scan its compressed
-        // streams. Key lives in metadata (fall back to item just in case).
+        // macOS: no .ipa, and the main .pkg is fully encrypted (needs the dpInfo
+        // key to decrypt the whole file before its XAR is readable), so we don't
+        // touch it. The preflight package, however, is a small unencrypted XAR —
+        // we already fetch it for the minimum OS version. Its real per-version
+        // date is the XAR's own <creation-time> (the per-file mtimes are zeroed);
+        // some older packages instead encode a build time in a legacy installer
+        // version string. Catalog date only as a last resort.
+        out.supportedPlatforms = {"macOS"};
+
         std::string pfURL = dict_str(metadata, "preflightPackageURL");
         if (pfURL.empty()) pfURL = dict_str(item, "preflightPackageURL");
         if (!pfURL.empty()) {
@@ -1369,12 +1533,19 @@ AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account&
                 // whole file, following redirects; cap guards a surprise large asset
                 HttpResponse pf = m_http.get_range(pfURL, "0-", 64u * 1024 * 1024);
                 if (!pf.body.empty()) {
-                    // A preflight package means this is a macOS title — there is
-                    // no CFBundleSupportedPlatforms to read, so set it explicitly.
-                    out.supportedPlatforms = {"macOS"};
-                    out.minimumOSVersion   = min_os_from_pfpkg(pf.body);
+                    out.minimumOSVersion = min_os_from_pfpkg(pf.body);
+
+                    // XAR creation-time first, then the legacy version-string time.
+                    std::string pfDate = xar_creation_time(xar_toc_xml(pf.body));
+                    if (pfDate.empty()) pfDate = release_date_from_pfpkg(pf.body);
+                    if (!pfDate.empty()) {
+                        if (m_debug && !out.releaseDate.empty() && out.releaseDate != pfDate)
+                            fprintf(stderr, "[DEBUG] releaseDate: catalog %s -> preflight %s\n",
+                                    out.releaseDate.c_str(), pfDate.c_str());
+                        out.releaseDate = pfDate;
+                    }
                 }
-            } catch (const std::exception&) { /* best-effort — leave empty */ }
+            } catch (const std::exception&) { /* best-effort — keep the catalog date */ }
         }
     }
 
