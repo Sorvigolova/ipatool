@@ -72,6 +72,41 @@ public:
                   int64_t            rangeStart = 0,
                   std::function<void(int64_t, int64_t)> progress = nullptr) const;
 
+    // Per-chunk integrity check used by the chunk-queue path: called with a
+    // chunk's index and its freshly downloaded bytes; return false if they don't
+    // match the expected hash, which makes the worker re-fetch that chunk. Keeps
+    // the hash format (and any crypto dependency) in the caller.
+    using ChunkVerifier = std::function<bool(int chunkIndex, const uint8_t* data, size_t len)>;
+
+    // Fetch a large file over several connections at once, writing the finished
+    // bytes to destPath. Returns true on success; false means the caller should
+    // fall back to the single-connection download() (same destPath). Declines
+    // (returns false, nothing left at destPath) for a small file, a server that
+    // won't honour ranges, or a resumable partial already on disk.
+    //
+    // With chunkSize/chunkCount from the store's download manifest it uses a
+    // chunk-queue: 4 workers pull free chunk indices off a shared counter, fetch
+    // each chunk's range, md5-check it via verifyChunk and re-fetch a bad chunk in
+    // place — load-balancing across workers and verifying as it goes. Without a
+    // manifest it splits the file into 4 equal contiguous parts (and then needs a
+    // strong ETag as the only cross-connection consistency guard). Staging is
+    // unique to this process, so concurrent ipatool runs never share temp files.
+    bool download_parallel(const std::string& url,
+                           const std::string& destPath,
+                           std::function<void(int64_t, int64_t)> progress = nullptr,
+                           int64_t       chunkSize   = 0,
+                           int           chunkCount  = 0,
+                           ChunkVerifier verifyChunk = nullptr) const;
+
+    // Fetch bytes [start,end] inclusive into `out` (cleared first), for targeted
+    // repair of a single corrupt chunk (the store ships per-chunk md5s in the
+    // download response). Transport/timeout failures are retried a few times; a
+    // non-206 response or a wrong byte count is a hard failure (false, no retry)
+    // so the caller can fall back to a full re-download.
+    bool download_range(const std::string& url,
+                        int64_t start, int64_t end,
+                        std::string& out) const;
+
 private:
     std::string m_cookieFile;
     bool        m_debug = false;

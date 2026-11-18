@@ -1455,6 +1455,11 @@ static void cmd_download(const Args& args) {
             }
             return;
         }
+        // In --debug the per-request trace lines (chunk md5 ok, retries, ...) stream
+        // to the same stderr terminal; an animated in-place bar interleaves with
+        // them and, on a narrow wrapping terminal, can't reliably erase its tail.
+        // The trace lines are the progress indicator in that mode, so skip the bar.
+        if (dbg) return;
         auto now     = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDraw).count();
         bool done    = (total > 0 && received >= total);

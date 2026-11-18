@@ -223,11 +223,166 @@ static std::string md5_file_hex(const std::string& path) {
     return out;
 }
 
+// Lowercase hex MD5 of an in-memory buffer, for per-chunk integrity checks
+// (the store ships a <key>hashes</key> array of per-chunk md5s). "" on error.
+static std::string md5_buf_hex(const uint8_t* data, size_t len) {
+    unsigned char md[16];
+#if MBEDTLS_VERSION_MAJOR >= 4
+    static const psa_status_t initrc = psa_crypto_init(); (void)initrc;  // idempotent
+    size_t mdlen = 0;
+    if (psa_hash_compute(PSA_ALG_MD5, data, len, md, sizeof(md), &mdlen) != PSA_SUCCESS
+        || mdlen != sizeof(md))
+        return "";
+#else
+    mbedtls_md5_context ctx;
+    mbedtls_md5_init(&ctx);
+    if (mbedtls_md5_starts(&ctx) != 0 ||
+        mbedtls_md5_update(&ctx, data, len) != 0 ||
+        mbedtls_md5_finish(&ctx, md) != 0) {
+        mbedtls_md5_free(&ctx);
+        return "";
+    }
+    mbedtls_md5_free(&ctx);
+#endif
+    static const char* hexd = "0123456789abcdef";
+    std::string out;
+    out.reserve(sizeof(md) * 2);
+    for (unsigned i = 0; i < sizeof(md); ++i) {
+        out.push_back(hexd[md[i] >> 4]);
+        out.push_back(hexd[md[i] & 0xF]);
+    }
+    return out;
+}
+
 // Case-insensitive ASCII equality (md5 hex compare).
 static bool ascii_iequals(const std::string& a, const std::string& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i)
         if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    return true;
+}
+
+// Depth-first search for the per-chunk integrity manifest: the first dict in the
+// item tree that carries both an integer <key>chunkSize</key> and an array
+// <key>hashes</key>. The store may place it at the item's top level or nested
+// under some sub-key, so we don't hard-code a path. Returns true and fills
+// chunkSize/hashes on the first valid manifest found.
+static bool find_chunk_manifest(const PlistDict& d,
+                                int64_t& chunkSize,
+                                std::vector<std::string>& hashes) {
+    auto cs = d.find("chunkSize");
+    auto hs = d.find("hashes");
+    if (cs != d.end() && cs->second.isInt() &&
+        hs != d.end() && hs->second.isArray()) {
+        int64_t                  csv = cs->second.i64();
+        std::vector<std::string> hv;
+        for (auto& e : hs->second.arrayVal)
+            if (e.isString()) hv.push_back(e.strVal);
+        if (csv > 0 && !hv.empty()) {
+            chunkSize = csv;
+            hashes    = std::move(hv);
+            return true;
+        }
+    }
+    for (auto& kv : d) {
+        const PlistValue& v = kv.second;
+        if (v.isDict()) {
+            if (find_chunk_manifest(v.dictVal, chunkSize, hashes)) return true;
+        } else if (v.isArray()) {
+            for (auto& e : v.arrayVal)
+                if (e.isDict() && find_chunk_manifest(e.dictVal, chunkSize, hashes)) return true;
+        }
+    }
+    return false;
+}
+
+// Verify a finished raw download against the store's per-chunk md5 manifest
+// (<key>chunkSize</key> + <key>hashes</key>) and repair any corrupt chunk by
+// re-fetching only that byte range. chunkSize and the hash count are taken from
+// the response, so whatever chunking the store uses is handled. Returns true if
+// the file matches the manifest (possibly after repair); false if a chunk can't
+// be repaired or the file doesn't line up with the manifest, in which case the
+// caller falls back to the whole-file md5 path (full re-download).
+static bool verify_and_repair_chunks(const HttpClient& http,
+                                     const std::string& url,
+                                     const std::string& path,
+                                     int64_t chunkSize,
+                                     const std::vector<std::string>& hashes,
+                                     bool debug)
+{
+    if (chunkSize <= 0 || hashes.empty()) return true;  // no manifest → nothing to check
+
+    std::error_code ec;
+    const int64_t fileSize = (int64_t)fs::file_size(ipt::fs_path(path), ec);
+    if (ec) return false;
+
+    // The manifest must line up with the file: (n-1) full chunks plus a final
+    // chunk of 1..chunkSize bytes. If it doesn't fit, the download length itself
+    // is wrong — not a per-chunk repair job — so hand it to the whole-file path.
+    const int64_t n       = (int64_t)hashes.size();
+    const int64_t minSize = (n - 1) * chunkSize + 1;
+    const int64_t maxSize = n * chunkSize;
+    if (fileSize < minSize || fileSize > maxSize) {
+        if (debug)
+            fprintf(stderr, "[DEBUG] chunk manifest does not fit file "
+                    "(%lld bytes, %lld chunks of %lld) - skipping chunk repair\n",
+                    (long long)fileSize, (long long)n, (long long)chunkSize);
+        return false;
+    }
+
+    auto seek64 = [](FILE* f, int64_t off) -> bool {
+#if defined(_WIN32)
+        return _fseeki64(f, off, SEEK_SET) == 0;
+#else
+        return fseeko(f, (off_t)off, SEEK_SET) == 0;
+#endif
+    };
+
+    int repaired = 0;
+    std::vector<uint8_t> win;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t off = i * chunkSize;
+        const int64_t len = std::min<int64_t>(chunkSize, fileSize - off);
+
+        // Read this chunk window from the file and md5 it.
+        FILE* f = ipt::fopen_utf8(path, "rb");
+        if (!f) return false;
+        if (!seek64(f, off)) { fclose(f); return false; }
+        win.resize((size_t)len);
+        size_t got = fread(win.data(), 1, (size_t)len, f);
+        fclose(f);
+        if ((int64_t)got != len) return false;
+
+        if (ascii_iequals(md5_buf_hex(win.data(), win.size()), hashes[i]))
+            continue;  // chunk is intact
+
+        // Corrupt chunk → re-fetch only this byte range and splice it back in.
+        if (debug)
+            fprintf(stderr, "[DEBUG] chunk %lld/%lld md5 mismatch - refetching range %lld-%lld\n",
+                    (long long)i, (long long)n, (long long)off, (long long)(off + len - 1));
+
+        std::string fresh;
+        if (!http.download_range(url, off, off + len - 1, fresh))
+            return false;  // transport dead or server misbehaved → whole-file fallback
+        if (!ascii_iequals(md5_buf_hex((const uint8_t*)fresh.data(), fresh.size()), hashes[i])) {
+            if (debug)
+                fprintf(stderr, "[DEBUG] chunk %lld still bad after refetch - falling back\n",
+                        (long long)i);
+            return false;  // re-fetched bytes still wrong → not recoverable here
+        }
+
+        FILE* w = ipt::fopen_utf8(path, "r+b");
+        if (!w) return false;
+        if (!seek64(w, off)) { fclose(w); return false; }
+        size_t wrote   = fwrite(fresh.data(), 1, fresh.size(), w);
+        int    flushed = fflush(w);
+        fclose(w);
+        if (wrote != fresh.size() || flushed != 0) return false;
+        ++repaired;
+    }
+
+    if (debug && repaired)
+        fprintf(stderr, "[DEBUG] chunk verify: repaired %d chunk(s)\n", repaired);
     return true;
 }
 
@@ -805,6 +960,29 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
     const PlistDict& item       = itemVal.dictVal;
     std::string      downloadURL = dict_str(item, "URL");
     std::string      md5Expected = dict_str(item, "md5");
+    // Per-chunk integrity manifest (optional): chunkSize + an array of md5s, one
+    // per chunk of the file as served. Lets us repair a single bad chunk by
+    // re-fetching just its range instead of the whole file. The manifest may be
+    // nested inside the item under a key we don't want to hard-code, so search
+    // the item tree for the dict that carries both keys. chunkSize / count come
+    // straight from the response, so any chunking is handled.
+    int64_t                  chunkSize = 0;
+    std::vector<std::string> chunkHashes;
+    find_chunk_manifest(item, chunkSize, chunkHashes);
+    // Per-chunk md5 verifier handed to the parallel downloader: it checks each
+    // chunk's bytes against the manifest as they arrive and makes the worker
+    // re-fetch a bad one. Also drives the single-stream repair pass below.
+    HttpClient::ChunkVerifier chunkVerify;
+    if (chunkSize > 0 && !chunkHashes.empty()) {
+        chunkVerify = [&chunkHashes](int idx, const uint8_t* data, size_t len) -> bool {
+            if (idx < 0 || (size_t)idx >= chunkHashes.size()) return false;
+            return ascii_iequals(md5_buf_hex(data, len), chunkHashes[idx]);
+        };
+    }
+    // Set true when download_parallel finishes and has already md5-verified every
+    // chunk inline, so verify_and_report skips the (now redundant) repair pass and
+    // only runs the authoritative whole-file md5 check.
+    bool parallelChunkVerified = false;
     // download-id for the completion ping — comes from the same item as the URL
     // (usually empty, but can be populated), passed through verbatim.
     std::string      downloadId  = dict_str(item, "download-id");
@@ -848,6 +1026,34 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
     // completion to Apple. Called on the raw downloaded temp file (before any
     // repack/decrypt), since the md5 describes the file exactly as served.
     auto verify_and_report = [&](const std::string& rawTmpPath) {
+        // Per-chunk integrity. Three cases:
+        //  - parallel download already md5-verified every chunk inline → nothing to do;
+        //  - single-stream path + manifest present → verify each chunk now and
+        //    repair any corrupt one by re-fetching just its range;
+        //  - no manifest at all → dump item keys so we can see where it lives.
+        if (parallelChunkVerified) {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] chunk manifest verified inline during parallel download "
+                                "(%zu chunks of %lld)\n",
+                        chunkHashes.size(), (long long)chunkSize);
+        } else if (chunkSize > 0 && !chunkHashes.empty()) {
+            if (verify_and_repair_chunks(m_http, downloadURL, rawTmpPath,
+                                         chunkSize, chunkHashes, m_debug)) {
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] chunk manifest verified (%zu chunks of %lld)\n",
+                            chunkHashes.size(), (long long)chunkSize);
+            } else if (m_debug) {
+                fprintf(stderr, "[DEBUG] chunk verify/repair did not complete "
+                                "- relying on whole-file md5 fallback\n");
+            }
+        } else if (m_debug) {
+            fprintf(stderr, "[DEBUG] no chunk manifest in response; item keys:");
+            for (auto& kv : item) fprintf(stderr, " %s", kv.first.c_str());
+            fprintf(stderr, "\n");
+        }
+
+        // Then verify the finished raw download against the store's whole-file md5
+        // (the authoritative overall check), and report completion to Apple.
         if (!md5Expected.empty()) {
             std::string actual = md5_file_hex(rawTmpPath);
             if (actual.empty())
@@ -920,8 +1126,15 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
         std::string pkgDest = resolve_destination(app, version, outputPath, displayName, ".pkg");
 
         std::string tmpPkg = pkgDest + ".tmp";
-        int64_t rangeStart = file_size(tmpPkg);
-        m_http.download(downloadURL, tmpPkg, rangeStart, progress);
+        // Large files download over several connections; falls back to the
+        // single-connection resumable path when that isn't possible.
+        if (m_http.download_parallel(downloadURL, tmpPkg, progress,
+                                     chunkSize, (int)chunkHashes.size(), chunkVerify)) {
+            parallelChunkVerified = (bool)chunkVerify;   // chunks already verified inline
+        } else {
+            int64_t rangeStart = file_size(tmpPkg);
+            m_http.download(downloadURL, tmpPkg, rangeStart, progress);
+        }
 
         verify_and_report(tmpPkg);
 
@@ -980,8 +1193,15 @@ AppStore::DownloadOutput AppStore::download(const Account& acc,
     std::string dest    = resolve_destination(app, version, outputPath, displayName);
     std::string tmpDest = dest + ".tmp";
 
-    int64_t rangeStart = file_size(tmpDest);
-    m_http.download(downloadURL, tmpDest, rangeStart, progress);
+    // Large files download over several connections; falls back to the
+    // single-connection resumable path when that isn't possible.
+    if (m_http.download_parallel(downloadURL, tmpDest, progress,
+                                 chunkSize, (int)chunkHashes.size(), chunkVerify)) {
+        parallelChunkVerified = (bool)chunkVerify;   // chunks already verified inline
+    } else {
+        int64_t rangeStart = file_size(tmpDest);
+        m_http.download(downloadURL, tmpDest, rangeStart, progress);
+    }
 
     verify_and_report(tmpDest);
 
