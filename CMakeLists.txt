@@ -73,6 +73,18 @@ if(STATIC_BUILD AND NOT WIN32)
     ExternalProject_Add(mbedtls_static
         URL https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2
         ${_ep_timestamp_opt}
+        # Enable the threading layer (pthread mutexes) so mbedTLS/PSA is safe to
+        # use from several threads at once. The parallel chunk downloader runs 4
+        # worker threads, each doing its own TLS handshake/reads (curl's mbedTLS
+        # backend) and PSA md5 — and in 4.x the TLS stack itself calls into PSA,
+        # whose global key store / RNG is only mutex-protected when
+        # MBEDTLS_THREADING_C is set. Without it, concurrent workers race on that
+        # global state and crash intermittently (most visibly on small files,
+        # where all workers start their handshakes at once). In 4.x these options
+        # live in tf-psa-crypto's crypto_config.h, toggled via its config.py.
+        # Requires python3 at build time; pthread is already linked by the app.
+        PATCH_COMMAND python3 <SOURCE_DIR>/tf-psa-crypto/scripts/config.py set MBEDTLS_THREADING_C
+              COMMAND python3 <SOURCE_DIR>/tf-psa-crypto/scripts/config.py set MBEDTLS_THREADING_PTHREAD
         CMAKE_ARGS ${_mbedtls_cmake_args}
         BUILD_BYPRODUCTS
             <INSTALL_DIR>/lib/libmbedtls.a
