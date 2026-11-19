@@ -41,13 +41,19 @@ if(STATIC_BUILD AND NOT WIN32)
     # is identical everywhere, then fed to curl's configure. The app's own crypto
     # (AES-GCM / SHA-256 / MD5 / PBKDF2 / RNG) uses the same libmbedcrypto, so
     # OpenSSL is gone entirely. Override the version with -DMBEDTLS_VERSION=<x.y.z>.
-    # 4.2.0: crypto moved to TF-PSA-Crypto and legacy APIs went PSA-only (our
+    # 4.x: crypto moved to TF-PSA-Crypto and legacy APIs went PSA-only (our
     # aes/sha2/protect use the PSA backend under MBEDTLS_VERSION_MAJOR>=4). 4.x
     # still installs compat-named static libs (libmbedtls/libmbedx509/
     # libmbedcrypto), so curl's --with-mbedtls and the byproducts below are
-    # unchanged. 4.2.0 specifically — 4.1.0 had a TLS 1.2 regression vs curl
-    # (mbedtls#10668). Needs the curl bump below (>= 8.17 understands 4.x).
-    set(MBEDTLS_VERSION "4.2.0" CACHE STRING
+    # unchanged. Avoid 4.1.0 (TLS 1.2 regression vs curl, mbedtls#10668); needs
+    # the curl bump below (>= 8.17 understands 4.x).
+    # 4.3.0 (Nov 2026): security release — fixes several certificate-verification
+    # CVEs that matter to us as a TLS client (SAN type confusion in cert verify
+    # CVE-2026-90470, strict name matching in revocation CVE-2026-116462,
+    # mbedtls_x509_dn_gets non-NUL-terminated output CVE-2026-115489), plus a
+    # cross-SNI resumption client-auth bypass and a PKCS5/PKCS12 unbounded-
+    # iteration DoS. curl's own fuzzing infra moved to 4.3.0, so no regression.
+    set(MBEDTLS_VERSION "4.3.0" CACHE STRING
         "mbedTLS version to build from source for the static build")
     set(_mbedtls_cmake_args
         -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
@@ -288,14 +294,20 @@ if(STATIC_BUILD AND MINGW)
     # mbedTLS from source for the app's own crypto (curl itself uses Schannel, so
     # only libmbedcrypto is needed here). Built with the same MinGW toolchain so
     # it links cleanly into the single-file static exe.
-    # 4.2.0 (PSA backend). curl here uses Schannel, so only the crypto lib is
-    # linked; 4.x still emits a compat-named libmbedcrypto.a, so the byproduct
-    # path below is unchanged.
-    set(MBEDTLS_VERSION "4.2.0" CACHE STRING "mbedTLS version (MinGW static)")
+    # 4.3.0 (PSA backend; security release — see the Linux/macOS note above). curl
+    # here uses Schannel, so only the crypto lib is linked; 4.x still emits a
+    # compat-named libmbedcrypto.a, so the byproduct path below is unchanged.
+    set(MBEDTLS_VERSION "4.3.0" CACHE STRING "mbedTLS version (MinGW static)")
     set(_MBEDTLS_INSTALL "${CMAKE_BINARY_DIR}/mbedtls_install")
     ExternalProject_Add(mbedtls_static_mingw
         URL https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2
         ${_curl_ts}
+        # TLS is Schannel here, but the parallel chunk downloader still calls PSA
+        # md5 from 4 worker threads at once, so libmbedcrypto must be thread-safe:
+        # enable the threading layer (pthread -> MinGW winpthreads). Without it the
+        # concurrent PSA calls race on global state and crash intermittently.
+        PATCH_COMMAND python3 <SOURCE_DIR>/tf-psa-crypto/scripts/config.py set MBEDTLS_THREADING_C
+              COMMAND python3 <SOURCE_DIR>/tf-psa-crypto/scripts/config.py set MBEDTLS_THREADING_PTHREAD
         CMAKE_ARGS
             -DCMAKE_BUILD_TYPE=Release
             -DCMAKE_INSTALL_PREFIX=${_MBEDTLS_INSTALL}
